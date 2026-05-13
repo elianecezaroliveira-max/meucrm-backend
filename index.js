@@ -84,20 +84,30 @@ app.post("/webhook", async (req, res) => {
 
 // ── Embedded Signup: recebe código do Facebook e salva conta automaticamente ──
 app.post("/auth/whatsapp", async (req, res) => {
-  const { code } = req.body;
+  const { code, redirect_uri } = req.body;
   if (!code) return res.status(400).json({ error: "Código não informado" });
-  if (!APP_ID || !APP_SECRET) return res.status(500).json({ error: "APP_ID e APP_SECRET não configurados no Railway" });
+  if (!APP_ID || !APP_SECRET) return res.status(500).json({ error: "APP_ID e APP_SECRET não configurados" });
 
   try {
-    // 1. Troca código pelo access token
+    // 1. Troca código pelo access token (usando redirect_uri se fornecido)
+    const tokenParams = {
+      client_id: APP_ID,
+      client_secret: APP_SECRET,
+      code,
+    };
+    if (redirect_uri) tokenParams.redirect_uri = redirect_uri;
+
     const tokenRes = await axios.get("https://graph.facebook.com/v19.0/oauth/access_token", {
-      params: { client_id: APP_ID, client_secret: APP_SECRET, code }
+      params: tokenParams,
     });
     const userToken = tokenRes.data.access_token;
 
     // 2. Busca empresas e WABAs do usuário
     const bizRes = await axios.get("https://graph.facebook.com/v19.0/me/businesses", {
-      params: { access_token: userToken, fields: "id,name,owned_whatsapp_business_accounts{id,name}" }
+      params: {
+        access_token: userToken,
+        fields: "id,name,owned_whatsapp_business_accounts{id,name}",
+      },
     });
 
     const businesses = bizRes.data.data || [];
@@ -108,18 +118,20 @@ app.post("/auth/whatsapp", async (req, res) => {
       for (const waba of wabas) {
         // 3. Busca números de telefone
         const phonesRes = await axios.get(`https://graph.facebook.com/v19.0/${waba.id}/phone_numbers`, {
-          params: { access_token: userToken, fields: "id,display_phone_number,verified_name" }
+          params: { access_token: userToken, fields: "id,display_phone_number,verified_name" },
         });
         const phones = phonesRes.data.data || [];
 
         for (const phone of phones) {
-          // 4. Inscreve WABA no webhook
+          // 4. Inscreve WABA no webhook do app
           try {
-            await axios.post(`https://graph.facebook.com/v19.0/${waba.id}/subscribed_apps`, {},
+            await axios.post(
+              `https://graph.facebook.com/v19.0/${waba.id}/subscribed_apps`,
+              {},
               { params: { access_token: userToken } }
             );
-          } catch(e) {
-            console.log("Aviso webhook:", e.response?.data?.error?.message);
+          } catch (e) {
+            console.log("Aviso webhook subscribe:", e.response?.data?.error?.message);
           }
 
           // 5. Salva conta no Supabase
@@ -135,8 +147,10 @@ app.post("/auth/whatsapp", async (req, res) => {
             const { data, error } = await supabase
               .from("accounts")
               .upsert(accountData, { onConflict: "phone_number_id" })
-              .select().single();
+              .select()
+              .single();
             if (!error) savedAccounts.push(data);
+            else console.error("Erro ao salvar conta:", error.message);
           } else {
             savedAccounts.push(accountData);
           }
@@ -145,7 +159,9 @@ app.post("/auth/whatsapp", async (req, res) => {
     }
 
     if (savedAccounts.length === 0) {
-      return res.status(400).json({ error: "Nenhum número de WhatsApp encontrado nesta conta do Facebook." });
+      return res.status(400).json({
+        error: "Nenhum número de WhatsApp encontrado nesta conta do Facebook. Verifique se há uma conta WhatsApp Business vinculada.",
+      });
     }
 
     res.json({ success: true, accounts: savedAccounts });
