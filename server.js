@@ -332,6 +332,35 @@ app.post("/send", async (req, res) => {
   }
 });
 
+// ── Criar contato manualmente ──
+app.post("/contacts", async (req, res) => {
+  const { name, phone, account_id } = req.body;
+  if (!name || !phone) return res.status(400).json({ error: "Nome e celular são obrigatórios" });
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const cleanPhone = phone.replace(/\D/g, '');
+  if (cleanPhone.length < 8) return res.status(400).json({ error: "Número de celular inválido" });
+  const { data, error } = await supabase.from("contacts")
+    .upsert({ phone: cleanPhone, name, account_id: account_id || null, last_message_at: new Date().toISOString() }, { onConflict: "phone" })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true, data });
+});
+
+// ── Importar lista de contatos ──
+app.post("/contacts/import", async (req, res) => {
+  const { contacts, account_id } = req.body;
+  if (!contacts || !Array.isArray(contacts)) return res.status(400).json({ error: "Lista inválida" });
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const toInsert = contacts
+    .map(c => ({ phone: String(c.phone || '').replace(/\D/g, ''), name: c.name || 'Desconhecido', account_id: account_id || null, last_message_at: new Date().toISOString() }))
+    .filter(c => c.phone.length >= 8);
+  if (!toInsert.length) return res.status(400).json({ error: "Nenhum contato válido encontrado" });
+  const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "phone" });
+  if (error) return res.status(500).json({ error: error.message });
+  console.log(`✅ ${toInsert.length} contatos importados`);
+  res.json({ success: true, count: toInsert.length });
+});
+
 // ── Listar contatos ──
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
