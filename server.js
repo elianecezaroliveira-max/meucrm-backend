@@ -406,6 +406,26 @@ app.post("/send-media", async (req, res) => {
   }
 });
 
+// ── Anotações por contato ──
+app.get("/contacts/:phone/notes", async (req, res) => {
+  if (!supabase) return res.json({ notes: "" });
+  const { data, error } = await supabase
+    .from("contacts").select("notes").eq("phone", req.params.phone).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ notes: data?.notes || "" });
+});
+
+app.put("/contacts/:phone/notes", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { notes } = req.body;
+  const { error } = await supabase
+    .from("contacts")
+    .update({ notes: notes ?? "" })
+    .eq("phone", req.params.phone);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── Criar contato manualmente ──
 app.post("/contacts", async (req, res) => {
   const { name, phone, account_id } = req.body;
