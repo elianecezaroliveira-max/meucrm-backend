@@ -406,6 +406,17 @@ app.post("/send-media", async (req, res) => {
   }
 });
 
+// ── Tags por contato ──
+app.put("/contacts/:phone/tags", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { tags } = req.body;
+  if (!Array.isArray(tags)) return res.status(400).json({ error: "tags deve ser array" });
+  const { error } = await supabase
+    .from("contacts").update({ tags }).eq("phone", req.params.phone);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── Anotações por contato ──
 app.get("/contacts/:phone/notes", async (req, res) => {
   if (!supabase) return res.json({ notes: "" });
@@ -620,7 +631,7 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("contacts").select("phone, name, account_id, stage_id, last_message_at")
+    .from("contacts").select("phone, name, account_id, stage_id, tags, last_message_at")
     .order("last_message_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
