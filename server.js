@@ -254,6 +254,8 @@ app.post("/send", async (req, res) => {
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
 
   let phoneNumberId, token;
+
+  // 1. Tenta buscar conta do banco de dados pelo account_id
   if (supabase && account_id) {
     const { data: account, error: accErr } = await supabase
       .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
@@ -261,8 +263,17 @@ app.post("/send", async (req, res) => {
     if (account) { phoneNumberId = account.phone_number_id; token = account.token; }
   }
 
+  // 2. Fallback: usa variáveis de ambiente (PHONE_NUMBER_ID + WHATSAPP_TOKEN)
+  if (!phoneNumberId || !token) {
+    phoneNumberId = process.env.PHONE_NUMBER_ID;
+    token = process.env.WHATSAPP_TOKEN;
+    if (phoneNumberId && token) {
+      console.log("⚠️ Conta não encontrada no banco — usando credenciais das variáveis de ambiente");
+    }
+  }
+
   if (!phoneNumberId || !token)
-    return res.status(400).json({ error: "Conta não encontrada. Adicione uma conta WhatsApp primeiro." });
+    return res.status(400).json({ error: "Nenhuma conta configurada. Adicione uma conta WhatsApp primeiro." });
 
   try {
     const response = await axios.post(
