@@ -181,7 +181,19 @@ app.post("/auth/whatsapp", async (req, res) => {
       console.log(`📞 ${phones.length} número(s) encontrado(s) no WABA ${wabaId}`);
 
       for (const phone of phones) {
-        // 5. Inscreve WABA no webhook do app
+        // 5. Registra o número na Cloud API (ativa o número de "Pendente" para "Ativo")
+        try {
+          await axios.post(
+            `https://graph.facebook.com/v23.0/${phone.id}/register`,
+            { messaging_product: "whatsapp", pin: process.env.WHATSAPP_PIN || "123456" },
+            { headers: { Authorization: `Bearer ${userToken}`, "Content-Type": "application/json" } }
+          );
+          console.log("✅ Número registrado na Cloud API:", phone.display_phone_number);
+        } catch (e) {
+          console.log("⚠️ Registro do número (pode já estar ativo):", e.response?.data?.error?.message);
+        }
+
+        // 6. Inscreve WABA no webhook do app
         try {
           await axios.post(
             `https://graph.facebook.com/v23.0/${wabaId}/subscribed_apps`,
