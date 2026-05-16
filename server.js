@@ -352,4 +352,101 @@ app.get("/messages/:phone", async (req, res) => {
   res.json(data);
 });
 
+// ── Listar templates ──
+app.get("/templates", async (req, res) => {
+  const { account_id } = req.query;
+  if (!supabase || !account_id) return res.status(400).json({ error: "account_id obrigatório" });
+  const { data: account, error: accErr } = await supabase
+    .from("accounts").select("token, waba_id").eq("id", account_id).single();
+  if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
+  if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
+  try {
+    const response = await axios.get(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, {
+      params: { access_token: account.token, fields: "id,name,status,category,language,components", limit: 100 },
+    });
+    res.json(response.data.data || []);
+  } catch (err) {
+    console.error("❌ Erro ao listar templates:", err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao listar templates" });
+  }
+});
+
+// ── Criar template ──
+app.post("/templates", async (req, res) => {
+  const { account_id, name, category, language, components } = req.body;
+  if (!account_id || !name || !category || !language || !components)
+    return res.status(400).json({ error: "Campos obrigatórios: account_id, name, category, language, components" });
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { data: account, error: accErr } = await supabase
+    .from("accounts").select("token, waba_id").eq("id", account_id).single();
+  if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
+  try {
+    const response = await axios.post(
+      `https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`,
+      { name, category, language, components },
+      { headers: { Authorization: `Bearer ${account.token}`, "Content-Type": "application/json" } }
+    );
+    console.log("✅ Template criado:", name);
+    res.json({ success: true, data: response.data });
+  } catch (err) {
+    console.error("❌ Erro ao criar template:", err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao criar template" });
+  }
+});
+
+// ── Deletar template ──
+app.delete("/templates/:template_id", async (req, res) => {
+  const { account_id } = req.query;
+  if (!supabase || !account_id) return res.status(400).json({ error: "account_id obrigatório" });
+  const { data: account, error: accErr } = await supabase
+    .from("accounts").select("token, waba_id").eq("id", account_id).single();
+  if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
+  try {
+    await axios.delete(`https://graph.facebook.com/v23.0/${req.params.template_id}`, {
+      params: { access_token: account.token },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Erro ao deletar template:", err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao deletar template" });
+  }
+});
+
+// ── Enviar template ──
+app.post("/send-template", async (req, res) => {
+  const { to, account_id, template_name, language_code, components } = req.body;
+  if (!to || !account_id || !template_name)
+    return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { data: account, error: accErr } = await supabase
+    .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
+  if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
+  try {
+    const templateMsg = {
+      messaging_product: "whatsapp", to, type: "template",
+      template: { name: template_name, language: { code: language_code || "pt_BR" } },
+    };
+    if (components && components.length > 0) templateMsg.template.components = components;
+    const response = await axios.post(
+      `https://graph.facebook.com/v23.0/${account.phone_number_id}/messages`,
+      templateMsg,
+      { headers: { Authorization: `Bearer ${account.token}`, "Content-Type": "application/json" } }
+    );
+    const safeAccountId = account_id || null;
+    await supabase.from("contacts").upsert(
+      { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
+      { onConflict: "phone" }
+    );
+    await supabase.from("messages").insert({
+      phone: to, content: `[Template: ${template_name}]`, type: "template",
+      direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
+    });
+    console.log("✅ Template enviado:", template_name, "→", to);
+    res.json({ success: true, data: response.data });
+  } catch (err) {
+    console.error("❌ Erro ao enviar template:", err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao enviar template" });
+  }
+});
+
 app.listen(PORT, () => console.log(`🚀 MeuCRM na porta ${PORT}`));
