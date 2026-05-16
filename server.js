@@ -147,60 +147,75 @@ app.post("/auth/whatsapp", async (req, res) => {
     const userToken = tokenRes.data.access_token;
     console.log("✅ Token obtido via Embedded Signup");
 
-    // 2. Busca empresas e WABAs do usuário
-    const bizRes = await axios.get("https://graph.facebook.com/v23.0/me/businesses", {
-      params: { access_token: userToken, fields: "id,name,owned_whatsapp_business_accounts{id,name}" },
+    // 2. Usa debug_token para obter WABA IDs das permissões granulares
+    // (não requer business_management — funciona com whatsapp_business_management)
+    const appToken = `${APP_ID}|${APP_SECRET}`;
+    const debugRes = await axios.get("https://graph.facebook.com/v23.0/debug_token", {
+      params: { input_token: userToken, access_token: appToken },
     });
 
-    const businesses = bizRes.data.data || [];
+    const granularScopes = debugRes.data.data?.granular_scopes || [];
+    const wabaScope = granularScopes.find(s => s.scope === "whatsapp_business_management");
+    const wabaIds = wabaScope?.target_ids || [];
+    console.log("✅ WABA IDs encontrados via debug_token:", wabaIds);
+
     const savedAccounts = [];
 
-    for (const biz of businesses) {
-      const wabas = biz.owned_whatsapp_business_accounts?.data || [];
-      for (const waba of wabas) {
-        // 3. Busca números de telefone
-        const phonesRes = await axios.get(`https://graph.facebook.com/v23.0/${waba.id}/phone_numbers`, {
-          params: { access_token: userToken, fields: "id,display_phone_number,verified_name" },
+    for (const wabaId of wabaIds) {
+      // 3. Busca nome do WABA
+      let wabaName = wabaId;
+      try {
+        const wabaRes = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}`, {
+          params: { access_token: userToken, fields: "id,name" },
         });
-        const phones = phonesRes.data.data || [];
+        wabaName = wabaRes.data.name || wabaId;
+      } catch (e) {
+        console.log("⚠️ Não foi possível buscar nome do WABA:", e.response?.data?.error?.message);
+      }
 
-        for (const phone of phones) {
-          // 4. Inscreve WABA no webhook do app
-          try {
-            await axios.post(
-              `https://graph.facebook.com/v23.0/${waba.id}/subscribed_apps`,
-              {},
-              { params: { access_token: userToken } }
-            );
-            console.log("✅ WABA inscrito no webhook:", waba.id);
-          } catch (e) {
-            console.log("⚠️ Aviso webhook subscribe:", e.response?.data?.error?.message);
-          }
+      // 4. Busca números de telefone do WABA
+      const phonesRes = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}/phone_numbers`, {
+        params: { access_token: userToken, fields: "id,display_phone_number,verified_name" },
+      });
+      const phones = phonesRes.data.data || [];
+      console.log(`📞 ${phones.length} número(s) encontrado(s) no WABA ${wabaId}`);
 
-          // 5. Salva conta no Supabase
-          const accountData = {
-            name: phone.verified_name || waba.name || biz.name,
-            phone_number_id: phone.id,
-            phone_display: phone.display_phone_number,
-            token: userToken,
-            waba_id: waba.id,
-          };
+      for (const phone of phones) {
+        // 5. Inscreve WABA no webhook do app
+        try {
+          await axios.post(
+            `https://graph.facebook.com/v23.0/${wabaId}/subscribed_apps`,
+            {},
+            { params: { access_token: userToken } }
+          );
+          console.log("✅ WABA inscrito no webhook:", wabaId);
+        } catch (e) {
+          console.log("⚠️ Aviso webhook subscribe:", e.response?.data?.error?.message);
+        }
 
-          if (supabase) {
-            const { data, error } = await supabase
-              .from("accounts")
-              .upsert(accountData, { onConflict: "phone_number_id" })
-              .select()
-              .single();
-            if (!error) {
-              savedAccounts.push(data);
-              console.log("✅ Conta salva:", accountData.name);
-            } else {
-              console.error("❌ Erro ao salvar conta:", error.message);
-            }
+        // 6. Salva conta no Supabase
+        const accountData = {
+          name: phone.verified_name || wabaName,
+          phone_number_id: phone.id,
+          phone_display: phone.display_phone_number,
+          token: userToken,
+          waba_id: wabaId,
+        };
+
+        if (supabase) {
+          const { data, error } = await supabase
+            .from("accounts")
+            .upsert(accountData, { onConflict: "phone_number_id" })
+            .select()
+            .single();
+          if (!error) {
+            savedAccounts.push(data);
+            console.log("✅ Conta salva:", accountData.name);
           } else {
-            savedAccounts.push(accountData);
+            console.error("❌ Erro ao salvar conta:", error.message);
           }
+        } else {
+          savedAccounts.push(accountData);
         }
       }
     }
