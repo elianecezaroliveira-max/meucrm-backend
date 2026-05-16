@@ -283,14 +283,20 @@ app.post("/send", async (req, res) => {
     );
 
     if (supabase) {
+      const safeAccountId = account_id || null;
       await supabase.from("contacts").upsert(
-        { phone: to, last_message_at: new Date().toISOString(), account_id },
+        { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
         { onConflict: "phone" }
       );
-      await supabase.from("messages").insert({
+      const { error: msgErr } = await supabase.from("messages").insert({
         phone: to, content: message, type: "text", direction: "outbound",
-        timestamp: new Date().toISOString(), account_id,
+        timestamp: new Date().toISOString(), account_id: safeAccountId,
       });
+      if (msgErr) {
+        console.error("❌ Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
+      } else {
+        console.log("✅ Mensagem enviada salva no banco:", message.substring(0, 50));
+      }
     }
     res.json({ success: true, data: response.data });
   } catch (err) {
