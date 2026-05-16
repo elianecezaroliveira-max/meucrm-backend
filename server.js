@@ -572,4 +572,68 @@ app.post("/send-template", async (req, res) => {
   }
 });
 
+// ── Pipeline / Kanban ──
+
+// Listar estágios
+app.get("/pipeline/stages", async (req, res) => {
+  if (!supabase) return res.json([]);
+  const { data, error } = await supabase
+    .from("pipeline_stages").select("*").order("position", { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// Criar estágio
+app.post("/pipeline/stages", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { name, position } = req.body;
+  if (!name) return res.status(400).json({ error: "Nome obrigatório" });
+  const { data, error } = await supabase
+    .from("pipeline_stages").insert({ name, position: position || 0 }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// Renomear / reordenar estágio
+app.put("/pipeline/stages/:id", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { name, position } = req.body;
+  const updates = {};
+  if (name !== undefined) updates.name = name;
+  if (position !== undefined) updates.position = position;
+  const { error } = await supabase
+    .from("pipeline_stages").update(updates).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// Excluir estágio (move leads para sem-status)
+app.delete("/pipeline/stages/:id", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  await supabase.from("contacts").update({ stage_id: null }).eq("stage_id", req.params.id);
+  const { error } = await supabase.from("pipeline_stages").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// Listar contatos (com stage_id)
+app.get("/contacts", async (req, res) => {
+  if (!supabase) return res.json([]);
+  const { data, error } = await supabase
+    .from("contacts").select("phone, name, account_id, stage_id, last_message_at")
+    .order("last_message_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// Mover lead para estágio
+app.put("/contacts/:phone/stage", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { stage_id } = req.body;
+  const { error } = await supabase
+    .from("contacts").update({ stage_id: stage_id || null }).eq("phone", req.params.phone);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 app.listen(PORT, () => console.log(`🚀 MeuCRM na porta ${PORT}`));
