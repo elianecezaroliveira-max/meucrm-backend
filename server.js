@@ -332,6 +332,80 @@ app.post("/send", async (req, res) => {
   }
 });
 
+// ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
+app.post("/send-media", async (req, res) => {
+  const { to, account_id, fileBase64, fileName, mimeType } = req.body;
+  if (!to || !fileBase64 || !fileName || !mimeType)
+    return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
+
+  let phoneNumberId, token;
+  if (supabase && account_id) {
+    const { data: account } = await supabase
+      .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
+    if (account) { phoneNumberId = account.phone_number_id; token = account.token; }
+  }
+  if (!phoneNumberId || !token) {
+    phoneNumberId = process.env.PHONE_NUMBER_ID;
+    token = process.env.WHATSAPP_TOKEN;
+  }
+  if (!phoneNumberId || !token)
+    return res.status(400).json({ error: "Nenhuma conta configurada." });
+
+  try {
+    // 1. Faz upload da mídia para a Meta
+    const FormData = require("form-data");
+    const form = new FormData();
+    form.append("messaging_product", "whatsapp");
+    form.append("type", mimeType);
+    form.append("file", Buffer.from(fileBase64, "base64"), {
+      filename: fileName,
+      contentType: mimeType,
+    });
+
+    const uploadRes = await axios.post(
+      `https://graph.facebook.com/v23.0/${phoneNumberId}/media`,
+      form,
+      { headers: { ...form.getHeaders(), Authorization: `Bearer ${token}` } }
+    );
+    const mediaId = uploadRes.data.id;
+    console.log("✅ Mídia enviada para Meta, id:", mediaId);
+
+    // 2. Determina o tipo de mensagem WhatsApp
+    let msgType = "document";
+    if (mimeType.startsWith("image/")) msgType = "image";
+    else if (mimeType.startsWith("video/")) msgType = "video";
+    else if (mimeType.startsWith("audio/")) msgType = "audio";
+
+    const mediaObj = { id: mediaId };
+    if (msgType === "document") mediaObj.filename = fileName;
+
+    // 3. Envia a mensagem de mídia
+    await axios.post(
+      `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
+      { messaging_product: "whatsapp", to, type: msgType, [msgType]: mediaObj },
+      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+    );
+
+    // 4. Salva no Supabase
+    if (supabase) {
+      const safeAccountId = account_id || null;
+      await supabase.from("contacts").upsert(
+        { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
+        { onConflict: "phone" }
+      );
+      await supabase.from("messages").insert({
+        phone: to, content: `[${msgType === "image" ? "Imagem" : msgType === "video" ? "Vídeo" : msgType === "audio" ? "Áudio" : "Documento"}: ${fileName}]`,
+        type: msgType, direction: "outbound",
+        timestamp: new Date().toISOString(), account_id: safeAccountId,
+      });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Erro ao enviar mídia:", err.response?.data || err.message);
+    res.status(500).json({ error: "Falha ao enviar mídia", detail: err.response?.data });
+  }
+});
+
 // ── Criar contato manualmente ──
 app.post("/contacts", async (req, res) => {
   const { name, phone, account_id } = req.body;
