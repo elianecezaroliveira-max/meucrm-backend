@@ -615,6 +615,43 @@ app.post("/contacts/import", async (req, res) => {
 });
 
 
+// ── Foto de perfil do contato via WhatsApp API ──
+app.get("/contacts/:phone/avatar", async (req, res) => {
+  const { phone } = req.params;
+  const { account_id } = req.query;
+
+  let token = process.env.WHATSAPP_TOKEN;
+  let phoneNumberId = process.env.PHONE_NUMBER_ID;
+  if (supabase && account_id) {
+    const { data: acc } = await supabase
+      .from("accounts").select("token, phone_number_id").eq("id", account_id).maybeSingle();
+    if (acc?.token) { token = acc.token; phoneNumberId = acc.phone_number_id; }
+  }
+  if (!token || !phoneNumberId) return res.status(404).end();
+
+  try {
+    // Busca a URL da foto de perfil do contato via API Meta
+    const r = await axios.get(
+      `https://graph.facebook.com/v23.0/${phoneNumberId}/profile_picture`,
+      { params: { wa_id: phone, access_token: token } }
+    );
+    const picUrl = r.data?.profile_picture_url || r.data?.url;
+    if (!picUrl) return res.status(404).end();
+
+    // Baixa e faz proxy da imagem
+    const img = await axios.get(picUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+      responseType: "arraybuffer"
+    });
+    const ct = img.headers["content-type"] || "image/jpeg";
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.end(Buffer.from(img.data));
+  } catch (err) {
+    res.status(404).end(); // Sem foto disponível — frontend usa inicial
+  }
+});
+
 // ── Deletar mensagem individual ──
 app.delete("/messages/id/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
