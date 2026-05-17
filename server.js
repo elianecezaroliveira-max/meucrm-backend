@@ -510,39 +510,43 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     const { buffer, contentType } = cached;
     const totalSize = buffer.length;
 
+    // Aumenta timeout do socket para arquivos grandes (evita corte no áudio/vídeo)
+    req.socket.setTimeout(120000);
+
+    // Headers comuns
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=600");
+
     // Download forçado
     if (download === "1") {
       const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
       res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-      res.setHeader("Content-Type", contentType);
       res.setHeader("Content-Length", totalSize);
-      return res.end(buffer);
+      return res.send(buffer);
     }
 
-    // 3. Suporte a Range requests (necessário para player de áudio/vídeo funcionar)
+    // Suporte a Range requests (necessário para player de áudio/vídeo)
     const rangeHeader = req.headers.range;
     if (rangeHeader) {
       const parts = rangeHeader.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+      const end = Math.min(parts[1] ? parseInt(parts[1], 10) : totalSize - 1, totalSize - 1);
+      if (isNaN(start) || start >= totalSize) {
+        res.setHeader("Content-Range", `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
       const chunkSize = end - start + 1;
-
       res.status(206);
       res.setHeader("Content-Range", `bytes ${start}-${end}/${totalSize}`);
-      res.setHeader("Accept-Ranges", "bytes");
       res.setHeader("Content-Length", chunkSize);
-      res.setHeader("Content-Type", contentType);
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.end(buffer.slice(start, end + 1));
+      return res.send(buffer.slice(start, end + 1));
     }
 
-    // 4. Resposta completa (sem range)
-    res.setHeader("Content-Type", contentType);
+    // Resposta completa
     res.setHeader("Content-Length", totalSize);
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "public, max-age=600");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.end(buffer);
+    res.send(buffer);
 
   } catch (err) {
     console.error("❌ Erro ao baixar mídia:", err.response?.data || err.message);
@@ -610,6 +614,14 @@ app.post("/contacts/import", async (req, res) => {
   res.json({ success: true, count: toInsert.length });
 });
 
+
+// ── Deletar mensagem individual ──
+app.delete("/messages/id/:id", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { error } = await supabase.from("messages").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
 
 // ── Mensagens de um contato ──
 app.get("/messages/:phone", async (req, res) => {
