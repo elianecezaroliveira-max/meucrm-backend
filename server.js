@@ -463,8 +463,11 @@ app.post("/send-media", async (req, res) => {
 });
 
 // ── Proxy de mídia recebida (imagem, áudio, vídeo, documento) ──
+// Cache simples de URLs temporárias da Meta (válidas ~5 min)
+const mediUrlCache = new Map();
+
 app.get("/media-proxy/:mediaId", async (req, res) => {
-  const { account_id } = req.query;
+  const { account_id, download, filename } = req.query;
   const { mediaId } = req.params;
 
   // Busca token da conta
@@ -477,26 +480,57 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   if (!token) return res.status(400).json({ error: "Token não encontrado" });
 
   try {
-    // 1. Busca a URL temporária da mídia na Meta
-    const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    const mediaUrl = metaRes.data.url;
-    if (!mediaUrl) return res.status(404).json({ error: "URL de mídia não encontrada" });
+    // 1. Busca (ou reutiliza) a URL temporária da Meta
+    const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
+    let mediaUrl = mediUrlCache.get(cacheKey);
+    if (!mediaUrl) {
+      const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      mediaUrl = metaRes.data.url;
+      if (!mediaUrl) return res.status(404).json({ error: "URL de mídia não encontrada" });
+      mediUrlCache.set(cacheKey, mediaUrl);
+      // Expira cache após 4 minutos (URL Meta dura ~5 min)
+      setTimeout(() => mediUrlCache.delete(cacheKey), 4 * 60 * 1000);
+    }
 
-    // 2. Baixa o arquivo e retorna ao cliente
+    // 2. Encaminha Range header (essencial para vídeo/áudio funcionar no browser)
+    const reqHeaders = { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" };
+    if (req.headers.range) reqHeaders["Range"] = req.headers.range;
+
+    // 3. Baixa e faz proxy do arquivo
     const fileRes = await axios.get(mediaUrl, {
-      headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
-      responseType: "stream"
+      headers: reqHeaders,
+      responseType: "stream",
+      validateStatus: (s) => s < 500,
     });
 
     const contentType = fileRes.headers["content-type"] || "application/octet-stream";
     res.setHeader("Content-Type", contentType);
-    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "public, max-age=300");
+
+    // Repassa headers de range para o browser poder seekar
+    if (fileRes.headers["content-length"])  res.setHeader("Content-Length",  fileRes.headers["content-length"]);
+    if (fileRes.headers["content-range"])   res.setHeader("Content-Range",   fileRes.headers["content-range"]);
+
+    // Se for download, força o browser a baixar o arquivo
+    if (download === "1") {
+      const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+    }
+
+    res.status(fileRes.status);
     fileRes.data.pipe(res);
   } catch (err) {
     console.error("❌ Erro ao baixar mídia:", err.response?.data || err.message);
+    // Se a URL expirou, limpa o cache e tenta uma vez mais
+    const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
+    if (mediUrlCache.has(cacheKey)) {
+      mediUrlCache.delete(cacheKey);
+      return res.redirect(req.originalUrl); // tenta novamente
+    }
     res.status(500).json({ error: "Falha ao baixar mídia" });
   }
 });
