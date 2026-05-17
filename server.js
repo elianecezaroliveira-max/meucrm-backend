@@ -324,7 +324,7 @@ app.delete("/accounts/:id", async (req, res) => {
 
 // ── Enviar mensagem ──
 app.post("/send", async (req, res) => {
-  const { to, message, account_id } = req.body;
+  const { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
 
   let phoneNumberId, token;
@@ -372,6 +372,9 @@ app.post("/send", async (req, res) => {
         phone: to, content: message, type: "text", direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
         status: 'sent', wamid,
+        quoted_id: quoted_id || null,
+        quoted_content: quoted_content || null,
+        quoted_direction: quoted_direction || null,
       });
       if (msgErr) {
         console.error("❌ Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
@@ -614,43 +617,6 @@ app.post("/contacts/import", async (req, res) => {
   res.json({ success: true, count: toInsert.length });
 });
 
-
-// ── Foto de perfil do contato via WhatsApp API ──
-app.get("/contacts/:phone/avatar", async (req, res) => {
-  const { phone } = req.params;
-  const { account_id } = req.query;
-
-  let token = process.env.WHATSAPP_TOKEN;
-  let phoneNumberId = process.env.PHONE_NUMBER_ID;
-  if (supabase && account_id) {
-    const { data: acc } = await supabase
-      .from("accounts").select("token, phone_number_id").eq("id", account_id).maybeSingle();
-    if (acc?.token) { token = acc.token; phoneNumberId = acc.phone_number_id; }
-  }
-  if (!token || !phoneNumberId) return res.status(404).end();
-
-  try {
-    // Busca a URL da foto de perfil do contato via API Meta
-    const r = await axios.get(
-      `https://graph.facebook.com/v23.0/${phoneNumberId}/profile_picture`,
-      { params: { wa_id: phone, access_token: token } }
-    );
-    const picUrl = r.data?.profile_picture_url || r.data?.url;
-    if (!picUrl) return res.status(404).end();
-
-    // Baixa e faz proxy da imagem
-    const img = await axios.get(picUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-      responseType: "arraybuffer"
-    });
-    const ct = img.headers["content-type"] || "image/jpeg";
-    res.setHeader("Content-Type", ct);
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    res.end(Buffer.from(img.data));
-  } catch (err) {
-    res.status(404).end(); // Sem foto disponível — frontend usa inicial
-  }
-});
 
 // ── Deletar mensagem individual ──
 app.delete("/messages/id/:id", async (req, res) => {
