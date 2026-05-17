@@ -91,13 +91,34 @@ app.post("/webhook", async (req, res) => {
 
       // Extrai conteúdo da mensagem
       let content = "";
+      let mediaId = null;
+      let mediaMimeType = null;
+      let mediaCaption = null;
       const type = message.type;
-      if (type === "text") content = message.text?.body || "";
-      else if (type === "image") content = "[Imagem recebida]";
-      else if (type === "audio") content = "[Áudio recebido]";
-      else if (type === "document") content = "[Documento recebido]";
-      else if (type === "video") content = "[Vídeo recebido]";
-      else content = `[Mensagem do tipo: ${type}]`;
+      if (type === "text") {
+        content = message.text?.body || "";
+      } else if (type === "image") {
+        mediaId = message.image?.id || null;
+        mediaMimeType = message.image?.mime_type || "image/jpeg";
+        mediaCaption = message.image?.caption || null;
+        content = mediaCaption ? `[Imagem: ${mediaCaption}]` : "[Imagem recebida]";
+      } else if (type === "audio") {
+        mediaId = message.audio?.id || null;
+        mediaMimeType = message.audio?.mime_type || "audio/ogg";
+        content = "[Áudio recebido]";
+      } else if (type === "document") {
+        mediaId = message.document?.id || null;
+        mediaMimeType = message.document?.mime_type || "application/octet-stream";
+        mediaCaption = message.document?.filename || null;
+        content = mediaCaption ? `[Documento: ${mediaCaption}]` : "[Documento recebido]";
+      } else if (type === "video") {
+        mediaId = message.video?.id || null;
+        mediaMimeType = message.video?.mime_type || "video/mp4";
+        mediaCaption = message.video?.caption || null;
+        content = mediaCaption ? `[Vídeo: ${mediaCaption}]` : "[Vídeo recebido]";
+      } else {
+        content = `[Mensagem do tipo: ${type}]`;
+      }
 
       if (supabase) {
         // Salva contato com prévia da última mensagem
@@ -134,6 +155,8 @@ app.post("/webhook", async (req, res) => {
           type,
           direction: "inbound",
           timestamp,
+          media_id: mediaId,
+          media_mime_type: mediaMimeType,
         };
         if (accountId) messageData.account_id = accountId; // só inclui se não for null
 
@@ -436,6 +459,45 @@ app.post("/send-media", async (req, res) => {
   } catch (err) {
     console.error("❌ Erro ao enviar mídia:", err.response?.data || err.message);
     res.status(500).json({ error: "Falha ao enviar mídia", detail: err.response?.data });
+  }
+});
+
+// ── Proxy de mídia recebida (imagem, áudio, vídeo, documento) ──
+app.get("/media-proxy/:mediaId", async (req, res) => {
+  const { account_id } = req.query;
+  const { mediaId } = req.params;
+
+  // Busca token da conta
+  let token = process.env.WHATSAPP_TOKEN;
+  if (supabase && account_id) {
+    const { data: account } = await supabase
+      .from("accounts").select("token").eq("id", account_id).maybeSingle();
+    if (account?.token) token = account.token;
+  }
+  if (!token) return res.status(400).json({ error: "Token não encontrado" });
+
+  try {
+    // 1. Busca a URL temporária da mídia na Meta
+    const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const mediaUrl = metaRes.data.url;
+    if (!mediaUrl) return res.status(404).json({ error: "URL de mídia não encontrada" });
+
+    // 2. Baixa o arquivo e retorna ao cliente
+    const fileRes = await axios.get(mediaUrl, {
+      headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
+      responseType: "stream"
+    });
+
+    const contentType = fileRes.headers["content-type"] || "application/octet-stream";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    fileRes.data.pipe(res);
+  } catch (err) {
+    console.error("❌ Erro ao baixar mídia:", err.response?.data || err.message);
+    res.status(500).json({ error: "Falha ao baixar mídia" });
   }
 });
 
