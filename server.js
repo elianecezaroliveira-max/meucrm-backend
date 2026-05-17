@@ -53,6 +53,17 @@ app.post("/webhook", async (req, res) => {
 
     for (const change of changes) {
       const value = change.value;
+
+      // Handle status updates (read receipts)
+      if (value?.statuses?.length && supabase) {
+        for (const st of value.statuses) {
+          const { id: wamid, status } = st;
+          if (wamid && ['sent','delivered','read','failed'].includes(status)) {
+            await supabase.from("messages").update({ status }).eq("wamid", wamid);
+          }
+        }
+      }
+
       if (!value?.messages?.length) continue;
 
       const message = value.messages[0];
@@ -315,9 +326,11 @@ app.post("/send", async (req, res) => {
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
         { onConflict: "phone" }
       );
+      const wamid = response.data?.messages?.[0]?.id || null;
       const { error: msgErr } = await supabase.from("messages").insert({
         phone: to, content: message, type: "text", direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
+        status: 'sent', wamid,
       });
       if (msgErr) {
         console.error("❌ Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
@@ -393,10 +406,12 @@ app.post("/send-media", async (req, res) => {
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
         { onConflict: "phone" }
       );
+      const mediaWamid = null; // media endpoint doesn't return wamid in same way
       await supabase.from("messages").insert({
         phone: to, content: `[${msgType === "image" ? "Imagem" : msgType === "video" ? "Vídeo" : msgType === "audio" ? "Áudio" : "Documento"}: ${fileName}]`,
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
+        status: 'sent', wamid: mediaWamid,
       });
     }
     res.json({ success: true });
@@ -644,6 +659,41 @@ app.put("/contacts/:phone/stage", async (req, res) => {
   const { error } = await supabase
     .from("contacts").update({ stage_id: stage_id || null }).eq("phone", req.params.phone);
   if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// ── Bulk actions ──
+app.put("/contacts/bulk-stage", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { phones, stage_id } = req.body;
+  if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
+  const { error } = await supabase.from("contacts")
+    .update({ stage_id: stage_id || null })
+    .in("phone", phones);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.delete("/contacts/bulk-delete", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { phones } = req.body;
+  if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
+  await supabase.from("messages").delete().in("phone", phones);
+  const { error } = await supabase.from("contacts").delete().in("phone", phones);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.put("/contacts/bulk-tags", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { phones, tags } = req.body;
+  if (!Array.isArray(phones) || !Array.isArray(tags)) return res.status(400).json({ error: "phones e tags obrigatórios" });
+  // For each phone, merge new tags with existing
+  for (const phone of phones) {
+    const { data: contact } = await supabase.from("contacts").select("tags").eq("phone", phone).single();
+    const merged = Array.from(new Set([...(contact?.tags || []), ...tags]));
+    await supabase.from("contacts").update({ tags: merged }).eq("phone", phone);
+  }
   res.json({ success: true });
 });
 
