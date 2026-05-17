@@ -167,6 +167,10 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.log("✅ Mensagem salva:", content.substring(0, 50));
         }
+        // Processa reply de bot ativo
+        if (type === 'text' && content) {
+          try { await handleBotReply(from, content); } catch(be) { console.error('Bot reply error:', be.message); }
+        }
       }
     }
 
@@ -794,6 +798,14 @@ app.put("/contacts/:phone/stage", async (req, res) => {
   const { error } = await supabase
     .from("contacts").update({ stage_id: stage_id || null }).eq("phone", req.params.phone);
   if (error) return res.status(500).json({ error: error.message });
+  // Dispara bots com gatilho de etapa
+  if (stage_id && supabase) {
+    try {
+      const { data: trigBots } = await supabase.from('bots').select('*').eq('trigger_type','stage_enter').eq('trigger_stage_id',stage_id).eq('active',true);
+      const phone = req.params.phone;
+      for (const bot of trigBots||[]) { await startBot(bot.id, phone, bot.account_id); }
+    } catch(e) { console.error('Bot stage trigger error:', e.message); }
+  }
   res.json({ success: true });
 });
 
@@ -839,6 +851,218 @@ app.put("/contacts/:phone/read", async (req, res) => {
     .from("contacts").update({ unread_count: 0, first_unread_at: null }).eq("phone", req.params.phone);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
+});
+
+// ═══════════════════════════════════════
+// SISTEMA DE BOTS — motor de execução
+// ═══════════════════════════════════════
+
+async function sendBotMsg(phone, accountId, text) {
+  let phoneNumberId, token;
+  if (supabase && accountId) {
+    const { data: acct } = await supabase.from('accounts').select('phone_number_id,token').eq('id', accountId).maybeSingle();
+    if (acct) { phoneNumberId = acct.phone_number_id; token = acct.token; }
+  }
+  if (!phoneNumberId) { phoneNumberId = process.env.PHONE_NUMBER_ID; token = process.env.WHATSAPP_TOKEN; }
+  if (!phoneNumberId || !token) return null;
+  try {
+    const r = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
+      { messaging_product:'whatsapp', to:phone, type:'text', text:{body:text} },
+      { headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' } });
+    const wamid = r.data?.messages?.[0]?.id || null;
+    if (supabase) {
+      const ts = new Date().toISOString();
+      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid });
+      const prev = text.length>80 ? text.substring(0,80)+'…' : text;
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound' }).eq('phone',phone);
+    }
+    return wamid;
+  } catch(e) { console.error('❌ Bot sendMsg:', e.response?.data||e.message); return null; }
+}
+
+async function getNextNodeId(fromNodeId, edgeLabel) {
+  if (!supabase) return null;
+  const { data:edges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', fromNodeId);
+  if (!edges?.length) return null;
+  if (edgeLabel) {
+    const m = edges.find(e => e.label && e.label.toLowerCase() === edgeLabel.toLowerCase());
+    if (m) return m.to_node_id;
+  }
+  const def = edges.find(e => !e.label || e.label==='' || e.label==='default');
+  return def?.to_node_id || edges[0]?.to_node_id || null;
+}
+
+async function stopRun(runId, status='completed') {
+  if (supabase) await supabase.from('bot_runs').update({ status, updated_at:new Date().toISOString() }).eq('id', runId);
+}
+
+async function processNode(run, depth=0) {
+  if (!supabase || depth > 30) return; // prevent infinite loops
+  const { id:runId, contact_phone:phone, account_id:acctId, current_node_id:nodeId } = run;
+  const { data:node } = await supabase.from('bot_nodes').select('*').eq('id', nodeId).maybeSingle();
+  if (!node) { await stopRun(runId,'stopped'); return; }
+  const cfg = node.config || {};
+
+  if (node.type === 'start') {
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
+  } else if (node.type === 'message') {
+    let text = cfg.text || '';
+    const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).maybeSingle();
+    const name = ct?.name || phone;
+    text = text.replace(/\{nome\}/gi, name).replace(/\{telefone\}/gi, phone);
+    await sendBotMsg(phone, acctId, text);
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
+  } else if (node.type === 'wait_reply') {
+    let pauseUntil = null;
+    if (cfg.timeout_hours && cfg.timeout_hours > 0) pauseUntil = new Date(Date.now() + cfg.timeout_hours*3600000).toISOString();
+    await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
+
+  } else if (node.type === 'pause') {
+    const ms = ((cfg.days||0)*24+(cfg.hours||0))*3600000 + (cfg.minutes||0)*60000;
+    const pauseUntil = new Date(Date.now()+Math.max(ms,10000)).toISOString();
+    await supabase.from('bot_runs').update({ status:'paused', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
+
+  } else if (node.type === 'move_stage') {
+    if (cfg.stage_id) await supabase.from('contacts').update({ stage_id:cfg.stage_id }).eq('phone',phone);
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
+  } else if (node.type === 'end') {
+    await stopRun(runId,'completed');
+  } else {
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+  }
+}
+
+async function handleBotReply(phone, text) {
+  if (!supabase) return false;
+  const { data:run } = await supabase.from('bot_runs').select('*').eq('contact_phone',phone).eq('status','waiting_reply').order('created_at',{ascending:false}).limit(1).maybeSingle();
+  if (!run) return false;
+  const { data:edges } = await supabase.from('bot_edges').select('*').eq('from_node_id', run.current_node_id);
+  if (!edges?.length) { await stopRun(run.id,'completed'); return true; }
+  const tl = text.toLowerCase().trim();
+  let matched = null;
+  for (const e of edges) {
+    if (!e.label || e.label.startsWith('__')) continue;
+    if (tl === e.label.toLowerCase() || tl.includes(e.label.toLowerCase())) { matched = e; break; }
+  }
+  if (!matched) matched = edges.find(e=>e.label==='__other__') || edges.find(e=>!e.label||e.label===''||e.label==='default') || edges[0];
+  if (matched?.to_node_id) {
+    const upd = { current_node_id:matched.to_node_id, status:'running', pause_until:null, updated_at:new Date().toISOString() };
+    await supabase.from('bot_runs').update(upd).eq('id',run.id);
+    await processNode({...run,...upd});
+  } else { await stopRun(run.id,'completed'); }
+  return true;
+}
+
+async function startBot(botId, phone, accountId) {
+  if (!supabase) return null;
+  await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() }).eq('contact_phone',phone).eq('bot_id',botId).in('status',['running','waiting_reply','paused']);
+  const { data:startNode } = await supabase.from('bot_nodes').select('id').eq('bot_id',botId).eq('type','start').maybeSingle();
+  if (!startNode) { console.error('❌ Bot sem nó start:', botId); return null; }
+  const { data:run, error } = await supabase.from('bot_runs').insert({
+    bot_id:botId, contact_phone:phone, account_id:accountId||null,
+    current_node_id:startNode.id, status:'running',
+    created_at:new Date().toISOString(), updated_at:new Date().toISOString()
+  }).select().single();
+  if (error) { console.error('❌ Bot run insert:', error.message); return null; }
+  await processNode(run);
+  return run;
+}
+
+// Timer: resume paused/timed-out runs every 30s
+setInterval(async () => {
+  if (!supabase) return;
+  const now = new Date().toISOString();
+  const { data:paused } = await supabase.from('bot_runs').select('*').in('status',['paused','waiting_reply']).lte('pause_until',now).not('pause_until','is',null);
+  for (const run of paused||[]) {
+    const nxt = await getNextNodeId(run.current_node_id,'__timeout__') || await getNextNodeId(run.current_node_id,'__other__') || await getNextNodeId(run.current_node_id,null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, status:'running', pause_until:null, updated_at:now }).eq('id',run.id); await processNode({...run,current_node_id:nxt,status:'running'}); }
+    else { await stopRun(run.id,'completed'); }
+  }
+}, 30000);
+
+// ── CRUD de Bots ──
+app.get('/bots', async (req,res) => {
+  if (!supabase) return res.json([]);
+  const { data,error } = await supabase.from('bots').select('*').order('created_at',{ascending:false});
+  if (error) return res.status(500).json({error:error.message});
+  res.json(data||[]);
+});
+app.post('/bots', async (req,res) => {
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  const { name,trigger_type,trigger_stage_id,account_id } = req.body;
+  const { data,error } = await supabase.from('bots').insert({ name:name||'Novo Bot', trigger_type:trigger_type||'manual', trigger_stage_id:trigger_stage_id||null, account_id:account_id||null, active:true }).select().single();
+  if (error) return res.status(500).json({error:error.message});
+  res.json(data);
+});
+app.put('/bots/:id', async (req,res) => {
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  const { name,trigger_type,trigger_stage_id,active } = req.body;
+  const upd = {};
+  if (name!==undefined) upd.name=name;
+  if (trigger_type!==undefined) upd.trigger_type=trigger_type;
+  if (trigger_stage_id!==undefined) upd.trigger_stage_id=trigger_stage_id||null;
+  if (active!==undefined) upd.active=active;
+  const { data,error } = await supabase.from('bots').update(upd).eq('id',req.params.id).select().single();
+  if (error) return res.status(500).json({error:error.message});
+  res.json(data);
+});
+app.delete('/bots/:id', async (req,res) => {
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  const id = req.params.id;
+  await supabase.from('bot_runs').delete().eq('bot_id',id);
+  await supabase.from('bot_edges').delete().eq('bot_id',id);
+  await supabase.from('bot_nodes').delete().eq('bot_id',id);
+  const { error } = await supabase.from('bots').delete().eq('id',id);
+  if (error) return res.status(500).json({error:error.message});
+  res.json({success:true});
+});
+app.get('/bots/:id/flow', async (req,res) => {
+  if (!supabase) return res.json({nodes:[],edges:[]});
+  const id = req.params.id;
+  const [nr,er] = await Promise.all([
+    supabase.from('bot_nodes').select('*').eq('bot_id',id),
+    supabase.from('bot_edges').select('*').eq('bot_id',id)
+  ]);
+  res.json({nodes:nr.data||[],edges:er.data||[]});
+});
+app.put('/bots/:id/flow', async (req,res) => {
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  const { nodes,edges } = req.body;
+  const botId = req.params.id;
+  try {
+    await supabase.from('bot_edges').delete().eq('bot_id',botId);
+    await supabase.from('bot_nodes').delete().eq('bot_id',botId);
+    if (nodes?.length) { const { error:ne } = await supabase.from('bot_nodes').insert(nodes.map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0) }))); if (ne) throw ne; }
+    if (edges?.length) { const { error:ee } = await supabase.from('bot_edges').insert(edges.map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'' }))); if (ee) throw ee; }
+    res.json({success:true});
+  } catch(err) { res.status(500).json({error:err.message}); }
+});
+app.post('/bots/:id/start', async (req,res) => {
+  const { phone,account_id } = req.body;
+  if (!phone) return res.status(400).json({error:'phone obrigatório'});
+  const run = await startBot(req.params.id, phone, account_id);
+  if (!run) return res.status(500).json({error:'Erro ao iniciar bot (verifique se o fluxo tem nó Início)'});
+  res.json({success:true, run_id:run.id});
+});
+app.post('/bot-runs/:id/stop', async (req,res) => {
+  await stopRun(req.params.id,'stopped');
+  res.json({success:true});
+});
+app.get('/bot-runs/contact/:phone', async (req,res) => {
+  if (!supabase) return res.json([]);
+  const { data } = await supabase.from('bot_runs').select('*, bots(name)').eq('contact_phone',req.params.phone).in('status',['running','waiting_reply','paused']).order('created_at',{ascending:false});
+  res.json(data||[]);
 });
 
 app.listen(PORT, () => console.log(`🚀 MeuCRM na porta ${PORT}`));
