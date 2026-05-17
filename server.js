@@ -102,7 +102,7 @@ app.post("/webhook", async (req, res) => {
       if (supabase) {
         // Salva contato
         const contactData = { phone: from, name, last_message_at: timestamp };
-        if (accountId) contactData.account_id = accountId; // só inclui se não for null
+        if (accountId) contactData.account_id = accountId;
 
         const { error: contactErr } = await supabase
           .from("contacts")
@@ -113,6 +113,13 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.log("✅ Contato salvo:", from);
         }
+
+        // Incrementa contador de não lidas
+        const { data: cRow } = await supabase
+          .from("contacts").select("unread_count").eq("phone", from).maybeSingle();
+        await supabase.from("contacts")
+          .update({ unread_count: (cRow?.unread_count || 0) + 1 })
+          .eq("phone", from);
 
         // Salva mensagem
         const messageData = {
@@ -481,15 +488,6 @@ app.post("/contacts/import", async (req, res) => {
   res.json({ success: true, count: toInsert.length });
 });
 
-// ── Listar contatos ──
-app.get("/contacts", async (req, res) => {
-  if (!supabase) return res.json([]);
-  let query = supabase.from("contacts").select("*").order("last_message_at", { ascending: false });
-  if (req.query.account_id) query = query.eq("account_id", req.query.account_id);
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
 
 // ── Mensagens de um contato ──
 app.get("/messages/:phone", async (req, res) => {
@@ -642,11 +640,11 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// Listar contatos (com stage_id)
+// Listar contatos (com stage_id e unread_count)
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("contacts").select("phone, name, account_id, stage_id, tags, last_message_at")
+    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, last_message_at")
     .order("last_message_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -694,6 +692,15 @@ app.put("/contacts/bulk-tags", async (req, res) => {
     const merged = Array.from(new Set([...(contact?.tags || []), ...tags]));
     await supabase.from("contacts").update({ tags: merged }).eq("phone", phone);
   }
+  res.json({ success: true });
+});
+
+// ── Marcar conversa como lida ──
+app.put("/contacts/:phone/read", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { error } = await supabase
+    .from("contacts").update({ unread_count: 0 }).eq("phone", req.params.phone);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
