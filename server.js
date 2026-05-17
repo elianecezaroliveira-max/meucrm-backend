@@ -100,8 +100,13 @@ app.post("/webhook", async (req, res) => {
       else content = `[Mensagem do tipo: ${type}]`;
 
       if (supabase) {
-        // Salva contato
-        const contactData = { phone: from, name, last_message_at: timestamp };
+        // Salva contato com prévia da última mensagem
+        const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
+        const contactData = {
+          phone: from, name, last_message_at: timestamp,
+          last_message_preview: preview,
+          last_message_direction: 'inbound',
+        };
         if (accountId) contactData.account_id = accountId;
 
         const { error: contactErr } = await supabase
@@ -329,8 +334,13 @@ app.post("/send", async (req, res) => {
 
     if (supabase) {
       const safeAccountId = account_id || null;
+      const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
       await supabase.from("contacts").upsert(
-        { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
+        {
+          phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
+          last_message_preview: preview,
+          last_message_direction: 'outbound',
+        },
         { onConflict: "phone" }
       );
       const wamid = response.data?.messages?.[0]?.id || null;
@@ -640,11 +650,11 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// Listar contatos (com stage_id e unread_count)
+// Listar contatos (com stage_id, unread_count e prévia)
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, last_message_at")
+    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, last_message_at, last_message_preview, last_message_direction")
     .order("last_message_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
