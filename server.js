@@ -119,12 +119,13 @@ app.post("/webhook", async (req, res) => {
           console.log("✅ Contato salvo:", from);
         }
 
-        // Incrementa contador de não lidas
+        // Incrementa contador de não lidas e marca hora da 1ª mensagem não lida
         const { data: cRow } = await supabase
-          .from("contacts").select("unread_count").eq("phone", from).maybeSingle();
-        await supabase.from("contacts")
-          .update({ unread_count: (cRow?.unread_count || 0) + 1 })
-          .eq("phone", from);
+          .from("contacts").select("unread_count, first_unread_at").eq("phone", from).maybeSingle();
+        const currentUnread = cRow?.unread_count || 0;
+        const unreadUpdate = { unread_count: currentUnread + 1 };
+        if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp; // só na 1ª mensagem não lida
+        await supabase.from("contacts").update(unreadUpdate).eq("phone", from);
 
         // Salva mensagem
         const messageData = {
@@ -654,7 +655,7 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, last_message_at, last_message_preview, last_message_direction")
+    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
     .order("last_message_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -709,7 +710,7 @@ app.put("/contacts/bulk-tags", async (req, res) => {
 app.put("/contacts/:phone/read", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { error } = await supabase
-    .from("contacts").update({ unread_count: 0 }).eq("phone", req.params.phone);
+    .from("contacts").update({ unread_count: 0, first_unread_at: null }).eq("phone", req.params.phone);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
