@@ -171,6 +171,23 @@ app.post("/webhook", async (req, res) => {
         if (type === 'text' && content) {
           try { await handleBotReply(from, content); } catch(be) { console.error('Bot reply error:', be.message); }
         }
+        // Encaminha para N8N se configurado
+        const n8nUrl = _settings['n8n_webhook_url'];
+        if (n8nUrl) {
+          try {
+            await axios.post(n8nUrl, {
+              event: 'message_received',
+              phone: from,
+              name,
+              content,
+              type,
+              timestamp,
+              account_id: accountId || null,
+              media_id: mediaId || null,
+              media_mime_type: mediaMimeType || null
+            }, { timeout: 8000 });
+          } catch(ne) { console.error('N8N forward error:', ne.message); }
+        }
       }
     }
 
@@ -1063,6 +1080,59 @@ app.get('/bot-runs/contact/:phone', async (req,res) => {
   if (!supabase) return res.json([]);
   const { data } = await supabase.from('bot_runs').select('*, bots(name)').eq('contact_phone',req.params.phone).in('status',['running','waiting_reply','paused']).order('created_at',{ascending:false});
   res.json(data||[]);
+});
+
+// ═══════════════════════════════════════
+// SETTINGS + INTEGRAÇÃO N8N
+// ═══════════════════════════════════════
+
+// Cache de settings (evita consulta ao DB em cada mensagem)
+let _settings = {};
+async function loadSettings() {
+  if (!supabase) return;
+  try {
+    const { data } = await supabase.from('settings').select('key, value');
+    for (const row of data || []) _settings[row.key] = row.value;
+    console.log('✅ Settings carregados:', Object.keys(_settings).join(', ') || '(nenhum)');
+  } catch(e) { console.error('Settings load error:', e.message); }
+}
+loadSettings();
+
+app.get('/settings/:key', async (req, res) => {
+  if (!supabase) return res.json({ value: null });
+  const { data } = await supabase.from('settings').select('value').eq('key', req.params.key).maybeSingle();
+  res.json({ value: data?.value || null });
+});
+
+app.put('/settings/:key', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { value } = req.body;
+  const { error } = await supabase.from('settings').upsert({ key: req.params.key, value, updated_at: new Date().toISOString() });
+  if (error) return res.status(500).json({ error: error.message });
+  _settings[req.params.key] = value;
+  res.json({ success: true });
+});
+
+// Teste de conexão N8N — envia evento de teste para o webhook configurado
+app.post('/n8n/test', async (req, res) => {
+  const n8nUrl = _settings['n8n_webhook_url'];
+  if (!n8nUrl) return res.status(400).json({ error: 'URL do N8N não configurada' });
+  try {
+    await axios.post(n8nUrl, {
+      event: 'test',
+      phone: '5500000000000',
+      name: 'Teste MeuCRM',
+      content: 'Esta é uma mensagem de teste enviada pelo MeuCRM ✅',
+      type: 'text',
+      timestamp: new Date().toISOString(),
+      account_id: null,
+      media_id: null,
+      media_mime_type: null
+    }, { timeout: 10000 });
+    res.json({ success: true });
+  } catch(e) {
+    res.status(500).json({ error: 'Não conseguiu conectar: ' + e.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`🚀 MeuCRM na porta ${PORT}`));
