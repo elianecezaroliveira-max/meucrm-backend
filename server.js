@@ -1203,10 +1203,22 @@ app.post('/evolution/connect', async (req, res) => {
 app.get('/evolution/qr/:instance', async (req, res) => {
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
-    const qr = data?.base64 || data?.qrcode?.base64 || null;
-    res.json({ qr });
+    console.log('Evolution QR raw:', JSON.stringify(data).substring(0, 300));
+    const qr = data?.base64 || data?.qrcode?.base64 || data?.code || null;
+    res.json({ qr, raw: data });
   } catch(e) {
-    res.status(500).json({ error: e.message, qr: null });
+    console.error('Evolution QR error:', e.response?.data || e.message);
+    res.status(500).json({ error: e.message, qr: null, raw: e.response?.data });
+  }
+});
+
+// GET /evolution/debug — mostra info bruta da Evolution API
+app.get('/evolution/debug', async (req, res) => {
+  try {
+    const { data } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
+    res.json({ instances: data, url: EVOLUTION_URL });
+  } catch(e) {
+    res.status(500).json({ error: e.message, url: EVOLUTION_URL, detail: e.response?.data });
   }
 });
 
