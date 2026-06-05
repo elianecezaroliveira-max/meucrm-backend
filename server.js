@@ -1217,15 +1217,16 @@ app.post('/evolution/connect', async (req, res) => {
     // QR pode vir imediatamente na resposta de criação
     let qr = data?.qrcode?.base64 || data?.base64 || null;
 
-    // Se não veio, aguarda o ChannelStartupService inicializar (pode demorar 15-30s)
+    // Se não veio, faz APENAS algumas tentativas rápidas (não trava a requisição).
+    // O QR também chega de forma assíncrona via webhook (qrCache) e pelo polling do frontend.
     if (!qr) {
-      console.log(`⏳ QR não veio na criação, aguardando ChannelStartupService...`);
-      for (let i = 0; i < 15; i++) {
-        await new Promise(r => setTimeout(r, 3000)); // 3s entre tentativas = 45s total
+      console.log(`⏳ QR não veio na criação, tentando rápido via /instance/connect...`);
+      for (let i = 0; i < 3; i++) {
+        await new Promise(r => setTimeout(r, 2000)); // 3 tentativas x 2s = 6s no máximo
         try {
           const { data: qrData } = await axios.get(
             `${EVOLUTION_URL}/instance/connect/${instanceName}`,
-            { headers: evoHdr(), timeout: 10000 }
+            { headers: evoHdr(), timeout: 8000 }
           );
           console.log(`QR attempt ${i+1}:`, JSON.stringify(qrData).substring(0, 200));
           qr = qrData?.base64 || qrData?.qrcode?.base64 || null;
@@ -1236,7 +1237,8 @@ app.post('/evolution/connect', async (req, res) => {
       }
     }
 
-    console.log(`Instância criada: ${instanceName}, QR: ${qr ? 'SIM' : 'NAO'}`);
+    // Retorna já — o frontend continua buscando o QR em /evolution/qr (cache do webhook + connect)
+    console.log(`Instância criada: ${instanceName}, QR: ${qr ? 'SIM' : 'NAO (frontend faz polling)'}`);
     res.json({ success: true, instance: instanceName, qr });
   } catch(e) {
     console.error('Evolution create error:', e.response?.data || e.message);
