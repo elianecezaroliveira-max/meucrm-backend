@@ -1167,6 +1167,9 @@ const BACKEND_URL   = process.env.BACKEND_PUBLIC_URL || 'https://meucrm-backend-
 
 const evoHdr = () => ({ apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' });
 
+// Cache de QR Code por instância — preenchido pelo webhook QRCODE_UPDATED (QR assíncrono)
+const qrCache = {};
+
 // Envia mensagem via Evolution API
 async function sendViaEvolution(instanceName, to, text) {
   // Evolution API v2: body usa "text" direto
@@ -1205,7 +1208,7 @@ app.post('/evolution/connect', async (req, res) => {
         url: webhookUrl,
         byEvents: false,
         base64: false,
-        events: ['MESSAGES_UPSERT', 'CONNECTION_UPDATE']
+        events: ['QRCODE_UPDATED', 'MESSAGES_UPSERT', 'CONNECTION_UPDATE']
       }
     }, { headers: evoHdr(), timeout: 15000 });
 
@@ -1243,6 +1246,10 @@ app.post('/evolution/connect', async (req, res) => {
 
 // GET /evolution/qr/:instance — QR code (Evolution API v2)
 app.get('/evolution/qr/:instance', async (req, res) => {
+  // 0. Se o webhook já entregou o QR, serve do cache (mais rápido e confiável)
+  if (qrCache[req.params.instance]) {
+    return res.json({ qr: qrCache[req.params.instance], code: null, pairingCode: null, raw: { cached: true } });
+  }
   try {
     // Evolution API v2: o QR vem de GET /instance/connect/:instance
     // Resposta: { pairingCode, code, base64, count }
@@ -1380,8 +1387,17 @@ app.post('/evolution-webhook', async (req, res) => {
           try { await axios.post(n8nUrl, { event: 'message_received', phone, name, content, type, timestamp, account_id: accountId || null }, { timeout: 8000 }); } catch(ne) {}
         }
       }
+    } else if (event === 'qrcode.updated') {
+      // Evolution gera o QR de forma assíncrona e o entrega aqui
+      const b64 = data?.qrcode?.base64 || data?.base64 || null;
+      if (b64) {
+        qrCache[instanceName] = b64.startsWith('data:') ? b64 : 'data:image/png;base64,' + b64;
+        console.log(`📲 QR cacheado para ${instanceName}`);
+      }
     } else if (event === 'connection.update') {
       console.log(`🔌 Evolution ${instanceName}: ${data?.state}`);
+      // Ao conectar (ou desconectar), o QR antigo não serve mais
+      if (data?.state === 'open' || data?.state === 'close') delete qrCache[instanceName];
     }
   } catch(err) {
     console.error('Evolution webhook error:', err.message);
