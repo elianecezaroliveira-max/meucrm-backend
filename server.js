@@ -317,7 +317,7 @@ app.post("/auth/whatsapp", async (req, res) => {
 app.get("/accounts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("accounts").select("id, name, phone_number_id, phone_display, created_at")
+    .from("accounts").select("id, name, phone_number_id, phone_display, type, evolution_instance, created_at")
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -348,22 +348,44 @@ app.post("/send", async (req, res) => {
   const { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
 
-  let phoneNumberId, token;
+  let phoneNumberId, token, evolutionInstance = null, accountType = 'cloudapi';
 
   // 1. Tenta buscar conta do banco de dados pelo account_id
   if (supabase && account_id) {
     const { data: account, error: accErr } = await supabase
-      .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
+      .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).single();
     if (accErr) console.error("❌ Erro ao buscar conta para envio:", accErr.message);
-    if (account) { phoneNumberId = account.phone_number_id; token = account.token; }
+    if (account) {
+      phoneNumberId = account.phone_number_id;
+      token = account.token;
+      accountType = account.type || 'cloudapi';
+      evolutionInstance = account.evolution_instance || null;
+    }
   }
 
   // 2. Fallback: usa variáveis de ambiente (PHONE_NUMBER_ID + WHATSAPP_TOKEN)
-  if (!phoneNumberId || !token) {
+  if (!evolutionInstance && (!phoneNumberId || !token)) {
     phoneNumberId = process.env.PHONE_NUMBER_ID;
     token = process.env.WHATSAPP_TOKEN;
     if (phoneNumberId && token) {
       console.log("⚠️ Conta não encontrada no banco — usando credenciais das variáveis de ambiente");
+    }
+  }
+
+  // 3. Envio via Evolution API (QR Code)
+  if (accountType === 'evolution' && evolutionInstance) {
+    try {
+      await sendViaEvolution(evolutionInstance, to, message);
+      if (supabase) {
+        const safeAccountId = account_id || null;
+        const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
+        await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound' }, { onConflict: 'phone' });
+        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
+      }
+      return res.json({ success: true, via: 'evolution' });
+    } catch(e) {
+      console.error('Evolution send error:', e.response?.data || e.message);
+      return res.status(500).json({ error: 'Falha ao enviar via Evolution: ' + (e.response?.data?.message || e.message) });
     }
   }
 
@@ -1132,6 +1154,169 @@ app.post('/n8n/test', async (req, res) => {
     res.json({ success: true });
   } catch(e) {
     res.status(500).json({ error: 'Não conseguiu conectar: ' + e.message });
+  }
+});
+
+// ═══════════════════════════════════════
+// EVOLUTION API — Conexão via QR Code
+// ═══════════════════════════════════════
+
+const EVOLUTION_URL = (process.env.EVOLUTION_API_URL || 'https://evolution-api-production-ac49c.up.railway.app').replace(/\/$/, '');
+const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY || 'meucrm2024';
+const BACKEND_URL   = process.env.BACKEND_PUBLIC_URL || 'https://meucrm-backend-production-d4f4.up.railway.app';
+
+const evoHdr = () => ({ apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' });
+
+// Envia mensagem via Evolution API
+async function sendViaEvolution(instanceName, to, text) {
+  const r = await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`, { number: to, text }, { headers: evoHdr(), timeout: 15000 });
+  return r.data;
+}
+
+// POST /evolution/connect — cria instância e retorna QR code base64
+app.post('/evolution/connect', async (req, res) => {
+  const instanceName = `meucrm_${Date.now()}`;
+  try {
+    const webhookUrl = `${BACKEND_URL}/evolution-webhook`;
+    const { data } = await axios.post(`${EVOLUTION_URL}/instance/create`, {
+      instanceName,
+      qrcode: true,
+      integration: 'WHATSAPP-BAILEYS',
+      webhook: {
+        url: webhookUrl,
+        byEvents: false,
+        base64: false,
+        events: ['MESSAGES_UPSERT', 'CONNECTION_UPDATE']
+      }
+    }, { headers: evoHdr(), timeout: 15000 });
+
+    const qr = data?.qrcode?.base64 || data?.hash?.qrcode || null;
+    console.log(`✅ Evolution instância criada: ${instanceName}`);
+    res.json({ success: true, instance: instanceName, qr });
+  } catch(e) {
+    console.error('Evolution create error:', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
+// GET /evolution/qr/:instance — QR code atualizado
+app.get('/evolution/qr/:instance', async (req, res) => {
+  try {
+    const { data } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
+    const qr = data?.base64 || data?.qrcode?.base64 || null;
+    res.json({ qr });
+  } catch(e) {
+    res.status(500).json({ error: e.message, qr: null });
+  }
+});
+
+// GET /evolution/status/:instance — verifica estado da conexão
+app.get('/evolution/status/:instance', async (req, res) => {
+  try {
+    const { data } = await axios.get(`${EVOLUTION_URL}/instance/connectionState/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
+    const state = data?.instance?.state || data?.state || 'close';
+    let phone = null;
+    if (state === 'open') {
+      try {
+        const { data: list } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
+        const inst = (list || []).find(i => i.instance?.instanceName === req.params.instance || i.instanceName === req.params.instance);
+        const ownerJid = inst?.instance?.ownerJid || inst?.ownerJid || '';
+        if (ownerJid) phone = ownerJid.replace('@s.whatsapp.net', '').replace(/\D/g, '') || null;
+      } catch(e2) { console.warn('Fetch instances err:', e2.message); }
+    }
+    res.json({ state, phone });
+  } catch(e) {
+    res.status(500).json({ error: e.message, state: 'close' });
+  }
+});
+
+// POST /evolution/save-account — salva conta Evolution no Supabase após conexão
+app.post('/evolution/save-account', async (req, res) => {
+  const { instance, phone } = req.body;
+  if (!instance) return res.status(400).json({ error: 'instance obrigatório' });
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const name = phone ? `WhatsApp ${phone}` : `WhatsApp QR (${instance})`;
+  const { data, error } = await supabase.from('accounts')
+    .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '' }, { onConflict: 'phone_number_id' })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  console.log('✅ Conta Evolution salva:', name);
+  res.json({ success: true, data });
+});
+
+// DELETE /evolution/disconnect/:instance
+app.delete('/evolution/disconnect/:instance', async (req, res) => {
+  try {
+    await axios.delete(`${EVOLUTION_URL}/instance/delete/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
+    if (supabase) await supabase.from('accounts').delete().eq('evolution_instance', req.params.instance);
+    res.json({ success: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /evolution-webhook — recebe mensagens da Evolution API
+app.post('/evolution-webhook', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const { event, instance: instanceName, data } = req.body;
+    console.log('📩 Evolution webhook:', event, instanceName);
+
+    if (event === 'messages.upsert') {
+      if (!data || data.key?.fromMe) return;
+      const remoteJid = data.key?.remoteJid || '';
+      if (remoteJid.includes('@g.us')) return; // ignora grupos
+
+      const phone     = remoteJid.replace('@s.whatsapp.net', '');
+      const name      = data.pushName || phone;
+      const timestamp = new Date((data.messageTimestamp || Date.now() / 1000) * 1000).toISOString();
+
+      // Extrai conteúdo
+      let content = '[Mensagem recebida]', type = 'text';
+      const msg = data.message || {};
+      if      (msg.conversation)          { content = msg.conversation; type = 'text'; }
+      else if (msg.extendedTextMessage)   { content = msg.extendedTextMessage.text || ''; type = 'text'; }
+      else if (msg.imageMessage)          { content = msg.imageMessage.caption || '[Imagem recebida]'; type = 'image'; }
+      else if (msg.audioMessage || msg.pttMessage) { content = '[Áudio recebido]'; type = 'audio'; }
+      else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo recebido]'; type = 'video'; }
+      else if (msg.documentMessage)       { content = msg.documentMessage.fileName || '[Documento recebido]'; type = 'document'; }
+
+      // Busca account_id
+      let accountId = null;
+      if (supabase && instanceName) {
+        const { data: acc } = await supabase.from('accounts').select('id').eq('evolution_instance', instanceName).maybeSingle();
+        if (acc) accountId = acc.id;
+      }
+
+      if (supabase) {
+        const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
+        const contactData = { phone, name, last_message_at: timestamp, last_message_preview: preview, last_message_direction: 'inbound' };
+        if (accountId) contactData.account_id = accountId;
+        await supabase.from('contacts').upsert(contactData, { onConflict: 'phone' });
+
+        const { data: cRow } = await supabase.from('contacts').select('unread_count, first_unread_at').eq('phone', phone).maybeSingle();
+        const currentUnread = cRow?.unread_count || 0;
+        const unreadUpdate = { unread_count: currentUnread + 1 };
+        if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp;
+        await supabase.from('contacts').update(unreadUpdate).eq('phone', phone);
+
+        const msgData = { phone, content, type, direction: 'inbound', timestamp };
+        if (accountId) msgData.account_id = accountId;
+        await supabase.from('messages').insert(msgData);
+
+        if (type === 'text' && content) {
+          try { await handleBotReply(phone, content); } catch(be) { console.error('Bot reply error:', be.message); }
+        }
+        const n8nUrl = _settings['n8n_webhook_url'];
+        if (n8nUrl) {
+          try { await axios.post(n8nUrl, { event: 'message_received', phone, name, content, type, timestamp, account_id: accountId || null }, { timeout: 8000 }); } catch(ne) {}
+        }
+      }
+    } else if (event === 'connection.update') {
+      console.log(`🔌 Evolution ${instanceName}: ${data?.state}`);
+    }
+  } catch(err) {
+    console.error('Evolution webhook error:', err.message);
   }
 });
 
