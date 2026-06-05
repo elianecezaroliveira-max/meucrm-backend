@@ -1209,31 +1209,32 @@ app.post('/evolution/connect', async (req, res) => {
       }
     }, { headers: evoHdr(), timeout: 15000 });
 
-    console.log('Evolution create raw:', JSON.stringify(data));
+    console.log('Evolution create raw keys:', Object.keys(data || {}));
 
-    // 3. Tenta extrair QR de todos os campos possíveis
-    let qr = data?.qrcode?.base64
-      || data?.qrcode?.code
-      || data?.hash?.qrcode
-      || data?.base64
-      || data?.code
-      || null;
+    // QR pode vir imediatamente na resposta de criação
+    let qr = data?.qrcode?.base64 || data?.base64 || null;
 
-    // 4. Se não veio na criação, aguarda e tenta buscar
+    // Se não veio, aguarda o ChannelStartupService inicializar (pode demorar 15-30s)
     if (!qr) {
-      for (let i = 0; i < 5; i++) {
-        await new Promise(r => setTimeout(r, 2000));
+      console.log(`⏳ QR não veio na criação, aguardando ChannelStartupService...`);
+      for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 3000)); // 3s entre tentativas = 45s total
         try {
-          const { data: qrData } = await axios.get(`${EVOLUTION_URL}/instance/connect/${instanceName}`, { headers: evoHdr(), timeout: 10000 });
-          console.log(`Evolution connect attempt ${i+1}:`, JSON.stringify(qrData).substring(0, 400));
-          qr = qrData?.base64 || qrData?.qrcode?.base64 || qrData?.code || qrData?.qrcode?.code || null;
-          if (qr) break;
-        } catch(qrErr) { console.warn(`QR attempt ${i+1} error:`, qrErr.response?.data || qrErr.message); }
+          const { data: qrData } = await axios.get(
+            `${EVOLUTION_URL}/instance/qrcode/${instanceName}`,
+            { headers: evoHdr(), timeout: 10000, params: { image: true } }
+          );
+          console.log(`QR attempt ${i+1}:`, JSON.stringify(qrData).substring(0, 200));
+          qr = qrData?.base64 || qrData?.qrcode?.base64 || null;
+          if (qr) { console.log(`✅ QR obtido na tentativa ${i+1}`); break; }
+        } catch(qrErr) {
+          console.warn(`QR attempt ${i+1} error:`, qrErr.response?.status, qrErr.message);
+        }
       }
     }
 
-    console.log(`✅ Evolution instância criada: ${instanceName}, QR: ${qr ? 'recebido (' + qr.substring(0,30) + '...)' : 'não obtido'}`);
-    res.json({ success: true, instance: instanceName, qr, _debug: { keys: Object.keys(data || {}) } });
+    console.log(`Instância criada: ${instanceName}, QR: ${qr ? 'SIM' : 'NAO'}`);
+    res.json({ success: true, instance: instanceName, qr });
   } catch(e) {
     console.error('Evolution create error:', e.response?.data || e.message);
     res.status(500).json({ error: e.response?.data?.message || e.message });
