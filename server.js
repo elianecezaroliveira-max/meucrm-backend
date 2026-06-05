@@ -1221,8 +1221,8 @@ app.post('/evolution/connect', async (req, res) => {
         await new Promise(r => setTimeout(r, 3000)); // 3s entre tentativas = 45s total
         try {
           const { data: qrData } = await axios.get(
-            `${EVOLUTION_URL}/instance/qrcode/${instanceName}`,
-            { headers: evoHdr(), timeout: 10000, params: { image: true } }
+            `${EVOLUTION_URL}/instance/connect/${instanceName}`,
+            { headers: evoHdr(), timeout: 10000 }
           );
           console.log(`QR attempt ${i+1}:`, JSON.stringify(qrData).substring(0, 200));
           qr = qrData?.base64 || qrData?.qrcode?.base64 || null;
@@ -1244,20 +1244,20 @@ app.post('/evolution/connect', async (req, res) => {
 // GET /evolution/qr/:instance — QR code (Evolution API v2)
 app.get('/evolution/qr/:instance', async (req, res) => {
   try {
-    // Evolution API v2: endpoint correto é /instance/qrcode/:instance
-    const { data } = await axios.get(`${EVOLUTION_URL}/instance/qrcode/${req.params.instance}`, {
-      headers: evoHdr(), timeout: 10000,
-      params: { image: true }
+    // Evolution API v2: o QR vem de GET /instance/connect/:instance
+    // Resposta: { pairingCode, code, base64, count }
+    const { data } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, {
+      headers: evoHdr(), timeout: 10000
     });
     console.log('Evolution QR v2 raw:', JSON.stringify(data).substring(0, 400));
     const qr = data?.base64 || data?.qrcode?.base64 || null;
     const code = data?.code || data?.qrcode?.code || null;
-    res.json({ qr, code, raw: data });
+    res.json({ qr, code, pairingCode: data?.pairingCode || null, raw: data });
   } catch(e) {
     console.error('Evolution QR error:', e.response?.data || e.message);
-    // Tenta endpoint alternativo v1
+    // Fallback: endpoint legado /instance/qrcode
     try {
-      const { data: d2 } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, { headers: evoHdr(), timeout: 8000 });
+      const { data: d2 } = await axios.get(`${EVOLUTION_URL}/instance/qrcode/${req.params.instance}`, { headers: evoHdr(), timeout: 8000, params: { image: true } });
       const qr = d2?.base64 || d2?.qrcode?.base64 || null;
       const code = d2?.code || d2?.qrcode?.code || null;
       return res.json({ qr, code, raw: d2 });
