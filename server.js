@@ -1169,7 +1169,12 @@ const evoHdr = () => ({ apikey: EVOLUTION_KEY, 'Content-Type': 'application/json
 
 // Envia mensagem via Evolution API
 async function sendViaEvolution(instanceName, to, text) {
-  const r = await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`, { number: to, text }, { headers: evoHdr(), timeout: 15000 });
+  // Evolution API v2: body usa "text" direto
+  const r = await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
+    number: to,
+    text,
+    options: { delay: 1000 }
+  }, { headers: evoHdr(), timeout: 15000 });
   return r.data;
 }
 
@@ -1235,22 +1240,27 @@ app.post('/evolution/connect', async (req, res) => {
   }
 });
 
-// GET /evolution/qr/:instance — QR code atualizado
+// GET /evolution/qr/:instance — QR code (Evolution API v2)
 app.get('/evolution/qr/:instance', async (req, res) => {
   try {
-    const { data } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
-    console.log('Evolution QR raw:', JSON.stringify(data).substring(0, 400));
-    // Tenta todos os campos possíveis de QR
-    let qr = data?.base64 || data?.qrcode?.base64 || null;
-    // Se vier como código de texto (não base64), converte via URL do Google Charts
-    if (!qr && (data?.code || data?.qrcode?.code)) {
-      const code = data?.code || data?.qrcode?.code;
-      // Retorna o código para o frontend gerar a imagem
-      return res.json({ qr: null, code, raw: data });
-    }
-    res.json({ qr, raw: data });
+    // Evolution API v2: endpoint correto é /instance/qrcode/:instance
+    const { data } = await axios.get(`${EVOLUTION_URL}/instance/qrcode/${req.params.instance}`, {
+      headers: evoHdr(), timeout: 10000,
+      params: { image: true }
+    });
+    console.log('Evolution QR v2 raw:', JSON.stringify(data).substring(0, 400));
+    const qr = data?.base64 || data?.qrcode?.base64 || null;
+    const code = data?.code || data?.qrcode?.code || null;
+    res.json({ qr, code, raw: data });
   } catch(e) {
     console.error('Evolution QR error:', e.response?.data || e.message);
+    // Tenta endpoint alternativo v1
+    try {
+      const { data: d2 } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, { headers: evoHdr(), timeout: 8000 });
+      const qr = d2?.base64 || d2?.qrcode?.base64 || null;
+      const code = d2?.code || d2?.qrcode?.code || null;
+      return res.json({ qr, code, raw: d2 });
+    } catch(e2) {}
     res.status(500).json({ error: e.message, qr: null, raw: e.response?.data });
   }
 });
@@ -1265,16 +1275,18 @@ app.get('/evolution/debug', async (req, res) => {
   }
 });
 
-// GET /evolution/status/:instance — verifica estado da conexão
+// GET /evolution/status/:instance — verifica estado (Evolution API v2)
 app.get('/evolution/status/:instance', async (req, res) => {
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/connectionState/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
+    console.log('Evolution status raw:', JSON.stringify(data).substring(0, 200));
+    // v2: { instance: { instanceName, state } } ou { state }
     const state = data?.instance?.state || data?.state || 'close';
     let phone = null;
     if (state === 'open') {
       try {
         const { data: list } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
-        const inst = (list || []).find(i => i.instance?.instanceName === req.params.instance || i.instanceName === req.params.instance);
+        const inst = (list || []).find(i => (i.instance?.instanceName || i.instanceName || i.name) === req.params.instance);
         const ownerJid = inst?.instance?.ownerJid || inst?.ownerJid || '';
         if (ownerJid) phone = ownerJid.replace('@s.whatsapp.net', '').replace(/\D/g, '') || null;
       } catch(e2) { console.warn('Fetch instances err:', e2.message); }
