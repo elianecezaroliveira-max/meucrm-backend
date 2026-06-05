@@ -1173,10 +1173,24 @@ async function sendViaEvolution(instanceName, to, text) {
   return r.data;
 }
 
-// POST /evolution/connect — cria instância e retorna QR code base64
+// POST /evolution/connect — limpa instâncias antigas, cria nova e retorna QR
 app.post('/evolution/connect', async (req, res) => {
   const instanceName = `meucrm_${Date.now()}`;
   try {
+    // 1. Limpa instâncias antigas desconectadas (evita acúmulo)
+    try {
+      const { data: list } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
+      for (const inst of list || []) {
+        const name = inst.instance?.instanceName || inst.instanceName || inst.name;
+        const status = inst.instance?.connectionStatus || inst.connectionStatus;
+        if (name && name.startsWith('meucrm_') && status !== 'open') {
+          await axios.delete(`${EVOLUTION_URL}/instance/delete/${name}`, { headers: evoHdr(), timeout: 8000 }).catch(() => {});
+          console.log('🗑️ Instância antiga removida:', name);
+        }
+      }
+    } catch(cleanErr) { console.warn('Cleanup warn:', cleanErr.message); }
+
+    // 2. Cria nova instância
     const webhookUrl = `${BACKEND_URL}/evolution-webhook`;
     const { data } = await axios.post(`${EVOLUTION_URL}/instance/create`, {
       instanceName,
@@ -1190,8 +1204,22 @@ app.post('/evolution/connect', async (req, res) => {
       }
     }, { headers: evoHdr(), timeout: 15000 });
 
-    const qr = data?.qrcode?.base64 || data?.hash?.qrcode || null;
-    console.log(`✅ Evolution instância criada: ${instanceName}`);
+    console.log('Evolution create raw:', JSON.stringify(data).substring(0, 500));
+
+    // 3. Tenta extrair QR da resposta de criação
+    let qr = data?.qrcode?.base64 || data?.hash?.qrcode || data?.qrcode?.code || null;
+
+    // 4. Se não veio na criação, tenta buscar logo em seguida
+    if (!qr) {
+      await new Promise(r => setTimeout(r, 2000)); // aguarda 2s
+      try {
+        const { data: qrData } = await axios.get(`${EVOLUTION_URL}/instance/connect/${instanceName}`, { headers: evoHdr(), timeout: 10000 });
+        console.log('Evolution connect raw:', JSON.stringify(qrData).substring(0, 300));
+        qr = qrData?.base64 || qrData?.qrcode?.base64 || qrData?.code || null;
+      } catch(qrErr) { console.warn('QR fetch warn:', qrErr.message); }
+    }
+
+    console.log(`✅ Evolution instância criada: ${instanceName}, QR: ${qr ? 'recebido' : 'pendente'}`);
     res.json({ success: true, instance: instanceName, qr });
   } catch(e) {
     console.error('Evolution create error:', e.response?.data || e.message);
@@ -1203,8 +1231,15 @@ app.post('/evolution/connect', async (req, res) => {
 app.get('/evolution/qr/:instance', async (req, res) => {
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
-    console.log('Evolution QR raw:', JSON.stringify(data).substring(0, 300));
-    const qr = data?.base64 || data?.qrcode?.base64 || data?.code || null;
+    console.log('Evolution QR raw:', JSON.stringify(data).substring(0, 400));
+    // Tenta todos os campos possíveis de QR
+    let qr = data?.base64 || data?.qrcode?.base64 || null;
+    // Se vier como código de texto (não base64), converte via URL do Google Charts
+    if (!qr && (data?.code || data?.qrcode?.code)) {
+      const code = data?.code || data?.qrcode?.code;
+      // Retorna o código para o frontend gerar a imagem
+      return res.json({ qr: null, code, raw: data });
+    }
     res.json({ qr, raw: data });
   } catch(e) {
     console.error('Evolution QR error:', e.response?.data || e.message);
