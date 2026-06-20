@@ -375,12 +375,13 @@ app.post("/send", async (req, res) => {
   // 3. Envio via Evolution API (QR Code)
   if (accountType === 'evolution' && evolutionInstance) {
     try {
-      await sendViaEvolution(evolutionInstance, to, message);
+      const evoRes = await sendViaEvolution(evolutionInstance, to, message);
+      const wamid = evoRes?.key?.id || null; // mesmo id que volta no webhook → permite dedup
       if (supabase) {
         const safeAccountId = account_id || null;
         const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
         await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound' }, { onConflict: 'phone' });
-        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
+        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, wamid, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
       }
       return res.json({ success: true, via: 'evolution' });
     } catch(e) {
@@ -1340,23 +1341,26 @@ app.post('/evolution-webhook', async (req, res) => {
     console.log('📩 Evolution webhook:', event, instanceName);
 
     if (event === 'messages.upsert') {
-      if (!data || data.key?.fromMe) return;
+      if (!data) return;
+      const fromMe    = !!data.key?.fromMe;        // true = mensagem enviada pelo celular/CRM
       const remoteJid = data.key?.remoteJid || '';
       if (remoteJid.includes('@g.us')) return; // ignora grupos
 
       const phone     = remoteJid.replace('@s.whatsapp.net', '');
       const name      = data.pushName || phone;
       const timestamp = new Date((data.messageTimestamp || Date.now() / 1000) * 1000).toISOString();
+      const wamid     = data.key?.id || null;
+      const direction = fromMe ? 'outbound' : 'inbound';
 
       // Extrai conteúdo
-      let content = '[Mensagem recebida]', type = 'text';
+      let content = fromMe ? '[Mensagem enviada]' : '[Mensagem recebida]', type = 'text';
       const msg = data.message || {};
       if      (msg.conversation)          { content = msg.conversation; type = 'text'; }
       else if (msg.extendedTextMessage)   { content = msg.extendedTextMessage.text || ''; type = 'text'; }
-      else if (msg.imageMessage)          { content = msg.imageMessage.caption || '[Imagem recebida]'; type = 'image'; }
-      else if (msg.audioMessage || msg.pttMessage) { content = '[Áudio recebido]'; type = 'audio'; }
-      else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo recebido]'; type = 'video'; }
-      else if (msg.documentMessage)       { content = msg.documentMessage.fileName || '[Documento recebido]'; type = 'document'; }
+      else if (msg.imageMessage)          { content = msg.imageMessage.caption || '[Imagem]'; type = 'image'; }
+      else if (msg.audioMessage || msg.pttMessage) { content = '[Áudio]'; type = 'audio'; }
+      else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
+      else if (msg.documentMessage)       { content = msg.documentMessage.fileName || '[Documento]'; type = 'document'; }
 
       // Busca account_id
       let accountId = null;
@@ -1366,27 +1370,39 @@ app.post('/evolution-webhook', async (req, res) => {
       }
 
       if (supabase) {
+        // Dedup: evita duplicar mensagens já salvas (ex.: enviadas pelo próprio CRM)
+        if (wamid) {
+          const { data: exists } = await supabase.from('messages').select('id').eq('wamid', wamid).maybeSingle();
+          if (exists) return;
+        }
+
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
-        const contactData = { phone, name, last_message_at: timestamp, last_message_preview: preview, last_message_direction: 'inbound' };
+        const contactData = { phone, name, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
         if (accountId) contactData.account_id = accountId;
         await supabase.from('contacts').upsert(contactData, { onConflict: 'phone' });
 
-        const { data: cRow } = await supabase.from('contacts').select('unread_count, first_unread_at').eq('phone', phone).maybeSingle();
-        const currentUnread = cRow?.unread_count || 0;
-        const unreadUpdate = { unread_count: currentUnread + 1 };
-        if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp;
-        await supabase.from('contacts').update(unreadUpdate).eq('phone', phone);
+        // Incrementa não-lidos só para mensagens RECEBIDAS
+        if (!fromMe) {
+          const { data: cRow } = await supabase.from('contacts').select('unread_count, first_unread_at').eq('phone', phone).maybeSingle();
+          const currentUnread = cRow?.unread_count || 0;
+          const unreadUpdate = { unread_count: currentUnread + 1 };
+          if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp;
+          await supabase.from('contacts').update(unreadUpdate).eq('phone', phone);
+        }
 
-        const msgData = { phone, content, type, direction: 'inbound', timestamp };
+        const msgData = { phone, content, type, direction, timestamp, wamid };
         if (accountId) msgData.account_id = accountId;
         await supabase.from('messages').insert(msgData);
 
-        if (type === 'text' && content) {
+        // Bot e n8n só para mensagens RECEBIDAS
+        if (!fromMe && type === 'text' && content) {
           try { await handleBotReply(phone, content); } catch(be) { console.error('Bot reply error:', be.message); }
         }
-        const n8nUrl = _settings['n8n_webhook_url'];
-        if (n8nUrl) {
-          try { await axios.post(n8nUrl, { event: 'message_received', phone, name, content, type, timestamp, account_id: accountId || null }, { timeout: 8000 }); } catch(ne) {}
+        if (!fromMe) {
+          const n8nUrl = _settings['n8n_webhook_url'];
+          if (n8nUrl) {
+            try { await axios.post(n8nUrl, { event: 'message_received', phone, name, content, type, timestamp, account_id: accountId || null }, { timeout: 8000 }); } catch(ne) {}
+          }
         }
       }
     } else if (event === 'qrcode.updated') {
