@@ -723,16 +723,21 @@ app.post("/templates", async (req, res) => {
 });
 
 // ── Deletar template ──
+// A Meta exige excluir por NOME na borda do WABA (não pelo ID do nó).
+// O parâmetro :template_id agora recebe o NOME do template.
 app.delete("/templates/:template_id", async (req, res) => {
   const { account_id } = req.query;
   if (!supabase || !account_id) return res.status(400).json({ error: "account_id obrigatório" });
   const { data: account, error: accErr } = await supabase
     .from("accounts").select("token, waba_id").eq("id", account_id).single();
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
+  if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
+  const name = decodeURIComponent(req.params.template_id);
   try {
-    await axios.delete(`https://graph.facebook.com/v23.0/${req.params.template_id}`, {
-      params: { access_token: account.token },
+    await axios.delete(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, {
+      params: { name, access_token: account.token },
     });
+    console.log("🗑️ Template excluído:", name);
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Erro ao deletar template:", err.response?.data || err.message);
