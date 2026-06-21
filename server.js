@@ -1201,15 +1201,28 @@ async function processNode(run, depth=0) {
   } else if (node.type === 'message') {
     const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).maybeSingle();
     const name = ct?.name || phone;
+    let sendOk;
     if (cfg.mode === 'template' && cfg.template_name) {
-      await sendBotTemplate(phone, acctId, cfg, name);
+      sendOk = await sendBotTemplate(phone, acctId, cfg, name);
     } else {
       const text = (cfg.text || '').replace(/\{nome\}/gi, name).replace(/\{telefone\}/gi, phone);
-      if (text) await sendBotMsg(phone, acctId, text);
+      sendOk = text ? await sendBotMsg(phone, acctId, text) : true; // sem texto = nada a enviar (não é falha)
     }
-    const nxt = await getNextNodeId(nodeId, null);
-    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
-    else await stopRun(runId,'completed');
+    // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
+    const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
+    const okNxt   = medges?.find(e=>!e.label||e.label===''||e.label==='default')?.to_node_id || null;
+    const failNxt = medges?.find(e=>(e.label||'').toLowerCase()==='__failed__')?.to_node_id || null;
+    if (!sendOk && failNxt) {
+      await supabase.from('bot_runs').update({ current_node_id:failNxt, updated_at:new Date().toISOString() }).eq('id',runId);
+      await processNode({...run,current_node_id:failNxt}, depth+1);
+    } else if (!sendOk) {
+      await stopRun(runId,'failed');
+    } else if (okNxt) {
+      await supabase.from('bot_runs').update({ current_node_id:okNxt, updated_at:new Date().toISOString() }).eq('id',runId);
+      await processNode({...run,current_node_id:okNxt}, depth+1);
+    } else {
+      await stopRun(runId,'completed');
+    }
 
   } else if (node.type === 'tags') {
     const { data:ct } = await supabase.from('contacts').select('tags').eq('phone',phone).maybeSingle();
