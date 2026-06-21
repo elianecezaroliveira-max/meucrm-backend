@@ -73,6 +73,17 @@ app.post("/webhook", async (req, res) => {
       const timestamp = new Date(parseInt(message.timestamp) * 1000).toISOString();
       const phoneNumberId = value.metadata?.phone_number_id;
 
+      // Reação a uma mensagem (lead reagiu a uma mensagem minha)
+      if (message.type === 'reaction') {
+        const emoji = message.reaction?.emoji || null; // vazio = reação removida
+        const targetWamid = message.reaction?.message_id;
+        if (supabase && targetWamid) {
+          await supabase.from('messages').update({ reaction: emoji, reaction_by: 'contact' }).eq('wamid', targetWamid);
+          console.log(`😀 Reação ${emoji||'(removida)'} em ${targetWamid}`);
+        }
+        continue;
+      }
+
       console.log(`📨 Mensagem de ${name} (${from}) via número ${phoneNumberId}`);
 
       // Busca account_id (pode ser null se não cadastrado)
@@ -434,6 +445,26 @@ app.post("/send", async (req, res) => {
   } catch (err) {
     console.error("❌ Erro ao enviar:", err.response?.data || err.message);
     res.status(500).json({ error: "Falha ao enviar mensagem", detail: err.response?.data });
+  }
+});
+
+// ── Reagir a uma mensagem com emoji (passe emoji vazio para remover) ──
+app.post("/react", async (req, res) => {
+  const { to, wamid, emoji, account_id } = req.body;
+  if (!to || !wamid) return res.status(400).json({ error: "Informe 'to' e 'wamid'" });
+  const acct = await botGetAcct(account_id);
+  if (!acct.phone_number_id || !acct.token) return res.status(400).json({ error: "Nenhuma conta configurada." });
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
+      { messaging_product: "whatsapp", to, type: "reaction", reaction: { message_id: wamid, emoji: emoji || "" } },
+      { headers: { Authorization: `Bearer ${acct.token}`, "Content-Type": "application/json" } }
+    );
+    if (supabase) await supabase.from("messages").update({ reaction: emoji || null, reaction_by: 'me' }).eq("wamid", wamid);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Erro ao reagir:", err.response?.data || err.message);
+    res.status(500).json({ error: "Falha ao reagir", detail: err.response?.data });
   }
 });
 
