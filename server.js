@@ -569,7 +569,9 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     res.status(upstream.status);
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Accept-Ranges", "bytes");
-    if (upstream.headers["content-type"])   res.setHeader("Content-Type", upstream.headers["content-type"]);
+    // Usa o mime conhecido (frontend envia ?mime=) — evita octet-stream que impede o vídeo de tocar
+    const ctype = req.query.mime || upstream.headers["content-type"];
+    if (ctype) res.setHeader("Content-Type", ctype);
     if (upstream.headers["content-length"]) res.setHeader("Content-Length", upstream.headers["content-length"]);
     if (upstream.headers["content-range"])  res.setHeader("Content-Range", upstream.headers["content-range"]);
 
@@ -596,6 +598,47 @@ app.get("/tags", async (req, res) => {
   const set = new Set();
   (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) set.add(t); }));
   res.json(Array.from(set).sort((a, b) => a.localeCompare(b)));
+});
+
+// ── Tarefas / lembretes por lead ──
+app.get("/tasks", async (req, res) => {
+  if (!supabase) return res.json([]);
+  const { phone, pending } = req.query;
+  let q = supabase.from("tasks").select("*").order("due_at", { ascending: true, nullsFirst: false });
+  if (phone) q = q.eq("phone", phone);
+  if (pending === "1") q = q.eq("done", false);
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post("/tasks", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { phone, account_id, title, due_at } = req.body;
+  if (!title) return res.status(400).json({ error: "Título obrigatório" });
+  const { data, error } = await supabase.from("tasks")
+    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true, data });
+});
+
+app.put("/tasks/:id", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const upd = {};
+  if (typeof req.body.done === "boolean") upd.done = req.body.done;
+  if (req.body.title != null) upd.title = req.body.title;
+  if (req.body.due_at !== undefined) upd.due_at = req.body.due_at || null;
+  const { error } = await supabase.from("tasks").update(upd).eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.delete("/tasks/:id", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { error } = await supabase.from("tasks").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 // ── Tags por contato ──
