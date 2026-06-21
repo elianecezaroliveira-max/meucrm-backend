@@ -1285,6 +1285,14 @@ async function processNode(run, depth=0) {
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
     else await stopRun(runId,'completed');
 
+  } else if (node.type === 'complete_task') {
+    let q = supabase.from('tasks').update({ done:true }).eq('phone', phone).eq('done', false);
+    if (cfg.title_filter) q = q.ilike('title', '%' + cfg.title_filter + '%');
+    await q;
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
   } else if (node.type === 'mark_read') {
     await supabase.from('contacts').update({ unread_count:0, first_unread_at:null }).eq('phone',phone);
     const nxt = await getNextNodeId(nodeId, null);
