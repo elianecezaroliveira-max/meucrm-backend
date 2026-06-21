@@ -1160,6 +1160,14 @@ app.put("/contacts/:phone/read", async (req, res) => {
 // SISTEMA DE BOTS — motor de execução
 // ═══════════════════════════════════════
 
+// Substitui variáveis aceitando vários formatos: {nome} (nome) [nome] {{nome}}, maiúsc/minúsc
+function applyVars(str, name, phone) {
+  if (!str) return str;
+  return String(str)
+    .replace(/[\{\(\[]{1,2}\s*nome\s*[\}\)\]]{1,2}/gi, name || '')
+    .replace(/[\{\(\[]{1,2}\s*telefone\s*[\}\)\]]{1,2}/gi, phone || '');
+}
+
 async function sendBotMsg(phone, accountId, text) {
   let phoneNumberId, token;
   if (supabase && accountId) {
@@ -1195,7 +1203,7 @@ async function botGetAcct(accountId) {
 async function sendBotTemplate(phone, accountId, cfg, name) {
   const acct = await botGetAcct(accountId);
   if (!acct.phone_number_id || !acct.token) return null;
-  const vars = (cfg.vars || []).map(v => String(v || '').replace(/\{nome\}/gi, name || phone).replace(/\{telefone\}/gi, phone));
+  const vars = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone));
   const tmpl = { name: cfg.template_name, language: { code: cfg.language || 'pt_BR' } };
   if (vars.length) tmpl.components = [{ type: 'body', parameters: vars.map(t => ({ type: 'text', text: t })) }];
   try {
@@ -1247,7 +1255,7 @@ async function processNode(run, depth=0) {
     if (cfg.mode === 'template' && cfg.template_name) {
       sendOk = await sendBotTemplate(phone, acctId, cfg, name);
     } else {
-      const text = (cfg.text || '').replace(/\{nome\}/gi, name).replace(/\{telefone\}/gi, phone);
+      const text = applyVars(cfg.text || '', name, phone);
       sendOk = text ? await sendBotMsg(phone, acctId, text) : true; // sem texto = nada a enviar (não é falha)
     }
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
@@ -1278,7 +1286,7 @@ async function processNode(run, depth=0) {
 
   } else if (node.type === 'task') {
     const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).maybeSingle();
-    const title = (cfg.title || 'Tarefa').replace(/\{nome\}/gi, ct?.name || phone);
+    const title = applyVars(cfg.title || 'Tarefa', ct?.name || phone, phone);
     const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours)*3600000).toISOString() : null;
     await supabase.from('tasks').insert({ phone, account_id:acctId||null, title, due_at:due });
     const nxt = await getNextNodeId(nodeId, null);
