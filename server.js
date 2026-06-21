@@ -777,7 +777,8 @@ app.post("/send-template", async (req, res) => {
     );
     const safeAccountId = account_id || null;
     await supabase.from("contacts").upsert(
-      { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
+      { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
+        last_message_preview: `[Modelo: ${template_name}]`, last_message_direction: 'outbound' },
       { onConflict: "phone" }
     );
     await supabase.from("messages").insert({
@@ -839,11 +840,13 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
 // Listar contatos (com stage_id, unread_count e prévia)
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
-  const { account_id } = req.query;
+  const { account_id, with_messages } = req.query;
   let query = supabase
     .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
     .order("last_message_at", { ascending: false });
   if (account_id) query = query.eq("account_id", account_id); // filtra pela conta quando informada
+  // Lista de CONVERSAS: só contatos que já tiveram mensagem (lead importado/criado fica só no pipeline)
+  if (with_messages) query = query.not("last_message_direction", "is", null);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
