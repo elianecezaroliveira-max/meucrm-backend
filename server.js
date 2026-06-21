@@ -490,16 +490,19 @@ app.post("/send-media", async (req, res) => {
     // 4. Salva no Supabase
     if (supabase) {
       const safeAccountId = account_id || null;
+      const label = msgType === "image" ? "Imagem" : msgType === "video" ? "Vídeo" : msgType === "audio" ? "Áudio" : "Documento";
+      const content = `[${label}: ${fileName}]`;
       await supabase.from("contacts").upsert(
-        { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId },
+        { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
+          last_message_preview: content, last_message_direction: 'outbound' },
         { onConflict: "phone" }
       );
-      const mediaWamid = null; // media endpoint doesn't return wamid in same way
       await supabase.from("messages").insert({
-        phone: to, content: `[${msgType === "image" ? "Imagem" : msgType === "video" ? "Vídeo" : msgType === "audio" ? "Áudio" : "Documento"}: ${fileName}]`,
+        phone: to, content,
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'sent', wamid: mediaWamid,
+        status: 'sent', wamid: null,
+        media_id: mediaId, media_mime_type: mimeType, // permite exibir a mídia no CRM
       });
     }
     res.json({ success: true });
