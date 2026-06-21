@@ -4,7 +4,7 @@ const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '30mb' })); // suporta fotos/vídeos em base64 (limite WhatsApp ~16MB → ~22MB em base64)
 app.use(cors());
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
