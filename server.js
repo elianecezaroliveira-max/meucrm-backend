@@ -517,39 +517,20 @@ app.post("/send-media", async (req, res) => {
 });
 
 // ── Proxy de mídia recebida (imagem, áudio, vídeo, documento) ──
-// Cache de buffers para evitar baixar o mesmo arquivo várias vezes (range requests)
-const mediaBufferCache = new Map();
-const mediaInFlight = new Map(); // evita downloads paralelos do mesmo arquivo
+// Faz STREAMING direto da Meta repassando o Range — método correto para vídeo
+// (sem baixar o arquivo inteiro na memória, evita travar a reprodução).
+const mediaUrlCache = new Map(); // mediaId_token -> { url, ts }
 
-// Baixa (uma única vez) o arquivo da Meta e cacheia. Requisições simultâneas
-// (comuns em vídeo, que faz vários range requests) aguardam a mesma baixada.
-async function getMediaBuffer(mediaId, token, cacheKey) {
-  const hit = mediaBufferCache.get(cacheKey);
-  if (hit) return hit;
-  if (mediaInFlight.has(cacheKey)) return mediaInFlight.get(cacheKey);
-  const p = (async () => {
-    const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
-      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-    });
-    const mediaUrl = metaRes.data.url;
-    if (!mediaUrl) throw new Error("URL de mídia não encontrada");
-    const fileRes = await axios.get(mediaUrl, {
-      headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
-      responseType: "arraybuffer",
-      maxContentLength: 120 * 1024 * 1024,
-      maxBodyLength: 120 * 1024 * 1024,
-      timeout: 60000,
-    });
-    const result = {
-      buffer: Buffer.from(fileRes.data),
-      contentType: fileRes.headers["content-type"] || "application/octet-stream",
-    };
-    mediaBufferCache.set(cacheKey, result);
-    setTimeout(() => mediaBufferCache.delete(cacheKey), 10 * 60 * 1000);
-    return result;
-  })();
-  mediaInFlight.set(cacheKey, p);
-  try { return await p; } finally { mediaInFlight.delete(cacheKey); }
+async function getMediaUrl(mediaId, token, cacheKey, force) {
+  const hit = mediaUrlCache.get(cacheKey);
+  if (!force && hit && (Date.now() - hit.ts) < 3 * 60 * 1000) return hit.url;
+  const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+    headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+  });
+  const url = metaRes.data.url;
+  if (!url) throw new Error("URL de mídia não encontrada");
+  mediaUrlCache.set(cacheKey, { url, ts: Date.now() });
+  return url;
 }
 
 app.get("/media-proxy/:mediaId", async (req, res) => {
@@ -565,54 +546,56 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   }
   if (!token) return res.status(400).json({ error: "Token não encontrado" });
 
+  const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
+  const upstreamHeaders = { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" };
+  if (req.headers.range && download !== "1") upstreamHeaders.Range = req.headers.range;
+
+  async function fetchStream(force) {
+    const url = await getMediaUrl(mediaId, token, cacheKey, force);
+    return axios.get(url, {
+      headers: upstreamHeaders, responseType: "stream", timeout: 60000,
+      validateStatus: s => s >= 200 && s < 400,
+    });
+  }
+
   try {
-    const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
-    const cached = await getMediaBuffer(mediaId, token, cacheKey);
-    const { buffer, contentType } = cached;
-    const totalSize = buffer.length;
+    let upstream;
+    try {
+      upstream = await fetchStream(false);
+    } catch (e) {
+      upstream = await fetchStream(true); // URL pode ter expirado — tenta uma vez com URL nova
+    }
 
-    // Aumenta timeout do socket para arquivos grandes (evita corte no áudio/vídeo)
-    req.socket.setTimeout(120000);
-
-    // Headers comuns
+    res.status(upstream.status);
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Cache-Control", "public, max-age=600");
+    if (upstream.headers["content-type"])   res.setHeader("Content-Type", upstream.headers["content-type"]);
+    if (upstream.headers["content-length"]) res.setHeader("Content-Length", upstream.headers["content-length"]);
+    if (upstream.headers["content-range"])  res.setHeader("Content-Range", upstream.headers["content-range"]);
 
-    // Download forçado
     if (download === "1") {
       const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
       res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-      res.setHeader("Content-Length", totalSize);
-      return res.send(buffer);
+    } else {
+      res.setHeader("Cache-Control", "public, max-age=600");
     }
 
-    // Suporte a Range requests (necessário para player de áudio/vídeo)
-    const rangeHeader = req.headers.range;
-    if (rangeHeader) {
-      const parts = rangeHeader.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = Math.min(parts[1] ? parseInt(parts[1], 10) : totalSize - 1, totalSize - 1);
-      if (isNaN(start) || start >= totalSize) {
-        res.setHeader("Content-Range", `bytes */${totalSize}`);
-        return res.status(416).end();
-      }
-      const chunkSize = end - start + 1;
-      res.status(206);
-      res.setHeader("Content-Range", `bytes ${start}-${end}/${totalSize}`);
-      res.setHeader("Content-Length", chunkSize);
-      return res.send(buffer.slice(start, end + 1));
-    }
-
-    // Resposta completa
-    res.setHeader("Content-Length", totalSize);
-    res.send(buffer);
-
+    upstream.data.on("error", () => { try { res.end(); } catch (_) {} });
+    upstream.data.pipe(res);
   } catch (err) {
-    console.error("❌ Erro ao baixar mídia:", err.response?.data || err.message);
-    res.status(500).json({ error: "Falha ao baixar mídia" });
+    console.error("❌ Erro ao baixar mídia:", err.response?.status || err.message);
+    if (!res.headersSent) res.status(500).json({ error: "Falha ao baixar mídia" });
   }
+});
+
+// ── Lista todas as tags existentes (para sugestões e filtro) ──
+app.get("/tags", async (req, res) => {
+  if (!supabase) return res.json([]);
+  const { data, error } = await supabase.from("contacts").select("tags");
+  if (error) return res.status(500).json({ error: error.message });
+  const set = new Set();
+  (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) set.add(t); }));
+  res.json(Array.from(set).sort((a, b) => a.localeCompare(b)));
 });
 
 // ── Tags por contato ──
