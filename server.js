@@ -837,6 +837,33 @@ app.post("/update/lead", async (req, res) => {
   res.json({ success: true, updated, errors });
 });
 
+// ── Listar leads de uma etapa (para o n8n buscar e depois mover) ──
+// GET /leads?id=98177799   ou   ?stage=SIAPE3   ou   ?stage_id=<uuid>
+// Retorna um array de { phone, name, stage_id } — o n8n itera direto.
+app.get("/leads", async (req, res) => {
+  if (!supabase) return res.json([]);
+  const clean = v => String(v || "").replace(/^=+\s*/, "").trim();
+  const extId     = clean(req.query.id || req.query.external_id);
+  const stageName = clean(req.query.stage || req.query.etapa);
+  let stage_id    = clean(req.query.stage_id) || null;
+
+  if (!stage_id && (extId || stageName)) {
+    let q = supabase.from("pipeline_stages").select("id");
+    if (extId) q = q.eq("external_id", extId);
+    else q = q.ilike("name", stageName);
+    const { data: st } = await q.maybeSingle();
+    stage_id = st ? st.id : null;
+  }
+  if (!stage_id) return res.json([]);
+
+  const { data, error } = await supabase.from("contacts")
+    .select("phone, name, stage_id, account_id, tags")
+    .eq("stage_id", stage_id)
+    .order("last_message_at", { ascending: false, nullsFirst: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
 
 // ── Deletar mensagem individual ──
 app.delete("/messages/id/:id", async (req, res) => {
