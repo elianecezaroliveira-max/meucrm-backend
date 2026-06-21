@@ -1237,18 +1237,22 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'round_robin') {
-    const accs = (cfg.account_ids || []).filter(Boolean);
-    let chosen = acctId;
-    if (accs.length) {
+    const branches = cfg.branches || [];
+    let chosen = acctId, branchIdx = 0;
+    if (branches.length) {
       const key = 'rr_' + nodeId;
       const { data:s } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
       let idx = parseInt(s?.value || '0', 10); if (isNaN(idx)) idx = 0;
-      chosen = accs[idx % accs.length];
+      branchIdx = idx % branches.length;
       await supabase.from('settings').upsert({ key, value: String(idx + 1), updated_at: new Date().toISOString() });
-      await supabase.from('contacts').update({ account_id: chosen }).eq('phone', phone);
-      await supabase.from('bot_runs').update({ account_id: chosen }).eq('id', runId);
+      const accId = branches[branchIdx]?.account_id;
+      if (accId) {
+        chosen = accId;
+        await supabase.from('contacts').update({ account_id: accId }).eq('phone', phone);
+        await supabase.from('bot_runs').update({ account_id: accId }).eq('id', runId);
+      }
     }
-    const nxt = await getNextNodeId(nodeId, null);
+    const nxt = await getNextNodeId(nodeId, String(branchIdx));
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt,account_id:chosen}, depth+1); }
     else await stopRun(runId,'completed');
 
