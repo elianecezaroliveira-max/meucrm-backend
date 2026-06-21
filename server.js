@@ -600,6 +600,39 @@ app.get("/tags", async (req, res) => {
   res.json(Array.from(set).sort((a, b) => a.localeCompare(b)));
 });
 
+// ── Busca por nome, telefone OU conteúdo das mensagens ──
+app.get("/search", async (req, res) => {
+  if (!supabase) return res.json([]);
+  const raw = (req.query.q || "").trim();
+  if (!raw) return res.json([]);
+  const { account_id } = req.query;
+  const term = raw.replace(/[,()]/g, " ").trim(); // evita quebrar a sintaxe do filtro
+  const like = `%${term}%`;
+  try {
+    // 1. Telefones que têm alguma mensagem contendo o termo
+    let mq = supabase.from("messages").select("phone").ilike("content", like).limit(500);
+    if (account_id) mq = mq.eq("account_id", account_id);
+    const { data: msgRows } = await mq;
+    const phones = [...new Set((msgRows || []).map(m => m.phone).filter(Boolean))];
+
+    // 2. Contatos por nome/telefone OU entre os telefones encontrados
+    let orCond = `name.ilike.${like},phone.ilike.${like}`;
+    if (phones.length) orCond += `,phone.in.(${phones.join(",")})`;
+    let cq = supabase.from("contacts")
+      .select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
+      .or(orCond)
+      .not("last_message_direction", "is", null)
+      .order("last_message_at", { ascending: false })
+      .limit(200);
+    if (account_id) cq = cq.eq("account_id", account_id);
+    const { data, error } = await cq;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Tarefas / lembretes por lead ──
 app.get("/tasks", async (req, res) => {
   if (!supabase) return res.json([]);
