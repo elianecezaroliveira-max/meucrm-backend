@@ -621,7 +621,7 @@ app.get("/search", async (req, res) => {
     let cq = supabase.from("contacts")
       .select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
       .or(orCond)
-      .not("last_message_direction", "is", null)
+      .not("last_message_preview", "is", null)
       .order("last_message_at", { ascending: false })
       .limit(200);
     if (account_id) cq = cq.eq("account_id", account_id);
@@ -971,8 +971,9 @@ app.get("/contacts", async (req, res) => {
     .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
     .order("last_message_at", { ascending: false });
   if (account_id) query = query.eq("account_id", account_id); // filtra pela conta quando informada
-  // Lista de CONVERSAS: só contatos que já tiveram mensagem (lead importado/criado fica só no pipeline)
-  if (with_messages) query = query.not("last_message_direction", "is", null);
+  // Lista de CONVERSAS: só contatos que já tiveram mensagem real (preview só é preenchido por mensagem,
+  // nunca por importação — diferente de last_message_direction, que tem padrão 'inbound' no banco)
+  if (with_messages) query = query.not("last_message_preview", "is", null);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
