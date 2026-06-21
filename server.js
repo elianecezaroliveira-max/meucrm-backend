@@ -116,6 +116,10 @@ app.post("/webhook", async (req, res) => {
         mediaMimeType = message.video?.mime_type || "video/mp4";
         mediaCaption = message.video?.caption || null;
         content = mediaCaption ? `[Vídeo: ${mediaCaption}]` : "[Vídeo recebido]";
+      } else if (type === "sticker") {
+        mediaId = message.sticker?.id || null;
+        mediaMimeType = message.sticker?.mime_type || "image/webp";
+        content = "[Figurinha]";
       } else {
         content = `[Mensagem do tipo: ${type}]`;
       }
