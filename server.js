@@ -1262,8 +1262,8 @@ async function processNode(run, depth=0) {
     await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
 
   } else if (node.type === 'pause') {
-    const ms = ((cfg.days||0)*24+(cfg.hours||0))*3600000 + (cfg.minutes||0)*60000;
-    const pauseUntil = new Date(Date.now()+Math.max(ms,10000)).toISOString();
+    const ms = ((cfg.days||0)*24+(cfg.hours||0))*3600000 + (cfg.minutes||0)*60000 + (cfg.seconds||0)*1000;
+    const pauseUntil = new Date(Date.now()+Math.max(ms,1000)).toISOString();
     await supabase.from('bot_runs').update({ status:'paused', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
 
   } else if (node.type === 'move_stage') {
@@ -1317,7 +1317,7 @@ async function startBot(botId, phone, accountId) {
   return run;
 }
 
-// Timer: resume paused/timed-out runs every 30s
+// Timer: resume paused/timed-out runs every 5s
 setInterval(async () => {
   if (!supabase) return;
   const now = new Date().toISOString();
@@ -1327,7 +1327,7 @@ setInterval(async () => {
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, status:'running', pause_until:null, updated_at:now }).eq('id',run.id); await processNode({...run,current_node_id:nxt,status:'running'}); }
     else { await stopRun(run.id,'completed'); }
   }
-}, 30000);
+}, 5000);
 
 // ── CRUD de Bots ──
 app.get('/bots', async (req,res) => {
