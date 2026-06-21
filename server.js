@@ -1336,6 +1336,12 @@ app.get('/bots', async (req,res) => {
   if (error) return res.status(500).json({error:error.message});
   res.json(data||[]);
 });
+app.get('/bots/:id', async (req,res) => {
+  if (!supabase) return res.json({});
+  const { data,error } = await supabase.from('bots').select('*').eq('id',req.params.id).single();
+  if (error) return res.status(404).json({error:error.message});
+  res.json(data||{});
+});
 app.post('/bots', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { name,trigger_type,trigger_stage_id,account_id } = req.body;
