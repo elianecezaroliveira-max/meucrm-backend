@@ -791,6 +791,52 @@ app.post("/import/lead", async (req, res) => {
   res.json({ success: true, imported, errors });
 });
 
+// ── Alterar a ETAPA de um lead já existente (via n8n) ──
+// Aceita 1 lead OU array. Identifica o lead pelo telefone e a etapa por:
+//   stage | etapa | "Etapa" (nome, ex.: "S3")  |  id | "ID" (external_id)  |  stage_id (UUID)
+app.post("/update/lead", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const items = Array.isArray(req.body) ? req.body
+              : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
+  const clean = v => String(v || "").replace(/^=+\s*/, "").trim();
+  const stageCache = {};
+  let updated = 0;
+  const errors = [];
+
+  for (const it of (items || [])) {
+    const phone = clean(it.phone || it.celular || it["Celular"]).replace(/\D/g, "");
+    if (phone.length < 8) { errors.push({ phone, error: "telefone inválido" }); continue; }
+
+    let stage_id = clean(it.stage_id) || null;
+    const extId     = clean(it.id || it["ID"] || it.stage_external_id);
+    const stageName = clean(it.stage || it.etapa || it["Etapa"] || it.stage_name);
+
+    if (!stage_id) {
+      const key = "ext:" + extId + "|name:" + stageName.toLowerCase();
+      if (stageCache[key] === undefined) {
+        let q = supabase.from("pipeline_stages").select("id");
+        if (extId) q = q.eq("external_id", extId);
+        else if (stageName) q = q.ilike("name", stageName);
+        else { stageCache[key] = null; }
+        if (stageCache[key] === undefined) {
+          const { data: st } = await q.maybeSingle();
+          stageCache[key] = st ? st.id : null;
+        }
+      }
+      stage_id = stageCache[key];
+    }
+    if (!stage_id) { errors.push({ phone, error: "etapa não encontrada" }); continue; }
+
+    const { data, error } = await supabase.from("contacts").update({ stage_id }).eq("phone", phone).select("phone");
+    if (error) { errors.push({ phone, error: error.message }); continue; }
+    if (!data || !data.length) { errors.push({ phone, error: "lead não encontrado no CRM" }); continue; }
+    updated++;
+  }
+
+  console.log(`🔁 n8n atualizou etapa de ${updated} lead(s)` + (errors.length ? `, ${errors.length} erro(s)` : ""));
+  res.json({ success: true, updated, errors });
+});
+
 
 // ── Deletar mensagem individual ──
 app.delete("/messages/id/:id", async (req, res) => {
