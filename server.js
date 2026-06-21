@@ -1141,6 +1141,35 @@ async function sendBotMsg(phone, accountId, text) {
   } catch(e) { console.error('❌ Bot sendMsg:', e.response?.data||e.message); return null; }
 }
 
+async function botGetAcct(accountId) {
+  if (supabase && accountId) {
+    const { data } = await supabase.from('accounts').select('phone_number_id,token').eq('id', accountId).maybeSingle();
+    if (data && data.phone_number_id) return data;
+  }
+  return { phone_number_id: process.env.PHONE_NUMBER_ID, token: process.env.WHATSAPP_TOKEN };
+}
+
+// Envia um MODELO aprovado pelo bot (com variáveis no corpo)
+async function sendBotTemplate(phone, accountId, cfg, name) {
+  const acct = await botGetAcct(accountId);
+  if (!acct.phone_number_id || !acct.token) return null;
+  const vars = (cfg.vars || []).map(v => String(v || '').replace(/\{nome\}/gi, name || phone).replace(/\{telefone\}/gi, phone));
+  const tmpl = { name: cfg.template_name, language: { code: cfg.language || 'pt_BR' } };
+  if (vars.length) tmpl.components = [{ type: 'body', parameters: vars.map(t => ({ type: 'text', text: t })) }];
+  try {
+    const r = await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
+      { messaging_product: 'whatsapp', to: phone, type: 'template', template: tmpl },
+      { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
+    if (supabase) {
+      const ts = new Date().toISOString();
+      const prev = `[Modelo: ${cfg.template_name}]`;
+      await supabase.from('messages').insert({ phone, content: prev, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: r.data?.messages?.[0]?.id || null });
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone);
+    }
+    return true;
+  } catch(e) { console.error('❌ Bot template:', e.response?.data || e.message); return null; }
+}
+
 async function getNextNodeId(fromNodeId, edgeLabel) {
   if (!supabase) return null;
   const { data:edges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', fromNodeId);
@@ -1170,13 +1199,57 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'message') {
-    let text = cfg.text || '';
     const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).maybeSingle();
     const name = ct?.name || phone;
-    text = text.replace(/\{nome\}/gi, name).replace(/\{telefone\}/gi, phone);
-    await sendBotMsg(phone, acctId, text);
+    if (cfg.mode === 'template' && cfg.template_name) {
+      await sendBotTemplate(phone, acctId, cfg, name);
+    } else {
+      const text = (cfg.text || '').replace(/\{nome\}/gi, name).replace(/\{telefone\}/gi, phone);
+      if (text) await sendBotMsg(phone, acctId, text);
+    }
     const nxt = await getNextNodeId(nodeId, null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
+  } else if (node.type === 'tags') {
+    const { data:ct } = await supabase.from('contacts').select('tags').eq('phone',phone).maybeSingle();
+    let tags = Array.isArray(ct?.tags) ? ct.tags.slice() : [];
+    (cfg.add||[]).forEach(t => { if (t && !tags.includes(t)) tags.push(t); });
+    if (cfg.remove?.length) tags = tags.filter(t => !cfg.remove.includes(t));
+    await supabase.from('contacts').update({ tags }).eq('phone',phone);
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
+  } else if (node.type === 'task') {
+    const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).maybeSingle();
+    const title = (cfg.title || 'Tarefa').replace(/\{nome\}/gi, ct?.name || phone);
+    const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours)*3600000).toISOString() : null;
+    await supabase.from('tasks').insert({ phone, account_id:acctId||null, title, due_at:due });
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
+  } else if (node.type === 'mark_read') {
+    await supabase.from('contacts').update({ unread_count:0, first_unread_at:null }).eq('phone',phone);
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
+  } else if (node.type === 'round_robin') {
+    const accs = (cfg.account_ids || []).filter(Boolean);
+    let chosen = acctId;
+    if (accs.length) {
+      const key = 'rr_' + nodeId;
+      const { data:s } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+      let idx = parseInt(s?.value || '0', 10); if (isNaN(idx)) idx = 0;
+      chosen = accs[idx % accs.length];
+      await supabase.from('settings').upsert({ key, value: String(idx + 1), updated_at: new Date().toISOString() });
+      await supabase.from('contacts').update({ account_id: chosen }).eq('phone', phone);
+      await supabase.from('bot_runs').update({ account_id: chosen }).eq('id', runId);
+    }
+    const nxt = await getNextNodeId(nodeId, null);
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt,account_id:chosen}, depth+1); }
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'wait_reply') {
