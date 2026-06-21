@@ -733,15 +733,21 @@ app.delete("/templates/:template_id", async (req, res) => {
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
   const name = decodeURIComponent(req.params.template_id);
+  const hsm_id = req.query.hsm_id;
   try {
-    await axios.delete(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, {
-      params: { name, access_token: account.token },
-    });
+    const params = { name, access_token: account.token };
+    if (hsm_id) params.hsm_id = hsm_id; // exclui o template específico (recomendado pela Meta)
+    await axios.delete(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, { params });
     console.log("🗑️ Template excluído:", name);
     res.json({ success: true });
   } catch (err) {
-    console.error("❌ Erro ao deletar template:", err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao deletar template" });
+    const metaErr = err.response?.data?.error;
+    console.error("❌ Erro ao deletar template:", metaErr || err.message);
+    // Devolve a mensagem detalhada da Meta (código/subcódigo) para diagnóstico
+    const msg = metaErr
+      ? `${metaErr.message || 'erro'}${metaErr.code ? ' (código ' + metaErr.code + (metaErr.error_subcode ? '/' + metaErr.error_subcode : '') + ')' : ''}`
+      : (err.message || "Erro ao deletar template");
+    res.status(500).json({ error: msg, detail: metaErr || null });
   }
 });
 
