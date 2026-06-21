@@ -763,9 +763,10 @@ app.post("/import/lead", async (req, res) => {
   const errors = [];
 
   for (const it of (items || [])) {
-    const name  = String(it.name || it.title || it["Lead Titulo"] || "Lead").trim();
+    // remove um "=" no início (marcador de expressão do n8n que às vezes vaza como texto)
+    const name  = (String(it.name || it.title || it["Lead Titulo"] || "").replace(/^=+\s*/, "").trim()) || "Lead";
     const phone = String(it.phone || it.celular || it["Celular"] || "").replace(/\D/g, "");
-    const extId = String(it.id || it["ID"] || it.stage_external_id || "").trim();
+    const extId = String(it.id || it["ID"] || it.stage_external_id || "").replace(/^=+\s*/, "").trim();
     const account_id = it.account_id || null;
     if (phone.length < 8) { errors.push({ phone, error: "telefone inválido" }); continue; }
 
