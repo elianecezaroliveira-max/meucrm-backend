@@ -648,11 +648,15 @@ app.post("/contacts", async (req, res) => {
 
 // ── Importar lista de contatos ──
 app.post("/contacts/import", async (req, res) => {
-  const { contacts, account_id } = req.body;
+  const { contacts, account_id, stage_id } = req.body;
   if (!contacts || !Array.isArray(contacts)) return res.status(400).json({ error: "Lista inválida" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const toInsert = contacts
-    .map(c => ({ phone: String(c.phone || '').replace(/\D/g, ''), name: c.name || 'Desconhecido', account_id: account_id || null, last_message_at: new Date().toISOString() }))
+    .map(c => {
+      const obj = { phone: String(c.phone || '').replace(/\D/g, ''), name: c.name || 'Desconhecido', account_id: account_id || null, last_message_at: new Date().toISOString() };
+      if (stage_id) obj.stage_id = stage_id; // só grava etapa quando escolhida (não apaga a de quem já existe)
+      return obj;
+    })
     .filter(c => c.phone.length >= 8);
   if (!toInsert.length) return res.status(400).json({ error: "Nenhum contato válido encontrado" });
   const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "phone" });
