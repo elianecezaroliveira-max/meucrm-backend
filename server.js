@@ -748,6 +748,48 @@ app.post("/contacts/import", async (req, res) => {
   res.json({ success: true, count: toInsert.length });
 });
 
+// ── Importar lead via n8n / planilha (mapeia ID da etapa → stage_id) ──
+// Aceita 1 lead OU um array de leads. Campos flexíveis:
+//   name | title | "Lead Titulo"   →  nome
+//   phone | celular | "Celular"     →  telefone
+//   id | "ID" | stage_external_id   →  ID da etapa (external_id de pipeline_stages)
+//   account_id (opcional)           →  vincula a uma conta WhatsApp
+app.post("/import/lead", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const items = Array.isArray(req.body) ? req.body
+              : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
+  const stageCache = {};
+  let imported = 0;
+  const errors = [];
+
+  for (const it of (items || [])) {
+    const name  = String(it.name || it.title || it["Lead Titulo"] || "Lead").trim();
+    const phone = String(it.phone || it.celular || it["Celular"] || "").replace(/\D/g, "");
+    const extId = String(it.id || it["ID"] || it.stage_external_id || "").trim();
+    const account_id = it.account_id || null;
+    if (phone.length < 8) { errors.push({ phone, error: "telefone inválido" }); continue; }
+
+    let stage_id = null;
+    if (extId) {
+      if (stageCache[extId] === undefined) {
+        const { data: st } = await supabase.from("pipeline_stages").select("id").eq("external_id", extId).maybeSingle();
+        stageCache[extId] = st ? st.id : null;
+      }
+      stage_id = stageCache[extId];
+    }
+
+    const row = { phone, name };
+    if (account_id) row.account_id = account_id;
+    if (stage_id) row.stage_id = stage_id;
+    // Não define last_message_* → o lead aparece só no Pipeline até iniciar conversa
+    const { error: e } = await supabase.from("contacts").upsert(row, { onConflict: "phone" });
+    if (e) errors.push({ phone, error: e.message }); else imported++;
+  }
+
+  console.log(`📥 n8n importou ${imported} lead(s)` + (errors.length ? `, ${errors.length} erro(s)` : ""));
+  res.json({ success: true, imported, errors });
+});
+
 
 // ── Deletar mensagem individual ──
 app.delete("/messages/id/:id", async (req, res) => {
