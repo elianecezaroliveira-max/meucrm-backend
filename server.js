@@ -172,6 +172,7 @@ app.post("/webhook", async (req, res) => {
           timestamp,
           media_id: mediaId,
           media_mime_type: mediaMimeType,
+          wamid: message.id || null,
         };
         if (accountId) messageData.account_id = accountId; // só inclui se não for null
 
@@ -673,7 +674,16 @@ app.get("/tasks", async (req, res) => {
   if (pending === "1") q = q.eq("done", false);
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  const tasks = data || [];
+  // anexa o nome do lead (para a aba global de tarefas)
+  const phones = [...new Set(tasks.map(t => t.phone).filter(Boolean))];
+  if (phones.length) {
+    const { data: cts } = await supabase.from("contacts").select("phone,name").in("phone", phones);
+    const nameMap = {};
+    for (const c of cts || []) nameMap[c.phone] = c.name;
+    for (const t of tasks) t.contact_name = t.phone ? (nameMap[t.phone] || t.phone) : null;
+  }
+  res.json(tasks);
 });
 
 app.post("/tasks", async (req, res) => {
