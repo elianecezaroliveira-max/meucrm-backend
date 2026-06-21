@@ -519,6 +519,38 @@ app.post("/send-media", async (req, res) => {
 // ── Proxy de mídia recebida (imagem, áudio, vídeo, documento) ──
 // Cache de buffers para evitar baixar o mesmo arquivo várias vezes (range requests)
 const mediaBufferCache = new Map();
+const mediaInFlight = new Map(); // evita downloads paralelos do mesmo arquivo
+
+// Baixa (uma única vez) o arquivo da Meta e cacheia. Requisições simultâneas
+// (comuns em vídeo, que faz vários range requests) aguardam a mesma baixada.
+async function getMediaBuffer(mediaId, token, cacheKey) {
+  const hit = mediaBufferCache.get(cacheKey);
+  if (hit) return hit;
+  if (mediaInFlight.has(cacheKey)) return mediaInFlight.get(cacheKey);
+  const p = (async () => {
+    const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    });
+    const mediaUrl = metaRes.data.url;
+    if (!mediaUrl) throw new Error("URL de mídia não encontrada");
+    const fileRes = await axios.get(mediaUrl, {
+      headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
+      responseType: "arraybuffer",
+      maxContentLength: 120 * 1024 * 1024,
+      maxBodyLength: 120 * 1024 * 1024,
+      timeout: 60000,
+    });
+    const result = {
+      buffer: Buffer.from(fileRes.data),
+      contentType: fileRes.headers["content-type"] || "application/octet-stream",
+    };
+    mediaBufferCache.set(cacheKey, result);
+    setTimeout(() => mediaBufferCache.delete(cacheKey), 10 * 60 * 1000);
+    return result;
+  })();
+  mediaInFlight.set(cacheKey, p);
+  try { return await p; } finally { mediaInFlight.delete(cacheKey); }
+}
 
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
@@ -535,32 +567,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
 
   try {
     const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
-
-    let cached = mediaBufferCache.get(cacheKey);
-    if (!cached) {
-      // 1. Busca a URL temporária da Meta
-      const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const mediaUrl = metaRes.data.url;
-      if (!mediaUrl) return res.status(404).json({ error: "URL de mídia não encontrada" });
-
-      // 2. Baixa o arquivo COMPLETO como buffer (resolve o problema de range/streaming)
-      const fileRes = await axios.get(mediaUrl, {
-        headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
-        responseType: "arraybuffer",
-        maxContentLength: 50 * 1024 * 1024, // até 50MB
-      });
-
-      cached = {
-        buffer: Buffer.from(fileRes.data),
-        contentType: fileRes.headers["content-type"] || "application/octet-stream",
-      };
-      mediaBufferCache.set(cacheKey, cached);
-      // Expira cache após 10 minutos
-      setTimeout(() => mediaBufferCache.delete(cacheKey), 10 * 60 * 1000);
-    }
-
+    const cached = await getMediaBuffer(mediaId, token, cacheKey);
     const { buffer, contentType } = cached;
     const totalSize = buffer.length;
 
