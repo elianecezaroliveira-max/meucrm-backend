@@ -688,10 +688,10 @@ app.get("/tasks", async (req, res) => {
 
 app.post("/tasks", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { phone, account_id, title, due_at } = req.body;
+  const { phone, account_id, title, due_at, notes } = req.body;
   if (!title) return res.status(400).json({ error: "Título obrigatório" });
   const { data, error } = await supabase.from("tasks")
-    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null })
+    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null, notes: notes || null })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
@@ -703,6 +703,7 @@ app.put("/tasks/:id", async (req, res) => {
   if (typeof req.body.done === "boolean") upd.done = req.body.done;
   if (req.body.title != null) upd.title = req.body.title;
   if (req.body.due_at !== undefined) upd.due_at = req.body.due_at || null;
+  if (req.body.notes !== undefined) upd.notes = req.body.notes || null;
   const { error } = await supabase.from("tasks").update(upd).eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
