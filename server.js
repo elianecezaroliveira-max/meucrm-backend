@@ -685,6 +685,16 @@ app.put("/contacts/:phone/tags", async (req, res) => {
   res.json({ success: true });
 });
 
+// ── Atualiza o nome do contato/lead ──
+app.put("/contacts/:phone/name", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const name = (req.body.name || "").trim();
+  if (!name) return res.status(400).json({ error: "Nome obrigatório" });
+  const { error } = await supabase.from("contacts").update({ name }).eq("phone", req.params.phone);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── Anotações por contato ──
 app.get("/contacts/:phone/notes", async (req, res) => {
   if (!supabase) return res.json({ notes: "" });
