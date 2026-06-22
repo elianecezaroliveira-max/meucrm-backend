@@ -1347,6 +1347,27 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes) {
   } catch(e) { console.error('❌ Bot template:', e.response?.data || e.message); return null; }
 }
 
+// Verifica horário comercial (UTC-3) e calcula a próxima abertura
+function businessHoursState(nowMs, cfg) {
+  const days = (cfg.days && cfg.days.length) ? cfg.days.map(Number) : [1,2,3,4,5]; // 0=Dom..6=Sáb
+  const [sh, sm] = String(cfg.start || '08:00').split(':').map(Number);
+  const [eh, em] = String(cfg.end   || '18:00').split(':').map(Number);
+  const startMin = sh*60 + sm, endMin = eh*60 + em;
+  const brt = new Date(nowMs - 3*3600000); // relógio de Brasília nos campos UTC
+  const dow = brt.getUTCDay();
+  const minNow = brt.getUTCHours()*60 + brt.getUTCMinutes();
+  const isOpen = days.includes(dow) && minNow >= startMin && minNow < endMin;
+  if (isOpen) return { open: true };
+  for (let off = 0; off <= 7; off++) {
+    const d = new Date(Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate() + off));
+    if (!days.includes(d.getUTCDay())) continue;
+    if (off === 0 && minNow >= startMin) continue; // hoje já passou da abertura
+    const openBrtMs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), sh, sm);
+    return { open: false, nextOpenMs: openBrtMs + 3*3600000 }; // volta para UTC real
+  }
+  return { open: false, nextOpenMs: nowMs + 3600000 };
+}
+
 async function getNextNodeId(fromNodeId, edgeLabel) {
   if (!supabase) return null;
   const { data:edges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', fromNodeId);
@@ -1471,6 +1492,21 @@ async function processNode(run, depth=0) {
     const pauseUntil = new Date(Date.now()+Math.max(ms,1000)).toISOString();
     await supabase.from('bot_runs').update({ status:'paused', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
 
+  } else if (node.type === 'business_hours') {
+    const st = businessHoursState(Date.now(), cfg);
+    if (st.open) {
+      const nxt = await getNextNodeId(nodeId, '__open__');
+      if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+      else await stopRun(runId,'completed');
+    } else if (cfg.wait !== false) {
+      // Fora do expediente: aguarda até reabrir (permanece neste nó; o timer re-avalia)
+      await supabase.from('bot_runs').update({ status:'paused', pause_until:new Date(st.nextOpenMs).toISOString(), updated_at:new Date().toISOString() }).eq('id',runId);
+    } else {
+      const nxt = await getNextNodeId(nodeId, '__closed__');
+      if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+      else await stopRun(runId,'completed');
+    }
+
   } else if (node.type === 'move_stage') {
     if (cfg.stage_id) await supabase.from('contacts').update({ stage_id:cfg.stage_id }).eq('phone',phone);
     const nxt = await getNextNodeId(nodeId, null);
@@ -1548,6 +1584,13 @@ setInterval(async () => {
   const now = new Date().toISOString();
   const { data:paused } = await supabase.from('bot_runs').select('*').in('status',['paused','waiting_reply']).lte('pause_until',now).not('pause_until','is',null);
   for (const run of paused||[]) {
+    // Se o nó atual é "Horário comercial", re-avalia o próprio nó (não avança)
+    const { data:curNode } = await supabase.from('bot_nodes').select('type').eq('id', run.current_node_id).maybeSingle();
+    if (curNode?.type === 'business_hours') {
+      await supabase.from('bot_runs').update({ status:'running', pause_until:null, updated_at:now }).eq('id',run.id);
+      await processNode({...run, status:'running'});
+      continue;
+    }
     const nxt = await getNextNodeId(run.current_node_id,'__timeout__') || await getNextNodeId(run.current_node_id,'__other__') || await getNextNodeId(run.current_node_id,null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, status:'running', pause_until:null, updated_at:now }).eq('id',run.id); await processNode({...run,current_node_id:nxt,status:'running'}); }
     else { await stopRun(run.id,'completed'); }
