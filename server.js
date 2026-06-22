@@ -43,6 +43,7 @@ const META_ERROR_CODES = {
   131051: 'Tipo de mensagem não suportado pelo destinatário.',
   131053: 'Falha ao enviar a mídia (arquivo inválido ou inacessível).',
   131000: 'Erro interno da Meta ao processar a mensagem.',
+  131042: 'Problema de pagamento da conta: o envio falhou por causa do método de pagamento do WhatsApp Business. Verifique o faturamento/cartão no Gerenciador de Negócios da Meta (WhatsApp > Configurações de pagamento).',
   130472: 'A Meta optou por não entregar (experimento/qualidade do número).',
   470:    'Fora da janela de 24h: use um modelo aprovado para reabrir a conversa.',
   132000: 'Modelo: número de variáveis não confere com o aprovado.',
@@ -55,12 +56,18 @@ const META_ERROR_CODES = {
 function metaErrorText(er) {
   if (!er) return 'Falha no envio reportada pela Meta sem detalhes adicionais (status "failed").';
   const code = er.code;
-  const parts = [];
-  if (code && META_ERROR_CODES[code]) parts.push(META_ERROR_CODES[code]);
-  if (er.title) parts.push(er.title);
-  if (er.error_data?.details) parts.push(er.error_data.details);
-  else if (er.message) parts.push(er.message);
-  let txt = parts.filter(Boolean).join(' — ') || 'Falha no envio reportada pela Meta.';
+  let txt;
+  if (code && META_ERROR_CODES[code]) {
+    // Temos tradução em português: usa só ela (não anexa o texto em inglês da Meta)
+    txt = META_ERROR_CODES[code];
+  } else {
+    // Sem tradução: usa o que a Meta mandou (em inglês mesmo) para não ficar sem motivo
+    const parts = [];
+    if (er.title) parts.push(er.title);
+    if (er.error_data?.details) parts.push(er.error_data.details);
+    else if (er.message) parts.push(er.message);
+    txt = parts.filter(Boolean).join(' — ') || 'Falha no envio reportada pela Meta.';
+  }
   if (code) txt += ` (código ${code})`;
   return txt;
 }
