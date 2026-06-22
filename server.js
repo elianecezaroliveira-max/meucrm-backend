@@ -185,13 +185,18 @@ app.post("/webhook", async (req, res) => {
       }
 
       if (supabase) {
+        // Já existe? (para NÃO sobrescrever o nome que o usuário editou manualmente)
+        const { data: existing } = await supabase
+          .from("contacts").select("name, unread_count, first_unread_at").eq("phone", from).maybeSingle();
+
         // Salva contato com prévia da última mensagem
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
         const contactData = {
-          phone: from, name, last_message_at: timestamp,
+          phone: from, last_message_at: timestamp,
           last_message_preview: preview,
           last_message_direction: 'inbound',
         };
+        if (!existing) contactData.name = name; // só define o nome do WhatsApp na CRIAÇÃO; depois respeita o editado
         if (accountId) contactData.account_id = accountId;
 
         const { error: contactErr } = await supabase
@@ -205,9 +210,7 @@ app.post("/webhook", async (req, res) => {
         }
 
         // Incrementa contador de não lidas e marca hora da 1ª mensagem não lida
-        const { data: cRow } = await supabase
-          .from("contacts").select("unread_count, first_unread_at").eq("phone", from).maybeSingle();
-        const currentUnread = cRow?.unread_count || 0;
+        const currentUnread = existing?.unread_count || 0;
         const unreadUpdate = { unread_count: currentUnread + 1 };
         if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp; // só na 1ª mensagem não lida
         await supabase.from("contacts").update(unreadUpdate).eq("phone", from);
@@ -1251,10 +1254,36 @@ async function sendBotMsg(phone, accountId, text) {
 
 async function botGetAcct(accountId) {
   if (supabase && accountId) {
-    const { data } = await supabase.from('accounts').select('phone_number_id,token').eq('id', accountId).maybeSingle();
+    const { data } = await supabase.from('accounts').select('phone_number_id,token,waba_id').eq('id', accountId).maybeSingle();
     if (data && data.phone_number_id) return data;
   }
-  return { phone_number_id: process.env.PHONE_NUMBER_ID, token: process.env.WHATSAPP_TOKEN };
+  return { phone_number_id: process.env.PHONE_NUMBER_ID, token: process.env.WHATSAPP_TOKEN, waba_id: process.env.WABA_ID };
+}
+
+// Busca o corpo (BODY) de um modelo aprovado na Meta — com cache em memória
+const _tmplBodyCache = {};
+async function getTemplateBodyText(token, wabaId, name, lang) {
+  if (!token || !wabaId || !name) return null;
+  const key = wabaId + '|' + name + '|' + (lang || '');
+  if (_tmplBodyCache[key] !== undefined) return _tmplBodyCache[key];
+  try {
+    const r = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}/message_templates`, {
+      params: { access_token: token, name, fields: 'name,language,components', limit: 10 }
+    });
+    const list = r.data?.data || [];
+    const tmpl = list.find(t => t.name === name && (!lang || t.language === lang)) || list.find(t => t.name === name) || list[0];
+    const body = tmpl?.components?.find(c => c.type === 'BODY');
+    const txt = body?.text || null;
+    _tmplBodyCache[key] = txt;
+    return txt;
+  } catch(e) { _tmplBodyCache[key] = null; return null; }
+}
+
+// Substitui {{1}}, {{2}}… pelos valores das variáveis (posicional)
+function renderTemplateBody(bodyText, vars) {
+  let txt = bodyText || '';
+  (vars || []).forEach((val, i) => { txt = txt.split('{{' + (i + 1) + '}}').join(val); });
+  return txt;
 }
 
 // Envia um MODELO aprovado pelo bot (com variáveis no corpo)
@@ -1270,8 +1299,14 @@ async function sendBotTemplate(phone, accountId, cfg, name) {
       { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
     if (supabase) {
       const ts = new Date().toISOString();
-      const prev = `[Modelo: ${cfg.template_name}]`;
-      await supabase.from('messages').insert({ phone, content: prev, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: r.data?.messages?.[0]?.id || null });
+      // Tenta montar o texto real do modelo (busca o corpo na Meta e troca {{n}} pelas variáveis)
+      let shown = `[Modelo: ${cfg.template_name}]`;
+      try {
+        const bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR');
+        if (bodyText) shown = renderTemplateBody(bodyText, vars);
+      } catch(_) {}
+      const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
+      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: r.data?.messages?.[0]?.id || null });
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone);
     }
     return true;
