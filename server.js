@@ -1291,7 +1291,16 @@ function renderTemplateBody(bodyText, vars) {
 async function sendBotTemplate(phone, accountId, cfg, name) {
   const acct = await botGetAcct(accountId);
   if (!acct.phone_number_id || !acct.token) return null;
-  const vars = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone));
+  // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
+  let bodyText = null;
+  try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR'); } catch(_) {}
+  const provided = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone));
+  const needed = bodyText ? new Set(bodyText.match(/\{\{\d+\}\}/g) || []).size : provided.length;
+  const vars = [];
+  for (let i = 0; i < needed; i++) {
+    const p = provided[i];
+    vars.push(p && p.trim() ? p : (i === 0 ? (name || phone) : ' ')); // preenche o que faltar (1ª = nome)
+  }
   const tmpl = { name: cfg.template_name, language: { code: cfg.language || 'pt_BR' } };
   if (vars.length) tmpl.components = [{ type: 'body', parameters: vars.map(t => ({ type: 'text', text: t })) }];
   try {
@@ -1300,12 +1309,8 @@ async function sendBotTemplate(phone, accountId, cfg, name) {
       { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
     if (supabase) {
       const ts = new Date().toISOString();
-      // Tenta montar o texto real do modelo (busca o corpo na Meta e troca {{n}} pelas variáveis)
-      let shown = `[Modelo: ${cfg.template_name}]`;
-      try {
-        const bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR');
-        if (bodyText) shown = renderTemplateBody(bodyText, vars);
-      } catch(_) {}
+      // Monta o texto real do modelo (troca {{n}} pelas variáveis)
+      let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: r.data?.messages?.[0]?.id || null });
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone);
@@ -1576,6 +1581,39 @@ app.put('/bots/:id/flow', async (req,res) => {
     if (edges?.length) { const { error:ee } = await supabase.from('bot_edges').insert(edges.map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'' }))); if (ee) throw ee; }
     res.json({success:true});
   } catch(err) { res.status(500).json({error:err.message}); }
+});
+// Duplicar um bot (copia config, nós e arestas com novos ids)
+app.post('/bots/:id/duplicate', async (req,res) => {
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  const srcId = req.params.id;
+  const { data: bot, error: be } = await supabase.from('bots').select('*').eq('id', srcId).single();
+  if (be || !bot) return res.status(404).json({error:'Bot não encontrado'});
+  // novo bot: começa MANUAL e INATIVO para não disparar sem querer
+  const { data: newBot, error: ne } = await supabase.from('bots').insert({
+    name: (bot.name || 'Bot') + ' (cópia)', trigger_type: 'manual', trigger_stage_id: null,
+    account_id: bot.account_id || null, active: false
+  }).select().single();
+  if (ne) return res.status(500).json({error:ne.message});
+  const [{data:nodes},{data:edges}] = await Promise.all([
+    supabase.from('bot_nodes').select('*').eq('bot_id', srcId),
+    supabase.from('bot_edges').select('*').eq('bot_id', srcId)
+  ]);
+  let c = 0;
+  const genId = () => 'n' + Date.now().toString(36) + (c++).toString(36) + Math.random().toString(36).substring(2,5);
+  const idMap = {};
+  (nodes || []).forEach(n => { idMap[n.id] = genId(); });
+  if (nodes?.length) {
+    const { error } = await supabase.from('bot_nodes').insert(nodes.map(n => ({
+      id: idMap[n.id], bot_id: newBot.id, type: n.type, label: n.label || '', config: n.config || {}, pos_x: n.pos_x || 0, pos_y: n.pos_y || 0
+    })));
+    if (error) return res.status(500).json({error:error.message});
+  }
+  if (edges?.length) {
+    const rows = edges.map(e => ({ id: genId(), bot_id: newBot.id, from_node_id: idMap[e.from_node_id], to_node_id: idMap[e.to_node_id], label: e.label || '' }))
+                      .filter(e => e.from_node_id && e.to_node_id);
+    if (rows.length) { const { error } = await supabase.from('bot_edges').insert(rows); if (error) return res.status(500).json({error:error.message}); }
+  }
+  res.json({ success:true, id:newBot.id });
 });
 app.post('/bots/:id/start', async (req,res) => {
   const { phone,account_id } = req.body;
