@@ -1028,8 +1028,9 @@ app.post("/send-template", async (req, res) => {
     await supabase.from("messages").insert({
       phone: to, content: `[Template: ${template_name}]`, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
+      status: 'sent', wamid: response.data?.messages?.[0]?.id || null,
     });
-    console.log("✅ Template enviado:", template_name, "→", to);
+    console.log("✅ Template enviado:", template_name, "→", to, "wamid:", response.data?.messages?.[0]?.id);
     res.json({ success: true, data: response.data });
   } catch (err) {
     console.error("❌ Erro ao enviar template:", err.response?.data || err.message);
