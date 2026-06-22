@@ -35,6 +35,36 @@ app.get("/webhook", (req, res) => {
   }
 });
 
+// Traduz o erro de entrega da Meta para um texto sempre preenchido (Meta + sistema)
+const META_ERROR_CODES = {
+  131026: 'Mensagem não entregue: o número não tem WhatsApp ou não pode receber mensagens deste tipo.',
+  131047: 'Fora da janela de 24h: só é possível enviar modelo (template) aprovado para este contato.',
+  131049: 'A Meta limitou a entrega (limite de marketing/saúde da conta) e optou por não entregar.',
+  131051: 'Tipo de mensagem não suportado pelo destinatário.',
+  131053: 'Falha ao enviar a mídia (arquivo inválido ou inacessível).',
+  131000: 'Erro interno da Meta ao processar a mensagem.',
+  130472: 'A Meta optou por não entregar (experimento/qualidade do número).',
+  470:    'Fora da janela de 24h: use um modelo aprovado para reabrir a conversa.',
+  132000: 'Modelo: número de variáveis não confere com o aprovado.',
+  132001: 'Modelo não existe ou não está aprovado para este idioma.',
+  132005: 'Modelo: o texto enviado foi reprovado pela Meta.',
+  132007: 'Modelo: conteúdo viola as políticas do WhatsApp.',
+  133010: 'Número não registrado na conta do WhatsApp.',
+  100:    'Parâmetro inválido na requisição à Meta.',
+};
+function metaErrorText(er) {
+  if (!er) return 'Falha no envio reportada pela Meta sem detalhes adicionais (status "failed").';
+  const code = er.code;
+  const parts = [];
+  if (code && META_ERROR_CODES[code]) parts.push(META_ERROR_CODES[code]);
+  if (er.title) parts.push(er.title);
+  if (er.error_data?.details) parts.push(er.error_data.details);
+  else if (er.message) parts.push(er.message);
+  let txt = parts.filter(Boolean).join(' — ') || 'Falha no envio reportada pela Meta.';
+  if (code) txt += ` (código ${code})`;
+  return txt;
+}
+
 // ── Receber mensagens ──
 app.post("/webhook", async (req, res) => {
   try {
@@ -60,9 +90,8 @@ app.post("/webhook", async (req, res) => {
           const { id: wamid, status } = st;
           if (wamid && ['sent','delivered','read','failed'].includes(status)) {
             const upd = { status };
-            if (status === 'failed' && st.errors?.length) {
-              const er = st.errors[0];
-              upd.error_info = (er.title || er.message || 'Falha no envio') + (er.error_data?.details ? ' — ' + er.error_data.details : '');
+            if (status === 'failed') {
+              upd.error_info = metaErrorText(st.errors?.[0]);
               console.error('❌ Entrega falhou:', wamid, upd.error_info);
             }
             await supabase.from("messages").update(upd).eq("wamid", wamid);
