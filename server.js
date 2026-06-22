@@ -1361,11 +1361,17 @@ async function processNode(run, depth=0) {
     const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
     const okNxt   = medges?.find(e=>!e.label||e.label===''||e.label==='default')?.to_node_id || null;
     const failNxt = medges?.find(e=>(e.label||'').toLowerCase()==='__failed__')?.to_node_id || null;
+    const hasButtons = cfg.mode === 'template' && Array.isArray(cfg.buttons) && cfg.buttons.length > 0;
     if (!sendOk && failNxt) {
       await supabase.from('bot_runs').update({ current_node_id:failNxt, updated_at:new Date().toISOString() }).eq('id',runId);
       await processNode({...run,current_node_id:failNxt}, depth+1);
     } else if (!sendOk) {
       await stopRun(runId,'failed');
+    } else if (hasButtons) {
+      // Modelo com botões: aguarda o lead clicar num botão (ramifica conforme o botão)
+      let pauseUntil = null;
+      if (cfg.timeout_hours && cfg.timeout_hours > 0) pauseUntil = new Date(Date.now() + cfg.timeout_hours*3600000).toISOString();
+      await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
     } else if (okNxt) {
       await supabase.from('bot_runs').update({ current_node_id:okNxt, updated_at:new Date().toISOString() }).eq('id',runId);
       await processNode({...run,current_node_id:okNxt}, depth+1);
