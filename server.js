@@ -59,7 +59,13 @@ app.post("/webhook", async (req, res) => {
         for (const st of value.statuses) {
           const { id: wamid, status } = st;
           if (wamid && ['sent','delivered','read','failed'].includes(status)) {
-            await supabase.from("messages").update({ status }).eq("wamid", wamid);
+            const upd = { status };
+            if (status === 'failed' && st.errors?.length) {
+              const er = st.errors[0];
+              upd.error_info = (er.title || er.message || 'Falha no envio') + (er.error_data?.details ? ' — ' + er.error_data.details : '');
+              console.error('❌ Entrega falhou:', wamid, upd.error_info);
+            }
+            await supabase.from("messages").update(upd).eq("wamid", wamid);
           }
         }
       }
@@ -1033,8 +1039,11 @@ app.post("/send-template", async (req, res) => {
     console.log("✅ Template enviado:", template_name, "→", to, "wamid:", response.data?.messages?.[0]?.id);
     res.json({ success: true, data: response.data });
   } catch (err) {
+    const e = err.response?.data?.error || {};
+    const msg = e.error_user_msg || e.message || err.message || "Erro ao enviar template";
+    const detail = e.error_user_title || e.error_data?.details || "";
     console.error("❌ Erro ao enviar template:", err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao enviar template" });
+    res.status(500).json({ error: msg, detail, code: e.code || null });
   }
 });
 
