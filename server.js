@@ -173,6 +173,13 @@ app.post("/webhook", async (req, res) => {
         mediaId = message.sticker?.id || null;
         mediaMimeType = message.sticker?.mime_type || "image/webp";
         content = "[Figurinha]";
+      } else if (type === "button") {
+        // Botão de resposta rápida de um template aprovado
+        content = message.button?.text || "[Botão]";
+      } else if (type === "interactive") {
+        // Botões/listas interativas
+        const it = message.interactive;
+        content = it?.button_reply?.title || it?.list_reply?.title || it?.nfm_reply?.name || "[Resposta interativa]";
       } else {
         content = `[Mensagem do tipo: ${type}]`;
       }
@@ -225,8 +232,8 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.log("✅ Mensagem salva:", content.substring(0, 50));
         }
-        // Processa reply de bot ativo
-        if (type === 'text' && content) {
+        // Processa reply de bot ativo (texto OU clique em botão/lista)
+        if (['text','button','interactive'].includes(type) && content) {
           try { await handleBotReply(from, content); } catch(be) { console.error('Bot reply error:', be.message); }
         }
         // Encaminha para N8N se configurado
@@ -1043,7 +1050,7 @@ app.delete("/templates/:template_id", async (req, res) => {
 
 // ── Enviar template ──
 app.post("/send-template", async (req, res) => {
-  const { to, account_id, template_name, language_code, components } = req.body;
+  const { to, account_id, template_name, language_code, components, body_text } = req.body;
   if (!to || !account_id || !template_name)
     return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
@@ -1062,13 +1069,15 @@ app.post("/send-template", async (req, res) => {
       { headers: { Authorization: `Bearer ${account.token}`, "Content-Type": "application/json" } }
     );
     const safeAccountId = account_id || null;
+    const shownText = (body_text && String(body_text).trim()) ? String(body_text).trim() : `[Template: ${template_name}]`;
+    const preview = shownText.length > 80 ? shownText.substring(0, 80) + '…' : shownText;
     await supabase.from("contacts").upsert(
       { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
-        last_message_preview: `[Modelo: ${template_name}]`, last_message_direction: 'outbound' },
+        last_message_preview: preview, last_message_direction: 'outbound' },
       { onConflict: "phone" }
     );
     await supabase.from("messages").insert({
-      phone: to, content: `[Template: ${template_name}]`, type: "template",
+      phone: to, content: shownText, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
       status: 'sent', wamid: response.data?.messages?.[0]?.id || null,
     });
