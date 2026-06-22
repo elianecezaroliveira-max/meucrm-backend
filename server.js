@@ -1223,11 +1223,12 @@ app.put("/contacts/:phone/read", async (req, res) => {
 // ═══════════════════════════════════════
 
 // Substitui variáveis aceitando vários formatos: {nome} (nome) [nome] {{nome}}, maiúsc/minúsc
-function applyVars(str, name, phone) {
+function applyVars(str, name, phone, notes) {
   if (!str) return str;
   return String(str)
     .replace(/[\{\(\[]{1,2}\s*nome\s*[\}\)\]]{1,2}/gi, name || '')
-    .replace(/[\{\(\[]{1,2}\s*telefone\s*[\}\)\]]{1,2}/gi, phone || '');
+    .replace(/[\{\(\[]{1,2}\s*telefone\s*[\}\)\]]{1,2}/gi, phone || '')
+    .replace(/[\{\(\[]{1,2}\s*(?:notas?|anota[cç][aã]o|anota[cç][oõ]es|observa[cç][aã]o|observa[cç][oõ]es)\s*[\}\)\]]{1,2}/gi, notes || '');
 }
 
 async function sendBotMsg(phone, accountId, text) {
@@ -1288,13 +1289,13 @@ function renderTemplateBody(bodyText, vars) {
 }
 
 // Envia um MODELO aprovado pelo bot (com variáveis no corpo)
-async function sendBotTemplate(phone, accountId, cfg, name) {
+async function sendBotTemplate(phone, accountId, cfg, name, notes) {
   const acct = await botGetAcct(accountId);
   if (!acct.phone_number_id || !acct.token) return null;
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
   let bodyText = null;
   try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR'); } catch(_) {}
-  const provided = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone));
+  const provided = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone, notes));
   const needed = bodyText ? new Set(bodyText.match(/\{\{\d+\}\}/g) || []).size : provided.length;
   const vars = [];
   for (let i = 0; i < needed; i++) {
@@ -1348,13 +1349,14 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'message') {
-    const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).maybeSingle();
+    const { data:ct } = await supabase.from('contacts').select('name,notes').eq('phone',phone).maybeSingle();
     const name = ct?.name || phone;
+    const notes = ct?.notes || '';
     let sendOk;
     if (cfg.mode === 'template' && cfg.template_name) {
-      sendOk = await sendBotTemplate(phone, acctId, cfg, name);
+      sendOk = await sendBotTemplate(phone, acctId, cfg, name, notes);
     } else {
-      const text = applyVars(cfg.text || '', name, phone);
+      const text = applyVars(cfg.text || '', name, phone, notes);
       sendOk = text ? await sendBotMsg(phone, acctId, text) : true; // sem texto = nada a enviar (não é falha)
     }
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
