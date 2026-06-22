@@ -852,6 +852,7 @@ app.post("/update/lead", async (req, res) => {
     let stage_id = clean(it.stage_id) || null;
     const extId     = clean(it.id || it["ID"] || it.stage_external_id);
     const stageName = clean(it.stage || it.etapa || it["Etapa"] || it.stage_name);
+    const { data: prev } = await supabase.from("contacts").select("stage_id").eq("phone", phone).maybeSingle();
 
     if (!stage_id) {
       const key = "ext:" + extId + "|name:" + stageName.toLowerCase();
@@ -873,6 +874,8 @@ app.post("/update/lead", async (req, res) => {
     if (error) { errors.push({ phone, error: error.message }); continue; }
     if (!data || !data.length) { errors.push({ phone, error: "lead não encontrado no CRM" }); continue; }
     updated++;
+    // Dispara bots com gatilho "entrou na etapa" — só quando a etapa realmente mudou
+    if (prev?.stage_id !== stage_id) { try { await fireStageBots(phone, stage_id); } catch(e) { console.error('fireStageBots (n8n):', e.message); } }
   }
 
   console.log(`🔁 n8n atualizou etapa de ${updated} lead(s)` + (errors.length ? `, ${errors.length} erro(s)` : ""));
@@ -1098,17 +1101,12 @@ app.get("/contacts", async (req, res) => {
 app.put("/contacts/:phone/stage", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { stage_id } = req.body;
+  const { data: old } = await supabase.from("contacts").select("stage_id").eq("phone", req.params.phone).maybeSingle();
   const { error } = await supabase
     .from("contacts").update({ stage_id: stage_id || null }).eq("phone", req.params.phone);
   if (error) return res.status(500).json({ error: error.message });
-  // Dispara bots com gatilho de etapa
-  if (stage_id && supabase) {
-    try {
-      const { data: trigBots } = await supabase.from('bots').select('*').eq('trigger_type','stage_enter').eq('trigger_stage_id',stage_id).eq('active',true);
-      const phone = req.params.phone;
-      for (const bot of trigBots||[]) { await startBot(bot.id, phone, bot.account_id); }
-    } catch(e) { console.error('Bot stage trigger error:', e.message); }
-  }
+  // Dispara bots com gatilho de etapa — só quando a etapa realmente mudou
+  if (stage_id && old?.stage_id !== stage_id) await fireStageBots(req.params.phone, stage_id);
   res.json({ success: true });
 });
 
@@ -1117,10 +1115,15 @@ app.put("/contacts/bulk-stage", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phones, stage_id } = req.body;
   if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
+  // Guarda etapas anteriores para disparar bot só em quem mudou de verdade
+  const { data: prevRows } = await supabase.from("contacts").select("phone, stage_id").in("phone", phones);
+  const prevMap = {}; for (const r of prevRows || []) prevMap[r.phone] = r.stage_id;
   const { error } = await supabase.from("contacts")
     .update({ stage_id: stage_id || null })
     .in("phone", phones);
   if (error) return res.status(500).json({ error: error.message });
+  // Dispara bots com gatilho "entrou na etapa" para cada lead que realmente mudou
+  if (stage_id) { for (const ph of phones) { if (prevMap[ph] !== stage_id) { try { await fireStageBots(ph, stage_id); } catch(e) { console.error('fireStageBots (bulk):', e.message); } } } }
   res.json({ success: true });
 });
 
@@ -1373,10 +1376,30 @@ async function handleBotReply(phone, text) {
   return true;
 }
 
+// Dispara todos os bots com gatilho "entrou na etapa" para um lead
+async function fireStageBots(phone, stageId, fallbackAcct) {
+  if (!supabase || !stageId || !phone) return;
+  try {
+    const { data: bots } = await supabase.from('bots')
+      .select('*').eq('trigger_type','stage_enter').eq('trigger_stage_id',stageId).eq('active',true);
+    if (!bots || !bots.length) return;
+    let leadAcct = fallbackAcct;
+    if (leadAcct === undefined) {
+      const { data: ct } = await supabase.from('contacts').select('account_id').eq('phone',phone).maybeSingle();
+      leadAcct = ct?.account_id || null;
+    }
+    for (const bot of bots) {
+      console.log(`🤖 Gatilho de etapa: bot "${bot.name}" para ${phone}`);
+      await startBot(bot.id, phone, bot.account_id || leadAcct);
+    }
+  } catch(e) { console.error('fireStageBots error:', e.message); }
+}
+
 async function startBot(botId, phone, accountId) {
   if (!supabase) return null;
   await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() }).eq('contact_phone',phone).eq('bot_id',botId).in('status',['running','waiting_reply','paused']);
-  const { data:startNode } = await supabase.from('bot_nodes').select('id').eq('bot_id',botId).eq('type','start').maybeSingle();
+  const { data:startNodes } = await supabase.from('bot_nodes').select('id').eq('bot_id',botId).eq('type','start').limit(1);
+  const startNode = startNodes && startNodes[0];
   if (!startNode) { console.error('❌ Bot sem nó start:', botId); return null; }
   const { data:run, error } = await supabase.from('bot_runs').insert({
     bot_id:botId, contact_phone:phone, account_id:accountId||null,
