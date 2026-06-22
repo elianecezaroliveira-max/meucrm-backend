@@ -73,6 +73,24 @@ function metaErrorText(er) {
   return txt;
 }
 
+// Buffer de status que chegam ANTES da mensagem ser salva (corrige ✓ que não vira ✓✓)
+const _pendingStatuses = {}; // wamid -> { status, error_info, ts }
+function _cachePendingStatus(wamid, upd) {
+  if (!wamid) return;
+  _pendingStatuses[wamid] = { ...upd, ts: Date.now() };
+  // limpa entradas com mais de 10 min
+  const cutoff = Date.now() - 600000;
+  for (const k in _pendingStatuses) if (_pendingStatuses[k].ts < cutoff) delete _pendingStatuses[k];
+}
+async function applyPendingStatus(wamid) {
+  if (!wamid || !supabase) return;
+  const p = _pendingStatuses[wamid];
+  if (!p) return;
+  const u = { status: p.status };
+  if (p.error_info) u.error_info = p.error_info;
+  await supabase.from('messages').update(u).eq('wamid', wamid);
+}
+
 // ── Receber mensagens ──
 app.post("/webhook", async (req, res) => {
   try {
@@ -102,6 +120,7 @@ app.post("/webhook", async (req, res) => {
               upd.error_info = metaErrorText(st.errors?.[0]);
               console.error('❌ Entrega falhou:', wamid, upd.error_info);
             }
+            _cachePendingStatus(wamid, upd); // guarda caso a msg ainda não esteja salva
             await supabase.from("messages").update(upd).eq("wamid", wamid);
           }
         }
@@ -492,6 +511,7 @@ app.post("/send", async (req, res) => {
       if (msgErr) {
         console.error("❌ Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
       } else {
+        await applyPendingStatus(wamid);
         console.log("✅ Mensagem enviada salva no banco:", message.substring(0, 50));
       }
     }
@@ -570,7 +590,7 @@ app.post("/send-media", async (req, res) => {
     if (msgType === "document") mediaObj.filename = fileName;
 
     // 3. Envia a mensagem de mídia
-    await axios.post(
+    const mediaResp = await axios.post(
       `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
       { messaging_product: "whatsapp", to, type: msgType, [msgType]: mediaObj },
       { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
@@ -579,6 +599,7 @@ app.post("/send-media", async (req, res) => {
     // 4. Salva no Supabase
     if (supabase) {
       const safeAccountId = account_id || null;
+      const mediaWamid = mediaResp.data?.messages?.[0]?.id || null;
       const label = msgType === "image" ? "Imagem" : msgType === "video" ? "Vídeo" : msgType === "audio" ? "Áudio" : "Documento";
       const content = `[${label}: ${fileName}]`;
       await supabase.from("contacts").upsert(
@@ -590,9 +611,10 @@ app.post("/send-media", async (req, res) => {
         phone: to, content,
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'sent', wamid: null,
+        status: 'sent', wamid: mediaWamid,
         media_id: mediaId, media_mime_type: mimeType, // permite exibir a mídia no CRM
       });
+      await applyPendingStatus(mediaWamid);
     }
     res.json({ success: true });
   } catch (err) {
@@ -1080,12 +1102,14 @@ app.post("/send-template", async (req, res) => {
         last_message_preview: preview, last_message_direction: 'outbound' },
       { onConflict: "phone" }
     );
+    const tplWamid = response.data?.messages?.[0]?.id || null;
     await supabase.from("messages").insert({
       phone: to, content: shownText, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
-      status: 'sent', wamid: response.data?.messages?.[0]?.id || null,
+      status: 'sent', wamid: tplWamid,
     });
-    console.log("✅ Template enviado:", template_name, "→", to, "wamid:", response.data?.messages?.[0]?.id);
+    await applyPendingStatus(tplWamid);
+    console.log("✅ Template enviado:", template_name, "→", to, "wamid:", tplWamid);
     res.json({ success: true, data: response.data });
   } catch (err) {
     const e = err.response?.data?.error || {};
@@ -1247,6 +1271,7 @@ async function sendBotMsg(phone, accountId, text) {
     if (supabase) {
       const ts = new Date().toISOString();
       await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid });
+      await applyPendingStatus(wamid); // aplica status que chegou antes do insert
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound' }).eq('phone',phone);
     }
@@ -1313,7 +1338,9 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes) {
       // Monta o texto real do modelo (troca {{n}} pelas variáveis)
       let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
-      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: r.data?.messages?.[0]?.id || null });
+      const tWamid = r.data?.messages?.[0]?.id || null;
+      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: tWamid });
+      await applyPendingStatus(tWamid);
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone);
     }
     return true;
