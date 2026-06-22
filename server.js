@@ -44,6 +44,7 @@ const META_ERROR_CODES = {
   131053: 'Falha ao enviar a mídia (arquivo inválido ou inacessível).',
   131000: 'Erro interno da Meta ao processar a mensagem.',
   131042: 'Problema de pagamento da conta: o envio falhou por causa do método de pagamento do WhatsApp Business. Verifique o faturamento/cartão no Gerenciador de Negócios da Meta (WhatsApp > Configurações de pagamento).',
+  131031: 'Conta do WhatsApp Business BLOQUEADA pela Meta. Geralmente por pagamento pendente/recusado ou violação de política. Resolva em business.facebook.com > Qualidade da conta / Central de Segurança (e regularize o pagamento). Pode ser necessário solicitar revisão.',
   130472: 'A Meta optou por não entregar (experimento/qualidade do número).',
   470:    'Fora da janela de 24h: use um modelo aprovado para reabrir a conversa.',
   132000: 'Modelo: número de variáveis não confere com o aprovado.',
