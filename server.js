@@ -166,15 +166,17 @@ app.post("/webhook", async (req, res) => {
 
       console.log(`📨 Mensagem de ${name} (${from}) via número ${phoneNumberId}`);
 
-      // Busca account_id (pode ser null se não cadastrado)
+      // Busca account_id + dono (owner) — roteia a mensagem para o usuário certo
       let accountId = null;
+      let ownerEmail = null;
       if (supabase && phoneNumberId) {
         const { data: account, error: accErr } = await supabase
-          .from("accounts").select("id").eq("phone_number_id", phoneNumberId).maybeSingle();
+          .from("accounts").select("id, owner").eq("phone_number_id", phoneNumberId).maybeSingle();
         if (accErr) console.error("❌ Erro ao buscar conta:", accErr.message);
         if (account) {
           accountId = account.id;
-          console.log("✅ Conta encontrada:", accountId);
+          ownerEmail = account.owner || null;
+          console.log("✅ Conta encontrada:", accountId, "dono:", ownerEmail);
         } else {
           console.log("⚠️ Nenhuma conta com phone_number_id:", phoneNumberId, "- salvando sem account_id");
         }
@@ -236,6 +238,7 @@ app.post("/webhook", async (req, res) => {
         };
         if (!existing) contactData.name = name; // só define o nome do WhatsApp na CRIAÇÃO; depois respeita o editado
         if (accountId) contactData.account_id = accountId;
+        if (ownerEmail) contactData.owner = ownerEmail; // dono = dono da conta de WhatsApp
 
         const { error: contactErr } = await supabase
           .from("contacts")
@@ -265,6 +268,7 @@ app.post("/webhook", async (req, res) => {
           wamid: message.id || null,
         };
         if (accountId) messageData.account_id = accountId; // só inclui se não for null
+        if (ownerEmail) messageData.owner = ownerEmail;
 
         const { error: msgErr } = await supabase.from("messages").insert(messageData);
 
@@ -424,6 +428,7 @@ app.get("/accounts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
     .from("accounts").select("id, name, phone_number_id, phone_display, type, evolution_instance, created_at")
+    .eq("owner", req.owner || ' ')
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -436,7 +441,7 @@ app.post("/accounts", async (req, res) => {
     return res.status(400).json({ error: "Informe name, phone_number_id e token" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { data, error } = await supabase
-    .from("accounts").insert({ name, phone_number_id, token }).select().single();
+    .from("accounts").insert({ name, phone_number_id, token, owner: req.owner || null }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
 });
@@ -444,7 +449,7 @@ app.post("/accounts", async (req, res) => {
 // ── Remover conta ──
 app.delete("/accounts/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { error } = await supabase.from("accounts").delete().eq("id", req.params.id);
+  const { error } = await supabase.from("accounts").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -514,6 +519,7 @@ app.post("/send", async (req, res) => {
           phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
           last_message_preview: preview,
           last_message_direction: 'outbound',
+          owner: req.owner || null,
         },
         { onConflict: "phone" }
       );
@@ -521,7 +527,7 @@ app.post("/send", async (req, res) => {
       const { error: msgErr } = await supabase.from("messages").insert({
         phone: to, content: message, type: "text", direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'sent', wamid,
+        status: 'sent', wamid, owner: req.owner || null,
         quoted_id: quoted_id || null,
         quoted_content: quoted_content || null,
         quoted_direction: quoted_direction || null,
@@ -622,14 +628,14 @@ app.post("/send-media", async (req, res) => {
       const content = `[${label}: ${fileName}]`;
       await supabase.from("contacts").upsert(
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
-          last_message_preview: content, last_message_direction: 'outbound' },
+          last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
         { onConflict: "phone" }
       );
       await supabase.from("messages").insert({
         phone: to, content,
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'sent', wamid: mediaWamid,
+        status: 'sent', wamid: mediaWamid, owner: req.owner || null,
         media_id: mediaId, media_mime_type: mimeType, // permite exibir a mídia no CRM
       });
       await applyPendingStatus(mediaWamid);
@@ -1006,7 +1012,7 @@ app.get("/leads", async (req, res) => {
 // ── Deletar mensagem individual ──
 app.delete("/messages/id/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { error } = await supabase.from("messages").delete().eq("id", req.params.id);
+  const { error } = await supabase.from("messages").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -1015,7 +1021,7 @@ app.delete("/messages/id/:id", async (req, res) => {
 app.get("/messages/:phone", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("messages").select("*").eq("phone", req.params.phone)
+    .from("messages").select("*").eq("phone", req.params.phone).eq("owner", req.owner || ' ')
     .order("timestamp", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -1117,14 +1123,14 @@ app.post("/send-template", async (req, res) => {
     const preview = shownText.length > 80 ? shownText.substring(0, 80) + '…' : shownText;
     await supabase.from("contacts").upsert(
       { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
-        last_message_preview: preview, last_message_direction: 'outbound' },
+        last_message_preview: preview, last_message_direction: 'outbound', owner: req.owner || null },
       { onConflict: "phone" }
     );
     const tplWamid = response.data?.messages?.[0]?.id || null;
     await supabase.from("messages").insert({
       phone: to, content: shownText, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
-      status: 'sent', wamid: tplWamid,
+      status: 'sent', wamid: tplWamid, owner: req.owner || null,
     });
     await applyPendingStatus(tplWamid);
     console.log("✅ Template enviado:", template_name, "→", to, "wamid:", tplWamid);
@@ -1188,6 +1194,7 @@ app.get("/contacts", async (req, res) => {
   const { account_id, with_messages } = req.query;
   let query = supabase
     .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
+    .eq("owner", req.owner || ' ')
     .order("last_message_at", { ascending: false });
   if (account_id) query = query.eq("account_id", account_id); // filtra pela conta quando informada
   // Lista de CONVERSAS: só contatos que já tiveram mensagem real (preview só é preenchido por mensagem,
@@ -1288,7 +1295,9 @@ async function sendBotMsg(phone, accountId, text) {
     const wamid = r.data?.messages?.[0]?.id || null;
     if (supabase) {
       const ts = new Date().toISOString();
-      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid });
+      const { data:ctOwn } = await supabase.from('contacts').select('owner').eq('phone',phone).maybeSingle();
+      const owner = ctOwn?.owner || null;
+      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid, owner });
       await applyPendingStatus(wamid); // aplica status que chegou antes do insert
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound' }).eq('phone',phone);
@@ -1357,7 +1366,8 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes) {
       let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
       const tWamid = r.data?.messages?.[0]?.id || null;
-      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: tWamid });
+      const { data:ctOwn } = await supabase.from('contacts').select('owner').eq('phone',phone).maybeSingle();
+      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: tWamid, owner: ctOwn?.owner || null });
       await applyPendingStatus(tWamid);
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone);
     }
