@@ -227,7 +227,7 @@ app.post("/webhook", async (req, res) => {
       if (supabase) {
         // Já existe? (para NÃO sobrescrever o nome que o usuário editou manualmente)
         const { data: existing } = await supabase
-          .from("contacts").select("name, unread_count, first_unread_at").eq("phone", from).maybeSingle();
+          .from("contacts").select("name, unread_count, first_unread_at").eq("phone", from).eq("owner", ownerEmail || ' ').maybeSingle();
 
         // Salva contato com prévia da última mensagem
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
@@ -242,7 +242,7 @@ app.post("/webhook", async (req, res) => {
 
         const { error: contactErr } = await supabase
           .from("contacts")
-          .upsert(contactData, { onConflict: "phone" });
+          .upsert(contactData, { onConflict: "owner,phone" });
 
         if (contactErr) {
           console.error("❌ Erro ao salvar contato:", contactErr.message, contactErr.details);
@@ -254,7 +254,7 @@ app.post("/webhook", async (req, res) => {
         const currentUnread = existing?.unread_count || 0;
         const unreadUpdate = { unread_count: currentUnread + 1 };
         if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp; // só na 1ª mensagem não lida
-        await supabase.from("contacts").update(unreadUpdate).eq("phone", from);
+        await supabase.from("contacts").update(unreadUpdate).eq("phone", from).eq("owner", ownerEmail || ' ');
 
         // Salva mensagem
         const messageData = {
@@ -279,7 +279,7 @@ app.post("/webhook", async (req, res) => {
         }
         // Processa reply de bot ativo (texto OU clique em botão/lista)
         if (['text','button','interactive'].includes(type) && content) {
-          try { await handleBotReply(from, content); } catch(be) { console.error('Bot reply error:', be.message); }
+          try { await handleBotReply(from, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
         }
         // Encaminha para N8N se configurado
         const n8nUrl = _settings['n8n_webhook_url'];
@@ -390,6 +390,7 @@ app.post("/auth/whatsapp", async (req, res) => {
           phone_display: phone.display_phone_number,
           token: userToken,
           waba_id: wabaId,
+          owner: req.owner || null,
         };
 
         if (supabase) {
@@ -521,7 +522,7 @@ app.post("/send", async (req, res) => {
           last_message_direction: 'outbound',
           owner: req.owner || null,
         },
-        { onConflict: "phone" }
+        { onConflict: "owner,phone" }
       );
       const wamid = response.data?.messages?.[0]?.id || null;
       const { error: msgErr } = await supabase.from("messages").insert({
@@ -629,7 +630,7 @@ app.post("/send-media", async (req, res) => {
       await supabase.from("contacts").upsert(
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
           last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
-        { onConflict: "phone" }
+        { onConflict: "owner,phone" }
       );
       await supabase.from("messages").insert({
         phone: to, content,
@@ -724,7 +725,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
 // ── Lista todas as tags existentes (para sugestões e filtro) ──
 app.get("/tags", async (req, res) => {
   if (!supabase) return res.json([]);
-  const { data, error } = await supabase.from("contacts").select("tags");
+  const { data, error } = await supabase.from("contacts").select("tags").eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   const set = new Set();
   (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) set.add(t); }));
@@ -741,7 +742,7 @@ app.get("/search", async (req, res) => {
   const like = `%${term}%`;
   try {
     // 1. Telefones que têm alguma mensagem contendo o termo
-    let mq = supabase.from("messages").select("phone").ilike("content", like).limit(500);
+    let mq = supabase.from("messages").select("phone").ilike("content", like).eq("owner", req.owner || ' ').limit(500);
     if (account_id) mq = mq.eq("account_id", account_id);
     const { data: msgRows } = await mq;
     const phones = [...new Set((msgRows || []).map(m => m.phone).filter(Boolean))];
@@ -751,6 +752,7 @@ app.get("/search", async (req, res) => {
     if (phones.length) orCond += `,phone.in.(${phones.join(",")})`;
     let cq = supabase.from("contacts")
       .select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
+      .eq("owner", req.owner || ' ')
       .or(orCond)
       .not("last_message_preview", "is", null)
       .order("last_message_at", { ascending: false })
@@ -768,7 +770,7 @@ app.get("/search", async (req, res) => {
 app.get("/tasks", async (req, res) => {
   if (!supabase) return res.json([]);
   const { phone, pending } = req.query;
-  let q = supabase.from("tasks").select("*").order("due_at", { ascending: true, nullsFirst: false });
+  let q = supabase.from("tasks").select("*").eq("owner", req.owner || ' ').order("due_at", { ascending: true, nullsFirst: false });
   if (phone) q = q.eq("phone", phone);
   if (pending === "1") q = q.eq("done", false);
   const { data, error } = await q;
@@ -777,7 +779,7 @@ app.get("/tasks", async (req, res) => {
   // anexa o nome do lead (para a aba global de tarefas)
   const phones = [...new Set(tasks.map(t => t.phone).filter(Boolean))];
   if (phones.length) {
-    const { data: cts } = await supabase.from("contacts").select("phone,name").in("phone", phones);
+    const { data: cts } = await supabase.from("contacts").select("phone,name").in("phone", phones).eq("owner", req.owner || ' ');
     const nameMap = {};
     for (const c of cts || []) nameMap[c.phone] = c.name;
     for (const t of tasks) t.contact_name = t.phone ? (nameMap[t.phone] || t.phone) : null;
@@ -790,7 +792,7 @@ app.post("/tasks", async (req, res) => {
   const { phone, account_id, title, due_at, notes } = req.body;
   if (!title) return res.status(400).json({ error: "Título obrigatório" });
   const { data, error } = await supabase.from("tasks")
-    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null, notes: notes || null })
+    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null, notes: notes || null, owner: req.owner || null })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
@@ -803,14 +805,14 @@ app.put("/tasks/:id", async (req, res) => {
   if (req.body.title != null) upd.title = req.body.title;
   if (req.body.due_at !== undefined) upd.due_at = req.body.due_at || null;
   if (req.body.notes !== undefined) upd.notes = req.body.notes || null;
-  const { error } = await supabase.from("tasks").update(upd).eq("id", req.params.id);
+  const { error } = await supabase.from("tasks").update(upd).eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
 app.delete("/tasks/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { error } = await supabase.from("tasks").delete().eq("id", req.params.id);
+  const { error } = await supabase.from("tasks").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -821,7 +823,7 @@ app.put("/contacts/:phone/tags", async (req, res) => {
   const { tags } = req.body;
   if (!Array.isArray(tags)) return res.status(400).json({ error: "tags deve ser array" });
   const { error } = await supabase
-    .from("contacts").update({ tags }).eq("phone", req.params.phone);
+    .from("contacts").update({ tags }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -831,7 +833,7 @@ app.put("/contacts/:phone/name", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const name = (req.body.name || "").trim();
   if (!name) return res.status(400).json({ error: "Nome obrigatório" });
-  const { error } = await supabase.from("contacts").update({ name }).eq("phone", req.params.phone);
+  const { error } = await supabase.from("contacts").update({ name }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -840,7 +842,7 @@ app.put("/contacts/:phone/name", async (req, res) => {
 app.get("/contacts/:phone/notes", async (req, res) => {
   if (!supabase) return res.json({ notes: "" });
   const { data, error } = await supabase
-    .from("contacts").select("notes").eq("phone", req.params.phone).maybeSingle();
+    .from("contacts").select("notes").eq("phone", req.params.phone).eq("owner", req.owner || ' ').maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ notes: data?.notes || "" });
 });
@@ -851,7 +853,7 @@ app.put("/contacts/:phone/notes", async (req, res) => {
   const { error } = await supabase
     .from("contacts")
     .update({ notes: notes ?? "" })
-    .eq("phone", req.params.phone);
+    .eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -864,7 +866,7 @@ app.post("/contacts", async (req, res) => {
   const cleanPhone = phone.replace(/\D/g, '');
   if (cleanPhone.length < 8) return res.status(400).json({ error: "Número de celular inválido" });
   const { data, error } = await supabase.from("contacts")
-    .upsert({ phone: cleanPhone, name, account_id: account_id || null, last_message_at: new Date().toISOString() }, { onConflict: "phone" })
+    .upsert({ phone: cleanPhone, name, account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() }, { onConflict: "owner,phone" })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
@@ -877,13 +879,13 @@ app.post("/contacts/import", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const toInsert = contacts
     .map(c => {
-      const obj = { phone: String(c.phone || '').replace(/\D/g, ''), name: c.name || 'Desconhecido', account_id: account_id || null, last_message_at: new Date().toISOString() };
+      const obj = { phone: String(c.phone || '').replace(/\D/g, ''), name: c.name || 'Desconhecido', account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() };
       if (stage_id) obj.stage_id = stage_id; // só grava etapa quando escolhida (não apaga a de quem já existe)
       return obj;
     })
     .filter(c => c.phone.length >= 8);
   if (!toInsert.length) return res.status(400).json({ error: "Nenhum contato válido encontrado" });
-  const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "phone" });
+  const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "owner,phone" });
   if (error) return res.status(500).json({ error: error.message });
   console.log(`✅ ${toInsert.length} contatos importados`);
   res.json({ success: true, count: toInsert.length });
@@ -899,6 +901,7 @@ app.post("/import/lead", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const items = Array.isArray(req.body) ? req.body
               : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
+  const n8nOwner = (String(req.query.owner||'').trim()) || (!Array.isArray(req.body) && req.body.owner) || 'elianecezaroliveira@gmail.com';
   const stageCache = {};
   let imported = 0;
   const errors = [];
@@ -914,17 +917,17 @@ app.post("/import/lead", async (req, res) => {
     let stage_id = null;
     if (extId) {
       if (stageCache[extId] === undefined) {
-        const { data: st } = await supabase.from("pipeline_stages").select("id").eq("external_id", extId).maybeSingle();
+        const { data: st } = await supabase.from("pipeline_stages").select("id").eq("external_id", extId).eq("owner", n8nOwner).maybeSingle();
         stageCache[extId] = st ? st.id : null;
       }
       stage_id = stageCache[extId];
     }
 
-    const row = { phone, name };
+    const row = { phone, name, owner: n8nOwner };
     if (account_id) row.account_id = account_id;
     if (stage_id) row.stage_id = stage_id;
     // Não define last_message_* → o lead aparece só no Pipeline até iniciar conversa
-    const { error: e } = await supabase.from("contacts").upsert(row, { onConflict: "phone" });
+    const { error: e } = await supabase.from("contacts").upsert(row, { onConflict: "owner,phone" });
     if (e) errors.push({ phone, error: e.message }); else imported++;
   }
 
@@ -940,6 +943,7 @@ app.post("/update/lead", async (req, res) => {
   const items = Array.isArray(req.body) ? req.body
               : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
   const clean = v => String(v || "").replace(/^=+\s*/, "").trim();
+  const n8nOwner = (String(req.query.owner||'').trim()) || (!Array.isArray(req.body) && req.body.owner) || 'elianecezaroliveira@gmail.com';
   const stageCache = {};
   let updated = 0;
   const errors = [];
@@ -951,12 +955,12 @@ app.post("/update/lead", async (req, res) => {
     let stage_id = clean(it.stage_id) || null;
     const extId     = clean(it.id || it["ID"] || it.stage_external_id);
     const stageName = clean(it.stage || it.etapa || it["Etapa"] || it.stage_name);
-    const { data: prev } = await supabase.from("contacts").select("stage_id").eq("phone", phone).maybeSingle();
+    const { data: prev } = await supabase.from("contacts").select("stage_id").eq("phone", phone).eq("owner", n8nOwner).maybeSingle();
 
     if (!stage_id) {
       const key = "ext:" + extId + "|name:" + stageName.toLowerCase();
       if (stageCache[key] === undefined) {
-        let q = supabase.from("pipeline_stages").select("id");
+        let q = supabase.from("pipeline_stages").select("id").eq("owner", n8nOwner);
         if (extId) q = q.eq("external_id", extId);
         else if (stageName) q = q.ilike("name", stageName);
         else { stageCache[key] = null; }
@@ -969,12 +973,12 @@ app.post("/update/lead", async (req, res) => {
     }
     if (!stage_id) { errors.push({ phone, error: "etapa não encontrada" }); continue; }
 
-    const { data, error } = await supabase.from("contacts").update({ stage_id }).eq("phone", phone).select("phone");
+    const { data, error } = await supabase.from("contacts").update({ stage_id }).eq("phone", phone).eq("owner", n8nOwner).select("phone");
     if (error) { errors.push({ phone, error: error.message }); continue; }
     if (!data || !data.length) { errors.push({ phone, error: "lead não encontrado no CRM" }); continue; }
     updated++;
     // Dispara bots com gatilho "entrou na etapa" — só quando a etapa realmente mudou
-    if (prev?.stage_id !== stage_id) { try { await fireStageBots(phone, stage_id); } catch(e) { console.error('fireStageBots (n8n):', e.message); } }
+    if (prev?.stage_id !== stage_id) { try { await fireStageBots(phone, stage_id, n8nOwner); } catch(e) { console.error('fireStageBots (n8n):', e.message); } }
   }
 
   console.log(`🔁 n8n atualizou etapa de ${updated} lead(s)` + (errors.length ? `, ${errors.length} erro(s)` : ""));
@@ -990,9 +994,10 @@ app.get("/leads", async (req, res) => {
   const extId     = clean(req.query.id || req.query.external_id);
   const stageName = clean(req.query.stage || req.query.etapa);
   let stage_id    = clean(req.query.stage_id) || null;
+  const n8nOwner  = clean(req.query.owner) || 'elianecezaroliveira@gmail.com';
 
   if (!stage_id && (extId || stageName)) {
-    let q = supabase.from("pipeline_stages").select("id");
+    let q = supabase.from("pipeline_stages").select("id").eq("owner", n8nOwner);
     if (extId) q = q.eq("external_id", extId);
     else q = q.ilike("name", stageName);
     const { data: st } = await q.maybeSingle();
@@ -1002,7 +1007,7 @@ app.get("/leads", async (req, res) => {
 
   const { data, error } = await supabase.from("contacts")
     .select("phone, name, stage_id, account_id, tags")
-    .eq("stage_id", stage_id)
+    .eq("stage_id", stage_id).eq("owner", n8nOwner)
     .order("last_message_at", { ascending: false, nullsFirst: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -1124,7 +1129,7 @@ app.post("/send-template", async (req, res) => {
     await supabase.from("contacts").upsert(
       { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
         last_message_preview: preview, last_message_direction: 'outbound', owner: req.owner || null },
-      { onConflict: "phone" }
+      { onConflict: "owner,phone" }
     );
     const tplWamid = response.data?.messages?.[0]?.id || null;
     await supabase.from("messages").insert({
@@ -1150,7 +1155,7 @@ app.post("/send-template", async (req, res) => {
 app.get("/pipeline/stages", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("pipeline_stages").select("*").order("position", { ascending: true });
+    .from("pipeline_stages").select("*").eq("owner", req.owner || ' ').order("position", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
@@ -1161,7 +1166,7 @@ app.post("/pipeline/stages", async (req, res) => {
   const { name, position } = req.body;
   if (!name) return res.status(400).json({ error: "Nome obrigatório" });
   const { data, error } = await supabase
-    .from("pipeline_stages").insert({ name, position: position || 0 }).select().single();
+    .from("pipeline_stages").insert({ name, position: position || 0, owner: req.owner || null }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -1174,7 +1179,7 @@ app.put("/pipeline/stages/:id", async (req, res) => {
   if (name !== undefined) updates.name = name;
   if (position !== undefined) updates.position = position;
   const { error } = await supabase
-    .from("pipeline_stages").update(updates).eq("id", req.params.id);
+    .from("pipeline_stages").update(updates).eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -1182,8 +1187,8 @@ app.put("/pipeline/stages/:id", async (req, res) => {
 // Excluir estágio (move leads para sem-status)
 app.delete("/pipeline/stages/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  await supabase.from("contacts").update({ stage_id: null }).eq("stage_id", req.params.id);
-  const { error } = await supabase.from("pipeline_stages").delete().eq("id", req.params.id);
+  await supabase.from("contacts").update({ stage_id: null }).eq("stage_id", req.params.id).eq("owner", req.owner || ' ');
+  const { error } = await supabase.from("pipeline_stages").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -1209,12 +1214,12 @@ app.get("/contacts", async (req, res) => {
 app.put("/contacts/:phone/stage", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { stage_id } = req.body;
-  const { data: old } = await supabase.from("contacts").select("stage_id").eq("phone", req.params.phone).maybeSingle();
+  const { data: old } = await supabase.from("contacts").select("stage_id").eq("phone", req.params.phone).eq("owner", req.owner || ' ').maybeSingle();
   const { error } = await supabase
-    .from("contacts").update({ stage_id: stage_id || null }).eq("phone", req.params.phone);
+    .from("contacts").update({ stage_id: stage_id || null }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   // Dispara bots com gatilho de etapa — só quando a etapa realmente mudou
-  if (stage_id && old?.stage_id !== stage_id) await fireStageBots(req.params.phone, stage_id);
+  if (stage_id && old?.stage_id !== stage_id) await fireStageBots(req.params.phone, stage_id, req.owner);
   res.json({ success: true });
 });
 
@@ -1224,14 +1229,14 @@ app.put("/contacts/bulk-stage", async (req, res) => {
   const { phones, stage_id } = req.body;
   if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
   // Guarda etapas anteriores para disparar bot só em quem mudou de verdade
-  const { data: prevRows } = await supabase.from("contacts").select("phone, stage_id").in("phone", phones);
+  const { data: prevRows } = await supabase.from("contacts").select("phone, stage_id").in("phone", phones).eq("owner", req.owner || ' ');
   const prevMap = {}; for (const r of prevRows || []) prevMap[r.phone] = r.stage_id;
   const { error } = await supabase.from("contacts")
     .update({ stage_id: stage_id || null })
-    .in("phone", phones);
+    .in("phone", phones).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   // Dispara bots com gatilho "entrou na etapa" para cada lead que realmente mudou
-  if (stage_id) { for (const ph of phones) { if (prevMap[ph] !== stage_id) { try { await fireStageBots(ph, stage_id); } catch(e) { console.error('fireStageBots (bulk):', e.message); } } } }
+  if (stage_id) { for (const ph of phones) { if (prevMap[ph] !== stage_id) { try { await fireStageBots(ph, stage_id, req.owner); } catch(e) { console.error('fireStageBots (bulk):', e.message); } } } }
   res.json({ success: true });
 });
 
@@ -1239,8 +1244,8 @@ app.delete("/contacts/bulk-delete", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phones } = req.body;
   if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
-  await supabase.from("messages").delete().in("phone", phones);
-  const { error } = await supabase.from("contacts").delete().in("phone", phones);
+  await supabase.from("messages").delete().in("phone", phones).eq("owner", req.owner || ' ');
+  const { error } = await supabase.from("contacts").delete().in("phone", phones).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -1251,9 +1256,9 @@ app.put("/contacts/bulk-tags", async (req, res) => {
   if (!Array.isArray(phones) || !Array.isArray(tags)) return res.status(400).json({ error: "phones e tags obrigatórios" });
   // For each phone, merge new tags with existing
   for (const phone of phones) {
-    const { data: contact } = await supabase.from("contacts").select("tags").eq("phone", phone).single();
+    const { data: contact } = await supabase.from("contacts").select("tags").eq("phone", phone).eq("owner", req.owner || ' ').maybeSingle();
     const merged = Array.from(new Set([...(contact?.tags || []), ...tags]));
-    await supabase.from("contacts").update({ tags: merged }).eq("phone", phone);
+    await supabase.from("contacts").update({ tags: merged }).eq("phone", phone).eq("owner", req.owner || ' ');
   }
   res.json({ success: true });
 });
@@ -1262,7 +1267,7 @@ app.put("/contacts/bulk-tags", async (req, res) => {
 app.put("/contacts/:phone/read", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { error } = await supabase
-    .from("contacts").update({ unread_count: 0, first_unread_at: null }).eq("phone", req.params.phone);
+    .from("contacts").update({ unread_count: 0, first_unread_at: null }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -1280,7 +1285,7 @@ function applyVars(str, name, phone, notes) {
     .replace(/[\{\(\[]{1,2}\s*(?:notas?|anota[cç][aã]o|anota[cç][oõ]es|observa[cç][aã]o|observa[cç][oõ]es)\s*[\}\)\]]{1,2}/gi, notes || '');
 }
 
-async function sendBotMsg(phone, accountId, text) {
+async function sendBotMsg(phone, accountId, text, owner) {
   let phoneNumberId, token;
   if (supabase && accountId) {
     const { data: acct } = await supabase.from('accounts').select('phone_number_id,token').eq('id', accountId).maybeSingle();
@@ -1295,12 +1300,10 @@ async function sendBotMsg(phone, accountId, text) {
     const wamid = r.data?.messages?.[0]?.id || null;
     if (supabase) {
       const ts = new Date().toISOString();
-      const { data:ctOwn } = await supabase.from('contacts').select('owner').eq('phone',phone).maybeSingle();
-      const owner = ctOwn?.owner || null;
-      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid, owner });
+      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid, owner:owner||null });
       await applyPendingStatus(wamid); // aplica status que chegou antes do insert
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
-      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound' }).eq('phone',phone);
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound' }).eq('phone',phone).eq('owner',owner||' ');
     }
     return wamid;
   } catch(e) { console.error('❌ Bot sendMsg:', e.response?.data||e.message); return null; }
@@ -1341,7 +1344,7 @@ function renderTemplateBody(bodyText, vars) {
 }
 
 // Envia um MODELO aprovado pelo bot (com variáveis no corpo)
-async function sendBotTemplate(phone, accountId, cfg, name, notes) {
+async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   const acct = await botGetAcct(accountId);
   if (!acct.phone_number_id || !acct.token) return null;
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
@@ -1366,10 +1369,9 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes) {
       let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
       const tWamid = r.data?.messages?.[0]?.id || null;
-      const { data:ctOwn } = await supabase.from('contacts').select('owner').eq('phone',phone).maybeSingle();
-      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: tWamid, owner: ctOwn?.owner || null });
+      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
-      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone);
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone).eq('owner', owner || ' ');
     }
     return true;
   } catch(e) { console.error('❌ Bot template:', e.response?.data || e.message); return null; }
@@ -1414,7 +1416,8 @@ async function stopRun(runId, status='completed') {
 
 async function processNode(run, depth=0) {
   if (!supabase || depth > 30) return; // prevent infinite loops
-  const { id:runId, contact_phone:phone, account_id:acctId, current_node_id:nodeId } = run;
+  const { id:runId, contact_phone:phone, account_id:acctId, current_node_id:nodeId, owner:botOwner } = run;
+  const OW = botOwner || ' '; // sentinela p/ escopo por dono
   const { data:node } = await supabase.from('bot_nodes').select('*').eq('id', nodeId).maybeSingle();
   if (!node) { await stopRun(runId,'stopped'); return; }
   const cfg = node.config || {};
@@ -1425,15 +1428,15 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'message') {
-    const { data:ct } = await supabase.from('contacts').select('name,notes').eq('phone',phone).maybeSingle();
+    const { data:ct } = await supabase.from('contacts').select('name,notes').eq('phone',phone).eq('owner',OW).maybeSingle();
     const name = ct?.name || phone;
     const notes = ct?.notes || '';
     let sendOk;
     if (cfg.mode === 'template' && cfg.template_name) {
-      sendOk = await sendBotTemplate(phone, acctId, cfg, name, notes);
+      sendOk = await sendBotTemplate(phone, acctId, cfg, name, notes, botOwner);
     } else {
       const text = applyVars(cfg.text || '', name, phone, notes);
-      sendOk = text ? await sendBotMsg(phone, acctId, text) : true; // sem texto = nada a enviar (não é falha)
+      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner) : true; // sem texto = nada a enviar (não é falha)
     }
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
     const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
@@ -1458,26 +1461,26 @@ async function processNode(run, depth=0) {
     }
 
   } else if (node.type === 'tags') {
-    const { data:ct } = await supabase.from('contacts').select('tags').eq('phone',phone).maybeSingle();
+    const { data:ct } = await supabase.from('contacts').select('tags').eq('phone',phone).eq('owner',OW).maybeSingle();
     let tags = Array.isArray(ct?.tags) ? ct.tags.slice() : [];
     (cfg.add||[]).forEach(t => { if (t && !tags.includes(t)) tags.push(t); });
     if (cfg.remove?.length) tags = tags.filter(t => !cfg.remove.includes(t));
-    await supabase.from('contacts').update({ tags }).eq('phone',phone);
+    await supabase.from('contacts').update({ tags }).eq('phone',phone).eq('owner',OW);
     const nxt = await getNextNodeId(nodeId, null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'task') {
-    const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).maybeSingle();
+    const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).eq('owner',OW).maybeSingle();
     const title = applyVars(cfg.title || 'Tarefa', ct?.name || phone, phone);
     const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours)*3600000).toISOString() : null;
-    await supabase.from('tasks').insert({ phone, account_id:acctId||null, title, due_at:due });
+    await supabase.from('tasks').insert({ phone, account_id:acctId||null, title, due_at:due, owner:botOwner||null });
     const nxt = await getNextNodeId(nodeId, null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'complete_task') {
-    let q = supabase.from('tasks').update({ done:true }).eq('phone', phone).eq('done', false);
+    let q = supabase.from('tasks').update({ done:true }).eq('phone', phone).eq('done', false).eq('owner', OW);
     if (cfg.title_filter) q = q.ilike('title', '%' + cfg.title_filter + '%');
     await q;
     const nxt = await getNextNodeId(nodeId, null);
@@ -1485,7 +1488,7 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'mark_read') {
-    await supabase.from('contacts').update({ unread_count:0, first_unread_at:null }).eq('phone',phone);
+    await supabase.from('contacts').update({ unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',OW);
     const nxt = await getNextNodeId(nodeId, null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
     else await stopRun(runId,'completed');
@@ -1502,7 +1505,7 @@ async function processNode(run, depth=0) {
       const accId = branches[branchIdx]?.account_id;
       if (accId) {
         chosen = accId;
-        await supabase.from('contacts').update({ account_id: accId }).eq('phone', phone);
+        await supabase.from('contacts').update({ account_id: accId }).eq('phone', phone).eq('owner', OW);
         await supabase.from('bot_runs').update({ account_id: accId }).eq('id', runId);
       }
     }
@@ -1536,7 +1539,7 @@ async function processNode(run, depth=0) {
     }
 
   } else if (node.type === 'move_stage') {
-    if (cfg.stage_id) await supabase.from('contacts').update({ stage_id:cfg.stage_id }).eq('phone',phone);
+    if (cfg.stage_id) await supabase.from('contacts').update({ stage_id:cfg.stage_id }).eq('phone',phone).eq('owner',OW);
     const nxt = await getNextNodeId(nodeId, null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
     else await stopRun(runId,'completed');
@@ -1550,9 +1553,11 @@ async function processNode(run, depth=0) {
   }
 }
 
-async function handleBotReply(phone, text) {
+async function handleBotReply(phone, text, owner) {
   if (!supabase) return false;
-  const { data:run } = await supabase.from('bot_runs').select('*').eq('contact_phone',phone).eq('status','waiting_reply').order('created_at',{ascending:false}).limit(1).maybeSingle();
+  let rq = supabase.from('bot_runs').select('*').eq('contact_phone',phone).eq('status','waiting_reply').order('created_at',{ascending:false}).limit(1);
+  if (owner) rq = rq.eq('owner', owner); // só a run do dono certo (telefone pode repetir entre donos)
+  const { data:run } = await rq.maybeSingle();
   if (!run) return false;
   const { data:edges } = await supabase.from('bot_edges').select('*').eq('from_node_id', run.current_node_id);
   if (!edges?.length) { await stopRun(run.id,'completed'); return true; }
@@ -1571,34 +1576,36 @@ async function handleBotReply(phone, text) {
   return true;
 }
 
-// Dispara todos os bots com gatilho "entrou na etapa" para um lead
-async function fireStageBots(phone, stageId, fallbackAcct) {
+// Dispara todos os bots com gatilho "entrou na etapa" para um lead (do dono certo)
+async function fireStageBots(phone, stageId, owner) {
   if (!supabase || !stageId || !phone) return;
   try {
-    const { data: bots } = await supabase.from('bots')
-      .select('*').eq('trigger_type','stage_enter').eq('trigger_stage_id',stageId).eq('active',true);
+    let bq = supabase.from('bots').select('*').eq('trigger_type','stage_enter').eq('trigger_stage_id',stageId).eq('active',true);
+    if (owner) bq = bq.eq('owner', owner); // só os bots do dono do lead
+    const { data: bots } = await bq;
     if (!bots || !bots.length) return;
-    let leadAcct = fallbackAcct;
-    if (leadAcct === undefined) {
-      const { data: ct } = await supabase.from('contacts').select('account_id').eq('phone',phone).maybeSingle();
-      leadAcct = ct?.account_id || null;
-    }
+    let cq = supabase.from('contacts').select('account_id').eq('phone',phone);
+    if (owner) cq = cq.eq('owner', owner);
+    const { data: ct } = await cq.maybeSingle();
+    const leadAcct = ct?.account_id || null;
     for (const bot of bots) {
       console.log(`🤖 Gatilho de etapa: bot "${bot.name}" para ${phone}`);
-      await startBot(bot.id, phone, bot.account_id || leadAcct);
+      await startBot(bot.id, phone, bot.account_id || leadAcct, owner || bot.owner);
     }
   } catch(e) { console.error('fireStageBots error:', e.message); }
 }
 
-async function startBot(botId, phone, accountId) {
+async function startBot(botId, phone, accountId, owner) {
   if (!supabase) return null;
+  let ownerEmail = owner;
+  if (!ownerEmail) { const { data:b } = await supabase.from('bots').select('owner').eq('id',botId).maybeSingle(); ownerEmail = b?.owner || null; }
   await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() }).eq('contact_phone',phone).eq('bot_id',botId).in('status',['running','waiting_reply','paused']);
   const { data:startNodes } = await supabase.from('bot_nodes').select('id').eq('bot_id',botId).eq('type','start').limit(1);
   const startNode = startNodes && startNodes[0];
   if (!startNode) { console.error('❌ Bot sem nó start:', botId); return null; }
   const { data:run, error } = await supabase.from('bot_runs').insert({
     bot_id:botId, contact_phone:phone, account_id:accountId||null,
-    current_node_id:startNode.id, status:'running',
+    current_node_id:startNode.id, status:'running', owner:ownerEmail||null,
     created_at:new Date().toISOString(), updated_at:new Date().toISOString()
   }).select().single();
   if (error) { console.error('❌ Bot run insert:', error.message); return null; }
@@ -1628,20 +1635,20 @@ setInterval(async () => {
 // ── CRUD de Bots ──
 app.get('/bots', async (req,res) => {
   if (!supabase) return res.json([]);
-  const { data,error } = await supabase.from('bots').select('*').order('created_at',{ascending:false});
+  const { data,error } = await supabase.from('bots').select('*').eq('owner', req.owner || ' ').order('created_at',{ascending:false});
   if (error) return res.status(500).json({error:error.message});
   res.json(data||[]);
 });
 app.get('/bots/:id', async (req,res) => {
   if (!supabase) return res.json({});
-  const { data,error } = await supabase.from('bots').select('*').eq('id',req.params.id).single();
+  const { data,error } = await supabase.from('bots').select('*').eq('id',req.params.id).eq('owner', req.owner || ' ').single();
   if (error) return res.status(404).json({error:error.message});
   res.json(data||{});
 });
 app.post('/bots', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { name,trigger_type,trigger_stage_id,account_id } = req.body;
-  const { data,error } = await supabase.from('bots').insert({ name:name||'Novo Bot', trigger_type:trigger_type||'manual', trigger_stage_id:trigger_stage_id||null, account_id:account_id||null, active:true }).select().single();
+  const { data,error } = await supabase.from('bots').insert({ name:name||'Novo Bot', trigger_type:trigger_type||'manual', trigger_stage_id:trigger_stage_id||null, account_id:account_id||null, active:true, owner:req.owner||null }).select().single();
   if (error) return res.status(500).json({error:error.message});
   res.json(data);
 });
@@ -1653,23 +1660,29 @@ app.put('/bots/:id', async (req,res) => {
   if (trigger_type!==undefined) upd.trigger_type=trigger_type;
   if (trigger_stage_id!==undefined) upd.trigger_stage_id=trigger_stage_id||null;
   if (active!==undefined) upd.active=active;
-  const { data,error } = await supabase.from('bots').update(upd).eq('id',req.params.id).select().single();
+  const { data,error } = await supabase.from('bots').update(upd).eq('id',req.params.id).eq('owner', req.owner || ' ').select().single();
   if (error) return res.status(500).json({error:error.message});
   res.json(data);
 });
 app.delete('/bots/:id', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const id = req.params.id;
+  // confirma que o bot é do dono antes de apagar os filhos
+  const { data: own } = await supabase.from('bots').select('id').eq('id',id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!own) return res.status(404).json({error:'Bot não encontrado'});
   await supabase.from('bot_runs').delete().eq('bot_id',id);
   await supabase.from('bot_edges').delete().eq('bot_id',id);
   await supabase.from('bot_nodes').delete().eq('bot_id',id);
-  const { error } = await supabase.from('bots').delete().eq('id',id);
+  const { error } = await supabase.from('bots').delete().eq('id',id).eq('owner', req.owner || ' ');
   if (error) return res.status(500).json({error:error.message});
   res.json({success:true});
 });
 app.get('/bots/:id/flow', async (req,res) => {
   if (!supabase) return res.json({nodes:[],edges:[]});
   const id = req.params.id;
+  // só devolve o fluxo se o bot for do dono
+  const { data: own } = await supabase.from('bots').select('id').eq('id',id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!own) return res.json({nodes:[],edges:[]});
   const [nr,er] = await Promise.all([
     supabase.from('bot_nodes').select('*').eq('bot_id',id),
     supabase.from('bot_edges').select('*').eq('bot_id',id)
@@ -1680,11 +1693,13 @@ app.put('/bots/:id/flow', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { nodes,edges } = req.body;
   const botId = req.params.id;
+  const { data: own } = await supabase.from('bots').select('id').eq('id',botId).eq('owner', req.owner || ' ').maybeSingle();
+  if (!own) return res.status(404).json({error:'Bot não encontrado'});
   try {
     await supabase.from('bot_edges').delete().eq('bot_id',botId);
     await supabase.from('bot_nodes').delete().eq('bot_id',botId);
-    if (nodes?.length) { const { error:ne } = await supabase.from('bot_nodes').insert(nodes.map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0) }))); if (ne) throw ne; }
-    if (edges?.length) { const { error:ee } = await supabase.from('bot_edges').insert(edges.map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'' }))); if (ee) throw ee; }
+    if (nodes?.length) { const { error:ne } = await supabase.from('bot_nodes').insert(nodes.map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0), owner:req.owner||null }))); if (ne) throw ne; }
+    if (edges?.length) { const { error:ee } = await supabase.from('bot_edges').insert(edges.map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'', owner:req.owner||null }))); if (ee) throw ee; }
     res.json({success:true});
   } catch(err) { res.status(500).json({error:err.message}); }
 });
@@ -1692,12 +1707,12 @@ app.put('/bots/:id/flow', async (req,res) => {
 app.post('/bots/:id/duplicate', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const srcId = req.params.id;
-  const { data: bot, error: be } = await supabase.from('bots').select('*').eq('id', srcId).single();
+  const { data: bot, error: be } = await supabase.from('bots').select('*').eq('id', srcId).eq('owner', req.owner || ' ').single();
   if (be || !bot) return res.status(404).json({error:'Bot não encontrado'});
   // novo bot: começa MANUAL e INATIVO para não disparar sem querer
   const { data: newBot, error: ne } = await supabase.from('bots').insert({
     name: (bot.name || 'Bot') + ' (cópia)', trigger_type: 'manual', trigger_stage_id: null,
-    account_id: bot.account_id || null, active: false
+    account_id: bot.account_id || null, active: false, owner: req.owner || null
   }).select().single();
   if (ne) return res.status(500).json({error:ne.message});
   const [{data:nodes},{data:edges}] = await Promise.all([
@@ -1710,12 +1725,12 @@ app.post('/bots/:id/duplicate', async (req,res) => {
   (nodes || []).forEach(n => { idMap[n.id] = genId(); });
   if (nodes?.length) {
     const { error } = await supabase.from('bot_nodes').insert(nodes.map(n => ({
-      id: idMap[n.id], bot_id: newBot.id, type: n.type, label: n.label || '', config: n.config || {}, pos_x: n.pos_x || 0, pos_y: n.pos_y || 0
+      id: idMap[n.id], bot_id: newBot.id, type: n.type, label: n.label || '', config: n.config || {}, pos_x: n.pos_x || 0, pos_y: n.pos_y || 0, owner: req.owner || null
     })));
     if (error) return res.status(500).json({error:error.message});
   }
   if (edges?.length) {
-    const rows = edges.map(e => ({ id: genId(), bot_id: newBot.id, from_node_id: idMap[e.from_node_id], to_node_id: idMap[e.to_node_id], label: e.label || '' }))
+    const rows = edges.map(e => ({ id: genId(), bot_id: newBot.id, from_node_id: idMap[e.from_node_id], to_node_id: idMap[e.to_node_id], label: e.label || '', owner: req.owner || null }))
                       .filter(e => e.from_node_id && e.to_node_id);
     if (rows.length) { const { error } = await supabase.from('bot_edges').insert(rows); if (error) return res.status(500).json({error:error.message}); }
   }
@@ -1724,17 +1739,21 @@ app.post('/bots/:id/duplicate', async (req,res) => {
 app.post('/bots/:id/start', async (req,res) => {
   const { phone,account_id } = req.body;
   if (!phone) return res.status(400).json({error:'phone obrigatório'});
-  const run = await startBot(req.params.id, phone, account_id);
+  // confirma que o bot é do dono
+  const { data: own } = await supabase.from('bots').select('id').eq('id',req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!own) return res.status(404).json({error:'Bot não encontrado'});
+  const run = await startBot(req.params.id, phone, account_id, req.owner);
   if (!run) return res.status(500).json({error:'Erro ao iniciar bot (verifique se o fluxo tem nó Início)'});
   res.json({success:true, run_id:run.id});
 });
 app.post('/bot-runs/:id/stop', async (req,res) => {
-  await stopRun(req.params.id,'stopped');
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() }).eq('id',req.params.id).eq('owner', req.owner || ' ');
   res.json({success:true});
 });
 app.get('/bot-runs/contact/:phone', async (req,res) => {
   if (!supabase) return res.json([]);
-  const { data } = await supabase.from('bot_runs').select('*, bots(name)').eq('contact_phone',req.params.phone).in('status',['running','waiting_reply','paused']).order('created_at',{ascending:false});
+  const { data } = await supabase.from('bot_runs').select('*, bots(name)').eq('contact_phone',req.params.phone).eq('owner', req.owner || ' ').in('status',['running','waiting_reply','paused']).order('created_at',{ascending:false});
   res.json(data||[]);
 });
 
