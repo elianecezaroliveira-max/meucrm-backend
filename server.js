@@ -20,6 +20,24 @@ if (SUPABASE_URL && SUPABASE_KEY) {
   console.log("✅ Supabase conectado!");
 }
 
+// ── Multi-tenant: identifica o usuário logado (dono) a partir do token do Supabase ──
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlmcnhneWhreWdxaGpyd3Brc3J5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1Mjk4MDcsImV4cCI6MjA5NDEwNTgwN30.6vjbaJdWk-u55xegMrHnv64pvlo0DByfPdtDSj2C7z4';
+const _tokenOwner = {}; // cache token -> { email, ts }
+async function resolveOwner(req) {
+  const a = req.headers.authorization || '';
+  const tok = a.startsWith('Bearer ') ? a.slice(7) : null;
+  if (!tok || !SUPABASE_URL) return null;
+  const c = _tokenOwner[tok];
+  if (c && Date.now() - c.ts < 300000) return c.email;
+  try {
+    const r = await axios.get(`${SUPABASE_URL}/auth/v1/user`, { headers: { Authorization: 'Bearer ' + tok, apikey: SUPABASE_ANON } });
+    const email = (r.data?.email || '').toLowerCase() || null;
+    if (email) _tokenOwner[tok] = { email, ts: Date.now() };
+    return email;
+  } catch (e) { return null; }
+}
+app.use(async (req, res, next) => { try { req.owner = await resolveOwner(req); } catch (_) { req.owner = null; } next(); });
+
 app.get("/", (req, res) => res.send("✅ MeuCRM Backend funcionando!"));
 
 // ── Verificação do Webhook ──
