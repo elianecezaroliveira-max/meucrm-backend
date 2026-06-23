@@ -1303,7 +1303,7 @@ async function sendBotMsg(phone, accountId, text, owner) {
       await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid, owner:owner||null });
       await applyPendingStatus(wamid); // aplica status que chegou antes do insert
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
-      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound' }).eq('phone',phone).eq('owner',owner||' ');
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
     }
     return wamid;
   } catch(e) { console.error('❌ Bot sendMsg:', e.response?.data||e.message); return null; }
@@ -1371,7 +1371,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       const tWamid = r.data?.messages?.[0]?.id || null;
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
-      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone).eq('owner', owner || ' ');
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
     }
     return true;
   } catch(e) { console.error('❌ Bot template:', e.response?.data || e.message); return null; }
