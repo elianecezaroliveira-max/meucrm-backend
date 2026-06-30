@@ -665,6 +665,7 @@ async function getMediaUrl(mediaId, token, cacheKey, force) {
   return url;
 }
 
+const _mediaBufCache = {}; // cacheKey -> { buf, ctype, ts } — arquivo inteiro em memória (cache curto)
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
   const { mediaId } = req.params;
@@ -679,43 +680,65 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   if (!token) return res.status(400).json({ error: "Token não encontrado" });
 
   const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
-  const upstreamHeaders = { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" };
-  if (req.headers.range && download !== "1") upstreamHeaders.Range = req.headers.range;
-
-  async function fetchStream(force) {
-    const url = await getMediaUrl(mediaId, token, cacheKey, force);
-    return axios.get(url, {
-      headers: upstreamHeaders, responseType: "stream", timeout: 60000,
-      validateStatus: s => s >= 200 && s < 400,
-    });
-  }
 
   try {
-    let upstream;
-    try {
-      upstream = await fetchStream(false);
-    } catch (e) {
-      upstream = await fetchStream(true); // URL pode ter expirado — tenta uma vez com URL nova
+    // Baixa o arquivo INTEIRO uma vez (com cache curto) e serve os ranges a partir do buffer.
+    let entry = _mediaBufCache[cacheKey];
+    if (!entry || Date.now() - entry.ts > 300000) {
+      const fetchFull = async (force) => {
+        const url = await getMediaUrl(mediaId, token, cacheKey, force);
+        return axios.get(url, {
+          headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
+          responseType: "arraybuffer", timeout: 60000,
+          validateStatus: s => s >= 200 && s < 400,
+        });
+      };
+      let resp;
+      try { resp = await fetchFull(false); } catch (e) { resp = await fetchFull(true); } // URL pode ter expirado
+      entry = { buf: Buffer.from(resp.data), ctype: resp.headers["content-type"], ts: Date.now() };
+      _mediaBufCache[cacheKey] = entry;
+      // Limita o cache em memória (remove os mais antigos)
+      const keys = Object.keys(_mediaBufCache);
+      if (keys.length > 12) { keys.sort((a,b)=>_mediaBufCache[a].ts-_mediaBufCache[b].ts); delete _mediaBufCache[keys[0]]; }
     }
 
-    res.status(upstream.status);
+    const buf = entry.buf;
+    const total = buf.length;
+    const ctype = req.query.mime || entry.ctype || "application/octet-stream";
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Accept-Ranges", "bytes");
-    // Usa o mime conhecido (frontend envia ?mime=) — evita octet-stream que impede o vídeo de tocar
-    const ctype = req.query.mime || upstream.headers["content-type"];
-    if (ctype) res.setHeader("Content-Type", ctype);
-    if (upstream.headers["content-length"]) res.setHeader("Content-Length", upstream.headers["content-length"]);
-    if (upstream.headers["content-range"])  res.setHeader("Content-Range", upstream.headers["content-range"]);
+    res.setHeader("Content-Type", ctype);
 
     if (download === "1") {
       const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
       res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-    } else {
-      res.setHeader("Cache-Control", "public, max-age=600");
+      res.setHeader("Content-Length", total);
+      return res.status(200).end(buf);
+    }
+    res.setHeader("Cache-Control", "public, max-age=600");
+
+    // Pedido com Range (áudio/vídeo): responde 206 com o pedaço certo
+    const range = req.headers.range;
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      let start = m && m[1] !== "" ? parseInt(m[1], 10) : 0;
+      let end   = m && m[2] !== "" ? parseInt(m[2], 10) : total - 1;
+      if (isNaN(start)) start = 0;
+      if (isNaN(end) || end >= total) end = total - 1;
+      if (start > end || start >= total) {
+        res.setHeader("Content-Range", `bytes */${total}`);
+        return res.status(416).end();
+      }
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+      res.setHeader("Content-Length", end - start + 1);
+      return res.end(buf.subarray(start, end + 1));
     }
 
-    upstream.data.on("error", () => { try { res.end(); } catch (_) {} });
-    upstream.data.pipe(res);
+    // Sem Range: arquivo inteiro
+    res.status(200);
+    res.setHeader("Content-Length", total);
+    return res.end(buf);
   } catch (err) {
     console.error("❌ Erro ao baixar mídia:", err.response?.status || err.message);
     if (!res.headersSent) res.status(500).json({ error: "Falha ao baixar mídia" });
