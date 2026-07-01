@@ -666,15 +666,11 @@ async function getMediaUrl(mediaId, token, cacheKey, force) {
 }
 
 const _mediaBufCache = {}; // cacheKey -> { buf, ctype, ts } — arquivo inteiro em memória (cache curto)
-// ── Proxy de mídia HÍBRIDO (cache + streaming seletivo) ──
-const mediaUrlCache = new Map(); // URL cache por 10 min
-const _mediaBufCache = {};       // cache de arquivos PEQUENOS (< 2MB)
-
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
   const { mediaId } = req.params;
 
-  // 1. Buscar token
+  // Busca token da conta
   let token = process.env.WHATSAPP_TOKEN;
   if (supabase && account_id) {
     const { data: account } = await supabase
@@ -686,130 +682,66 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
 
   try {
-    // 2. Obter URL da mídia (cache de 10 min)
-    let url = mediaUrlCache.get(cacheKey)?.url;
-    if (!url) {
-      const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
-        headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-      });
-      url = metaRes.data.url;
-      if (!url) throw new Error("URL de mídia não encontrada");
-      mediaUrlCache.set(cacheKey, { url, ts: Date.now() });
-    }
-
-    // 3. Verifica se o arquivo é pequeno (imagem, áudio, etc.) – se for, usa cache em memória
-    // Vamos fazer uma requisição HEAD primeiro para saber o tamanho (opcional, mas evita baixar tudo)
-    // Para simplificar, usamos um limite de 2 MB: se for menor, cacheia.
-    // Mas não temos o tamanho sem baixar. Então, vamos baixar apenas se for "download=1" ou se o range não for solicitado.
-    // Estratégia: se for arquivo pequeno (extensão comum), cacheia. Senão, streaming.
-    const isSmall = /\.(jpg|jpeg|png|gif|webp|mp3|ogg|wav)$/i.test(filename || '');
-    const isVideo = /\.(mp4|mov|avi|mkv|webm)$/i.test(filename || '');
-
-    // Se for pequeno E não for vídeo, usa cache em memória (mais rápido)
-    if (isSmall && !isVideo) {
-      let entry = _mediaBufCache[cacheKey];
-      if (!entry || Date.now() - entry.ts > 600000) { // 10 min
-        const resp = await axios.get(url, {
+    // Baixa o arquivo INTEIRO uma vez (com cache curto) e serve os ranges a partir do buffer.
+    let entry = _mediaBufCache[cacheKey];
+    if (!entry || Date.now() - entry.ts > 300000) {
+      const fetchFull = async (force) => {
+        const url = await getMediaUrl(mediaId, token, cacheKey, force);
+        return axios.get(url, {
           headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
-          responseType: "arraybuffer", timeout: 30000,
+          responseType: "arraybuffer", timeout: 60000,
           validateStatus: s => s >= 200 && s < 400,
         });
-        entry = {
-          buf: Buffer.from(resp.data),
-          ctype: resp.headers["content-type"] || req.query.mime || "application/octet-stream",
-          ts: Date.now()
-        };
-        _mediaBufCache[cacheKey] = entry;
-        // Limita o cache a 5 itens (remove os mais antigos)
-        const keys = Object.keys(_mediaBufCache);
-        if (keys.length > 5) {
-          keys.sort((a,b) => _mediaBufCache[a].ts - _mediaBufCache[b].ts);
-          delete _mediaBufCache[keys[0]];
-        }
-      }
+      };
+      let resp;
+      try { resp = await fetchFull(false); } catch (e) { resp = await fetchFull(true); } // URL pode ter expirado
+      entry = { buf: Buffer.from(resp.data), ctype: resp.headers["content-type"], ts: Date.now() };
+      _mediaBufCache[cacheKey] = entry;
+      // Limita o cache em memória (remove os mais antigos)
+      const keys = Object.keys(_mediaBufCache);
+      if (keys.length > 12) { keys.sort((a,b)=>_mediaBufCache[a].ts-_mediaBufCache[b].ts); delete _mediaBufCache[keys[0]]; }
+    }
 
-      // Servir do buffer (mesmo código antigo, mas com Range)
-      const buf = entry.buf;
-      const total = buf.length;
-      const ctype = req.query.mime || entry.ctype || "application/octet-stream";
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Accept-Ranges", "bytes");
-      res.setHeader("Content-Type", ctype);
+    const buf = entry.buf;
+    const total = buf.length;
+    const ctype = req.query.mime || entry.ctype || "application/octet-stream";
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Content-Type", ctype);
 
-      if (download === "1") {
-        const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0,8)}`;
-        res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-        res.setHeader("Content-Length", total);
-        return res.status(200).end(buf);
-      }
-      res.setHeader("Cache-Control", "public, max-age=600");
-
-      const range = req.headers.range;
-      if (range) {
-        const m = /bytes=(\d*)-(\d*)/.exec(range);
-        let start = m && m[1] !== "" ? parseInt(m[1], 10) : 0;
-        let end   = m && m[2] !== "" ? parseInt(m[2], 10) : total - 1;
-        if (isNaN(start)) start = 0;
-        if (isNaN(end) || end >= total) end = total - 1;
-        if (start > end || start >= total) {
-          res.setHeader("Content-Range", `bytes */${total}`);
-          return res.status(416).end();
-        }
-        res.status(206);
-        res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
-        res.setHeader("Content-Length", end - start + 1);
-        return res.end(buf.subarray(start, end + 1));
-      }
-
-      res.status(200);
+    if (download === "1") {
+      const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
       res.setHeader("Content-Length", total);
-      return res.end(buf);
+      return res.status(200).end(buf);
     }
+    res.setHeader("Cache-Control", "public, max-age=600");
 
-    // 4. Para vídeos ou arquivos grandes: STREAMING (sem cache em memória)
-    const headers = { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" };
+    // Pedido com Range (áudio/vídeo): responde 206 com o pedaço certo
     const range = req.headers.range;
-    if (range) headers.Range = range;
-
-    const response = await axios({
-      method: 'get',
-      url,
-      headers,
-      responseType: 'stream',
-      timeout: 60000,
-      validateStatus: s => s >= 200 && s < 400,
-    });
-
-    const contentType = response.headers['content-type'] || req.query.mime || 'application/octet-stream';
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=600');
-
-    if (download === '1') {
-      const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0,8)}`;
-      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-    }
-
-    if (response.status === 206) {
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      let start = m && m[1] !== "" ? parseInt(m[1], 10) : 0;
+      let end   = m && m[2] !== "" ? parseInt(m[2], 10) : total - 1;
+      if (isNaN(start)) start = 0;
+      if (isNaN(end) || end >= total) end = total - 1;
+      if (start > end || start >= total) {
+        res.setHeader("Content-Range", `bytes */${total}`);
+        return res.status(416).end();
+      }
       res.status(206);
-      res.setHeader('Content-Range', response.headers['content-range']);
-      res.setHeader('Content-Length', response.headers['content-length']);
-    } else {
-      res.status(200);
-      res.setHeader('Content-Length', response.headers['content-length'] || '');
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+      res.setHeader("Content-Length", end - start + 1);
+      return res.end(buf.subarray(start, end + 1));
     }
 
-    response.data.pipe(res);
-    response.data.on('error', (err) => {
-      console.error('Stream error:', err.message);
-      if (!res.headersSent) res.status(500).json({ error: 'Erro no streaming' });
-    });
-
+    // Sem Range: arquivo inteiro
+    res.status(200);
+    res.setHeader("Content-Length", total);
+    return res.end(buf);
   } catch (err) {
-    console.error('❌ Media error:', err.response?.status || err.message);
-    if (!res.headersSent) res.status(500).json({ error: "Falha ao carregar mídia" });
-  }
-});
+    console.error("❌ Erro ao baixar mídia:", err.response?.status || err.message);
+    if (!res.headersSent) res.status(500).json({ error: "Falha ao baixar mídia" });
   }
 });
 
