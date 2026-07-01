@@ -4,7 +4,7 @@ const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
 
 const app = express();
-app.use(express.json({ limit: '30mb' })); // suporta fotos/vídeos em base64 (limite WhatsApp ~16MB → ~22MB em base64)
+app.use(express.json({ limit: '30mb' }));
 app.use(cors());
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
@@ -22,7 +22,7 @@ if (SUPABASE_URL && SUPABASE_KEY) {
 
 // ── Multi-tenant: identifica o usuário logado (dono) a partir do token do Supabase ──
 const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlmcnhneWhreWdxaGpyd3Brc3J5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1Mjk4MDcsImV4cCI6MjA5NDEwNTgwN30.6vjbaJdWk-u55xegMrHnv64pvlo0DByfPdtDSj2C7z4';
-const _tokenOwner = {}; // cache token -> { email, ts }
+const _tokenOwner = {};
 async function resolveOwner(req) {
   const a = req.headers.authorization || '';
   const tok = a.startsWith('Bearer ') ? a.slice(7) : null;
@@ -53,7 +53,7 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// Traduz o erro de entrega da Meta para um texto sempre preenchido (Meta + sistema)
+// Traduz o erro de entrega da Meta
 const META_ERROR_CODES = {
   131026: 'Mensagem não entregue: o número não tem WhatsApp ou não pode receber mensagens deste tipo.',
   131047: 'Fora da janela de 24h: só é possível enviar modelo (template) aprovado para este contato.',
@@ -77,10 +77,8 @@ function metaErrorText(er) {
   const code = er.code;
   let txt;
   if (code && META_ERROR_CODES[code]) {
-    // Temos tradução em português: usa só ela (não anexa o texto em inglês da Meta)
     txt = META_ERROR_CODES[code];
   } else {
-    // Sem tradução: usa o que a Meta mandou (em inglês mesmo) para não ficar sem motivo
     const parts = [];
     if (er.title) parts.push(er.title);
     if (er.error_data?.details) parts.push(er.error_data.details);
@@ -91,12 +89,11 @@ function metaErrorText(er) {
   return txt;
 }
 
-// Buffer de status que chegam ANTES da mensagem ser salva (corrige ✓ que não vira ✓✓)
-const _pendingStatuses = {}; // wamid -> { status, error_info, ts }
+// Buffer de status
+const _pendingStatuses = {};
 function _cachePendingStatus(wamid, upd) {
   if (!wamid) return;
   _pendingStatuses[wamid] = { ...upd, ts: Date.now() };
-  // limpa entradas com mais de 10 min
   const cutoff = Date.now() - 600000;
   for (const k in _pendingStatuses) if (_pendingStatuses[k].ts < cutoff) delete _pendingStatuses[k];
 }
@@ -113,8 +110,6 @@ async function applyPendingStatus(wamid) {
 app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
-
-    // Log para debug - mostra o que chegou
     console.log("📩 Webhook recebido:", JSON.stringify(body).substring(0, 300));
 
     if (body.object !== "whatsapp_business_account") {
@@ -128,7 +123,6 @@ app.post("/webhook", async (req, res) => {
     for (const change of changes) {
       const value = change.value;
 
-      // Handle status updates (read receipts)
       if (value?.statuses?.length && supabase) {
         for (const st of value.statuses) {
           const { id: wamid, status } = st;
@@ -138,7 +132,7 @@ app.post("/webhook", async (req, res) => {
               upd.error_info = metaErrorText(st.errors?.[0]);
               console.error('❌ Entrega falhou:', wamid, upd.error_info);
             }
-            _cachePendingStatus(wamid, upd); // guarda caso a msg ainda não esteja salva
+            _cachePendingStatus(wamid, upd);
             await supabase.from("messages").update(upd).eq("wamid", wamid);
           }
         }
@@ -153,9 +147,8 @@ app.post("/webhook", async (req, res) => {
       const timestamp = new Date(parseInt(message.timestamp) * 1000).toISOString();
       const phoneNumberId = value.metadata?.phone_number_id;
 
-      // Reação a uma mensagem (lead reagiu a uma mensagem minha)
       if (message.type === 'reaction') {
-        const emoji = message.reaction?.emoji || null; // vazio = reação removida
+        const emoji = message.reaction?.emoji || null;
         const targetWamid = message.reaction?.message_id;
         if (supabase && targetWamid) {
           await supabase.from('messages').update({ reaction: emoji, reaction_by: 'contact' }).eq('wamid', targetWamid);
@@ -166,7 +159,6 @@ app.post("/webhook", async (req, res) => {
 
       console.log(`📨 Mensagem de ${name} (${from}) via número ${phoneNumberId}`);
 
-      // Busca account_id + dono (owner) — roteia a mensagem para o usuário certo
       let accountId = null;
       let ownerEmail = null;
       if (supabase && phoneNumberId) {
@@ -182,7 +174,6 @@ app.post("/webhook", async (req, res) => {
         }
       }
 
-      // Extrai conteúdo da mensagem
       let content = "";
       let mediaId = null;
       let mediaMimeType = null;
@@ -214,10 +205,8 @@ app.post("/webhook", async (req, res) => {
         mediaMimeType = message.sticker?.mime_type || "image/webp";
         content = "[Figurinha]";
       } else if (type === "button") {
-        // Botão de resposta rápida de um template aprovado
         content = message.button?.text || "[Botão]";
       } else if (type === "interactive") {
-        // Botões/listas interativas
         const it = message.interactive;
         content = it?.button_reply?.title || it?.list_reply?.title || it?.nfm_reply?.name || "[Resposta interativa]";
       } else {
@@ -225,20 +214,18 @@ app.post("/webhook", async (req, res) => {
       }
 
       if (supabase) {
-        // Já existe? (para NÃO sobrescrever o nome que o usuário editou manualmente)
         const { data: existing } = await supabase
           .from("contacts").select("name, unread_count, first_unread_at").eq("phone", from).eq("owner", ownerEmail || ' ').maybeSingle();
 
-        // Salva contato com prévia da última mensagem
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
         const contactData = {
           phone: from, last_message_at: timestamp,
           last_message_preview: preview,
           last_message_direction: 'inbound',
         };
-        if (!existing) contactData.name = name; // só define o nome do WhatsApp na CRIAÇÃO; depois respeita o editado
+        if (!existing) contactData.name = name;
         if (accountId) contactData.account_id = accountId;
-        if (ownerEmail) contactData.owner = ownerEmail; // dono = dono da conta de WhatsApp
+        if (ownerEmail) contactData.owner = ownerEmail;
 
         const { error: contactErr } = await supabase
           .from("contacts")
@@ -250,13 +237,11 @@ app.post("/webhook", async (req, res) => {
           console.log("✅ Contato salvo:", from);
         }
 
-        // Incrementa contador de não lidas e marca hora da 1ª mensagem não lida
         const currentUnread = existing?.unread_count || 0;
         const unreadUpdate = { unread_count: currentUnread + 1 };
-        if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp; // só na 1ª mensagem não lida
+        if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp;
         await supabase.from("contacts").update(unreadUpdate).eq("phone", from).eq("owner", ownerEmail || ' ');
 
-        // Salva mensagem
         const messageData = {
           phone: from,
           content,
@@ -267,7 +252,7 @@ app.post("/webhook", async (req, res) => {
           media_mime_type: mediaMimeType,
           wamid: message.id || null,
         };
-        if (accountId) messageData.account_id = accountId; // só inclui se não for null
+        if (accountId) messageData.account_id = accountId;
         if (ownerEmail) messageData.owner = ownerEmail;
 
         const { error: msgErr } = await supabase.from("messages").insert(messageData);
@@ -277,11 +262,9 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.log("✅ Mensagem salva:", content.substring(0, 50));
         }
-        // Processa reply de bot ativo (texto OU clique em botão/lista)
         if (['text','button','interactive'].includes(type) && content) {
           try { await handleBotReply(from, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
         }
-        // Encaminha para N8N se configurado
         const n8nUrl = _settings['n8n_webhook_url'];
         if (n8nUrl) {
           try {
@@ -308,14 +291,13 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ── Embedded Signup: recebe código do Facebook e salva conta automaticamente ──
+// ── Embedded Signup ──
 app.post("/auth/whatsapp", async (req, res) => {
   const { code, redirect_uri } = req.body;
   if (!code) return res.status(400).json({ error: "Código não informado" });
   if (!APP_ID || !APP_SECRET) return res.status(500).json({ error: "APP_ID e APP_SECRET não configurados" });
 
   try {
-    // 1. Troca código pelo access token
     const tokenParams = { client_id: APP_ID, client_secret: APP_SECRET, code };
     if (redirect_uri) tokenParams.redirect_uri = redirect_uri;
 
@@ -325,8 +307,6 @@ app.post("/auth/whatsapp", async (req, res) => {
     const userToken = tokenRes.data.access_token;
     console.log("✅ Token obtido via Embedded Signup");
 
-    // 2. Usa debug_token para obter WABA IDs das permissões granulares
-    // (não requer business_management — funciona com whatsapp_business_management)
     const appToken = `${APP_ID}|${APP_SECRET}`;
     const debugRes = await axios.get("https://graph.facebook.com/v23.0/debug_token", {
       params: { input_token: userToken, access_token: appToken },
@@ -340,7 +320,6 @@ app.post("/auth/whatsapp", async (req, res) => {
     const savedAccounts = [];
 
     for (const wabaId of wabaIds) {
-      // 3. Busca nome do WABA
       let wabaName = wabaId;
       try {
         const wabaRes = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}`, {
@@ -351,7 +330,6 @@ app.post("/auth/whatsapp", async (req, res) => {
         console.log("⚠️ Não foi possível buscar nome do WABA:", e.response?.data?.error?.message);
       }
 
-      // 4. Busca números de telefone do WABA
       const phonesRes = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}/phone_numbers`, {
         params: { access_token: userToken, fields: "id,display_phone_number,verified_name" },
       });
@@ -359,7 +337,6 @@ app.post("/auth/whatsapp", async (req, res) => {
       console.log(`📞 ${phones.length} número(s) encontrado(s) no WABA ${wabaId}`);
 
       for (const phone of phones) {
-        // 5. Registra o número na Cloud API (ativa o número de "Pendente" para "Ativo")
         try {
           await axios.post(
             `https://graph.facebook.com/v23.0/${phone.id}/register`,
@@ -371,7 +348,6 @@ app.post("/auth/whatsapp", async (req, res) => {
           console.log("⚠️ Registro do número (pode já estar ativo):", e.response?.data?.error?.message);
         }
 
-        // 6. Inscreve WABA no webhook do app
         try {
           await axios.post(
             `https://graph.facebook.com/v23.0/${wabaId}/subscribed_apps`,
@@ -383,7 +359,6 @@ app.post("/auth/whatsapp", async (req, res) => {
           console.log("⚠️ Aviso webhook subscribe:", e.response?.data?.error?.message);
         }
 
-        // 6. Salva conta no Supabase
         const accountData = {
           name: phone.verified_name || wabaName,
           phone_number_id: phone.id,
@@ -429,7 +404,7 @@ app.get("/accounts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
     .from("accounts").select("id, name, phone_number_id, phone_display, type, evolution_instance, created_at")
-    .eq("owner", req.owner || ' ')
+    .eq("owner", req.owner || ' ')
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -450,7 +425,7 @@ app.post("/accounts", async (req, res) => {
 // ── Remover conta ──
 app.delete("/accounts/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { error } = await supabase.from("accounts").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
+  const { error } = await supabase.from("accounts").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -462,7 +437,6 @@ app.post("/send", async (req, res) => {
 
   let phoneNumberId, token, evolutionInstance = null, accountType = 'cloudapi';
 
-  // 1. Tenta buscar conta do banco de dados pelo account_id
   if (supabase && account_id) {
     const { data: account, error: accErr } = await supabase
       .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).single();
@@ -475,7 +449,6 @@ app.post("/send", async (req, res) => {
     }
   }
 
-  // 2. Fallback: usa variáveis de ambiente (PHONE_NUMBER_ID + WHATSAPP_TOKEN)
   if (!evolutionInstance && (!phoneNumberId || !token)) {
     phoneNumberId = process.env.PHONE_NUMBER_ID;
     token = process.env.WHATSAPP_TOKEN;
@@ -484,11 +457,10 @@ app.post("/send", async (req, res) => {
     }
   }
 
-  // 3. Envio via Evolution API (QR Code)
   if (accountType === 'evolution' && evolutionInstance) {
     try {
       const evoRes = await sendViaEvolution(evolutionInstance, to, message);
-      const wamid = evoRes?.key?.id || null; // mesmo id que volta no webhook → permite dedup
+      const wamid = evoRes?.key?.id || null;
       if (supabase) {
         const safeAccountId = account_id || null;
         const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
@@ -547,7 +519,7 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// ── Reagir a uma mensagem com emoji (passe emoji vazio para remover) ──
+// ── Reagir a uma mensagem ──
 app.post("/react", async (req, res) => {
   const { to, wamid, emoji, account_id } = req.body;
   if (!to || !wamid) return res.status(400).json({ error: "Informe 'to' e 'wamid'" });
@@ -567,7 +539,7 @@ app.post("/react", async (req, res) => {
   }
 });
 
-// ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
+// ── Enviar mídia ──
 app.post("/send-media", async (req, res) => {
   const { to, account_id, fileBase64, fileName, mimeType } = req.body;
   if (!to || !fileBase64 || !fileName || !mimeType)
@@ -587,7 +559,6 @@ app.post("/send-media", async (req, res) => {
     return res.status(400).json({ error: "Nenhuma conta configurada." });
 
   try {
-    // 1. Faz upload da mídia para a Meta
     const FormData = require("form-data");
     const form = new FormData();
     form.append("messaging_product", "whatsapp");
@@ -605,7 +576,6 @@ app.post("/send-media", async (req, res) => {
     const mediaId = uploadRes.data.id;
     console.log("✅ Mídia enviada para Meta, id:", mediaId);
 
-    // 2. Determina o tipo de mensagem WhatsApp
     let msgType = "document";
     if (mimeType.startsWith("image/")) msgType = "image";
     else if (mimeType.startsWith("video/")) msgType = "video";
@@ -614,14 +584,12 @@ app.post("/send-media", async (req, res) => {
     const mediaObj = { id: mediaId };
     if (msgType === "document") mediaObj.filename = fileName;
 
-    // 3. Envia a mensagem de mídia
     const mediaResp = await axios.post(
       `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
       { messaging_product: "whatsapp", to, type: msgType, [msgType]: mediaObj },
       { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
     );
 
-    // 4. Salva no Supabase
     if (supabase) {
       const safeAccountId = account_id || null;
       const mediaWamid = mediaResp.data?.messages?.[0]?.id || null;
@@ -637,7 +605,7 @@ app.post("/send-media", async (req, res) => {
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
         status: 'sent', wamid: mediaWamid, owner: req.owner || null,
-        media_id: mediaId, media_mime_type: mimeType, // permite exibir a mídia no CRM
+        media_id: mediaId, media_mime_type: mimeType,
       });
       await applyPendingStatus(mediaWamid);
     }
@@ -648,29 +616,14 @@ app.post("/send-media", async (req, res) => {
   }
 });
 
-// ── Proxy de mídia recebida (imagem, áudio, vídeo, documento) ──
-// Faz STREAMING direto da Meta repassando o Range — método correto para vídeo
-// (sem baixar o arquivo inteiro na memória, evita travar a reprodução).
-const mediaUrlCache = new Map(); // mediaId_token -> { url, ts }
+// ── Proxy de mídia com STREAMING (sem cache em memória) ──
+const mediaUrlCache = new Map(); // guarda só a URL da mídia por 10 min
 
-async function getMediaUrl(mediaId, token, cacheKey, force) {
-  const hit = mediaUrlCache.get(cacheKey);
-  if (!force && hit && (Date.now() - hit.ts) < 3 * 60 * 1000) return hit.url;
-  const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
-    headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-  });
-  const url = metaRes.data.url;
-  if (!url) throw new Error("URL de mídia não encontrada");
-  mediaUrlCache.set(cacheKey, { url, ts: Date.now() });
-  return url;
-}
-
-const _mediaBufCache = {}; // cacheKey -> { buf, ctype, ts } — arquivo inteiro em memória (cache curto)
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
   const { mediaId } = req.params;
 
-  // Busca token da conta
+  // 1. Buscar token da conta
   let token = process.env.WHATSAPP_TOKEN;
   if (supabase && account_id) {
     const { data: account } = await supabase
@@ -679,73 +632,70 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   }
   if (!token) return res.status(400).json({ error: "Token não encontrado" });
 
-  const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
-
   try {
-    // Baixa o arquivo INTEIRO uma vez (com cache curto) e serve os ranges a partir do buffer.
-    let entry = _mediaBufCache[cacheKey];
-    if (!entry || Date.now() - entry.ts > 300000) {
-      const fetchFull = async (force) => {
-        const url = await getMediaUrl(mediaId, token, cacheKey, force);
-        return axios.get(url, {
-          headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
-          responseType: "arraybuffer", timeout: 60000,
-          validateStatus: s => s >= 200 && s < 400,
-        });
-      };
-      let resp;
-      try { resp = await fetchFull(false); } catch (e) { resp = await fetchFull(true); } // URL pode ter expirado
-      entry = { buf: Buffer.from(resp.data), ctype: resp.headers["content-type"], ts: Date.now() };
-      _mediaBufCache[cacheKey] = entry;
-      // Limita o cache em memória (remove os mais antigos)
-      const keys = Object.keys(_mediaBufCache);
-      if (keys.length > 12) { keys.sort((a,b)=>_mediaBufCache[a].ts-_mediaBufCache[b].ts); delete _mediaBufCache[keys[0]]; }
+    // 2. Obter URL da mídia (com cache de 10 minutos)
+    const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
+    let url = mediaUrlCache.get(cacheKey)?.url;
+    if (!url) {
+      const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+        headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+      });
+      url = metaRes.data.url;
+      if (!url) throw new Error("URL de mídia não encontrada");
+      mediaUrlCache.set(cacheKey, { url, ts: Date.now() });
     }
 
-    const buf = entry.buf;
-    const total = buf.length;
-    const ctype = req.query.mime || entry.ctype || "application/octet-stream";
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Content-Type", ctype);
-
-    if (download === "1") {
-      const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
-      res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-      res.setHeader("Content-Length", total);
-      return res.status(200).end(buf);
-    }
-    res.setHeader("Cache-Control", "public, max-age=600");
-
-    // Pedido com Range (áudio/vídeo): responde 206 com o pedaço certo
+    // 3. Fazer a requisição para a Meta, repassando o Range se o cliente pedir
+    const headers = { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" };
     const range = req.headers.range;
-    if (range) {
-      const m = /bytes=(\d*)-(\d*)/.exec(range);
-      let start = m && m[1] !== "" ? parseInt(m[1], 10) : 0;
-      let end   = m && m[2] !== "" ? parseInt(m[2], 10) : total - 1;
-      if (isNaN(start)) start = 0;
-      if (isNaN(end) || end >= total) end = total - 1;
-      if (start > end || start >= total) {
-        res.setHeader("Content-Range", `bytes */${total}`);
-        return res.status(416).end();
-      }
-      res.status(206);
-      res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
-      res.setHeader("Content-Length", end - start + 1);
-      return res.end(buf.subarray(start, end + 1));
+    if (range) headers.Range = range;
+
+    const response = await axios({
+      method: 'get',
+      url,
+      headers,
+      responseType: 'stream',
+      timeout: 60000,
+      validateStatus: s => s >= 200 && s < 400,
+    });
+
+    // 4. Configurar cabeçalhos de resposta
+    const contentType = response.headers['content-type'] || req.query.mime || 'application/octet-stream';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=600');
+
+    if (download === '1') {
+      const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
     }
 
-    // Sem Range: arquivo inteiro
-    res.status(200);
-    res.setHeader("Content-Length", total);
-    return res.end(buf);
+    // 5. Repassar o status e headers de Range, se a Meta respondeu com 206
+    if (response.status === 206) {
+      res.status(206);
+      res.setHeader('Content-Range', response.headers['content-range']);
+      res.setHeader('Content-Length', response.headers['content-length']);
+    } else {
+      res.status(200);
+      res.setHeader('Content-Length', response.headers['content-length'] || '');
+    }
+
+    // 6. Enviar o stream diretamente para o cliente
+    response.data.pipe(res);
+
+    // 7. Tratar erros no pipe
+    response.data.on('error', (err) => {
+      console.error('Erro no stream da mídia:', err.message);
+      if (!res.headersSent) res.status(500).json({ error: 'Erro no download da mídia' });
+    });
+
   } catch (err) {
-    console.error("❌ Erro ao baixar mídia:", err.response?.status || err.message);
+    console.error('❌ Erro ao baixar mídia:', err.response?.status || err.message);
     if (!res.headersSent) res.status(500).json({ error: "Falha ao baixar mídia" });
   }
 });
 
-// ── Lista todas as tags existentes (para sugestões e filtro) ──
+// ── Lista todas as tags ──
 app.get("/tags", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase.from("contacts").select("tags").eq("owner", req.owner || ' ');
@@ -761,16 +711,14 @@ app.get("/search", async (req, res) => {
   const raw = (req.query.q || "").trim();
   if (!raw) return res.json([]);
   const { account_id } = req.query;
-  const term = raw.replace(/[,()]/g, " ").trim(); // evita quebrar a sintaxe do filtro
+  const term = raw.replace(/[,()]/g, " ").trim();
   const like = `%${term}%`;
   try {
-    // 1. Telefones que têm alguma mensagem contendo o termo
     let mq = supabase.from("messages").select("phone").ilike("content", like).eq("owner", req.owner || ' ').limit(500);
     if (account_id) mq = mq.eq("account_id", account_id);
     const { data: msgRows } = await mq;
     const phones = [...new Set((msgRows || []).map(m => m.phone).filter(Boolean))];
 
-    // 2. Contatos por nome/telefone OU entre os telefones encontrados
     let orCond = `name.ilike.${like},phone.ilike.${like}`;
     if (phones.length) orCond += `,phone.in.(${phones.join(",")})`;
     let cq = supabase.from("contacts")
@@ -799,7 +747,6 @@ app.get("/tasks", async (req, res) => {
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
   const tasks = data || [];
-  // anexa o nome do lead (para a aba global de tarefas)
   const phones = [...new Set(tasks.map(t => t.phone).filter(Boolean))];
   if (phones.length) {
     const { data: cts } = await supabase.from("contacts").select("phone,name").in("phone", phones).eq("owner", req.owner || ' ');
@@ -851,7 +798,6 @@ app.put("/contacts/:phone/tags", async (req, res) => {
   res.json({ success: true });
 });
 
-// ── Atualiza o nome do contato/lead ──
 app.put("/contacts/:phone/name", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const name = (req.body.name || "").trim();
@@ -861,7 +807,6 @@ app.put("/contacts/:phone/name", async (req, res) => {
   res.json({ success: true });
 });
 
-// ── Anotações por contato ──
 app.get("/contacts/:phone/notes", async (req, res) => {
   if (!supabase) return res.json({ notes: "" });
   const { data, error } = await supabase
@@ -903,7 +848,7 @@ app.post("/contacts/import", async (req, res) => {
   const toInsert = contacts
     .map(c => {
       const obj = { phone: String(c.phone || '').replace(/\D/g, ''), name: c.name || 'Desconhecido', account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() };
-      if (stage_id) obj.stage_id = stage_id; // só grava etapa quando escolhida (não apaga a de quem já existe)
+      if (stage_id) obj.stage_id = stage_id;
       return obj;
     })
     .filter(c => c.phone.length >= 8);
@@ -914,12 +859,7 @@ app.post("/contacts/import", async (req, res) => {
   res.json({ success: true, count: toInsert.length });
 });
 
-// ── Importar lead via n8n / planilha (mapeia ID da etapa → stage_id) ──
-// Aceita 1 lead OU um array de leads. Campos flexíveis:
-//   name | title | "Lead Titulo"   →  nome
-//   phone | celular | "Celular"     →  telefone
-//   id | "ID" | stage_external_id   →  ID da etapa (external_id de pipeline_stages)
-//   account_id (opcional)           →  vincula a uma conta WhatsApp
+// ── Importar lead via n8n ──
 app.post("/import/lead", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const items = Array.isArray(req.body) ? req.body
@@ -930,7 +870,6 @@ app.post("/import/lead", async (req, res) => {
   const errors = [];
 
   for (const it of (items || [])) {
-    // remove um "=" no início (marcador de expressão do n8n que às vezes vaza como texto)
     const name  = (String(it.name || it.title || it["Lead Titulo"] || "").replace(/^=+\s*/, "").trim()) || "Lead";
     const phone = String(it.phone || it.celular || it["Celular"] || "").replace(/\D/g, "");
     const extId = String(it.id || it["ID"] || it.stage_external_id || "").replace(/^=+\s*/, "").trim();
@@ -949,7 +888,6 @@ app.post("/import/lead", async (req, res) => {
     const row = { phone, name, owner: n8nOwner };
     if (account_id) row.account_id = account_id;
     if (stage_id) row.stage_id = stage_id;
-    // Não define last_message_* → o lead aparece só no Pipeline até iniciar conversa
     const { error: e } = await supabase.from("contacts").upsert(row, { onConflict: "owner,phone" });
     if (e) errors.push({ phone, error: e.message }); else imported++;
   }
@@ -959,8 +897,6 @@ app.post("/import/lead", async (req, res) => {
 });
 
 // ── Alterar a ETAPA de um lead já existente (via n8n) ──
-// Aceita 1 lead OU array. Identifica o lead pelo telefone e a etapa por:
-//   stage | etapa | "Etapa" (nome, ex.: "S3")  |  id | "ID" (external_id)  |  stage_id (UUID)
 app.post("/update/lead", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const items = Array.isArray(req.body) ? req.body
@@ -1000,7 +936,6 @@ app.post("/update/lead", async (req, res) => {
     if (error) { errors.push({ phone, error: error.message }); continue; }
     if (!data || !data.length) { errors.push({ phone, error: "lead não encontrado no CRM" }); continue; }
     updated++;
-    // Dispara bots com gatilho "entrou na etapa" — só quando a etapa realmente mudou
     if (prev?.stage_id !== stage_id) { try { await fireStageBots(phone, stage_id, n8nOwner); } catch(e) { console.error('fireStageBots (n8n):', e.message); } }
   }
 
@@ -1008,9 +943,7 @@ app.post("/update/lead", async (req, res) => {
   res.json({ success: true, updated, errors });
 });
 
-// ── Listar leads de uma etapa (para o n8n buscar e depois mover) ──
-// GET /leads?id=98177799   ou   ?stage=SIAPE3   ou   ?stage_id=<uuid>
-// Retorna um array de { phone, name, stage_id } — o n8n itera direto.
+// ── Listar leads de uma etapa ──
 app.get("/leads", async (req, res) => {
   if (!supabase) return res.json([]);
   const clean = v => String(v || "").replace(/^=+\s*/, "").trim();
@@ -1035,7 +968,6 @@ app.get("/leads", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
-
 
 // ── Deletar mensagem individual ──
 app.delete("/messages/id/:id", async (req, res) => {
@@ -1098,8 +1030,6 @@ app.post("/templates", async (req, res) => {
 });
 
 // ── Deletar template ──
-// A Meta exige excluir por NOME na borda do WABA (não pelo ID do nó).
-// O parâmetro :template_id agora recebe o NOME do template.
 app.delete("/templates/:template_id", async (req, res) => {
   const { account_id } = req.query;
   if (!supabase || !account_id) return res.status(400).json({ error: "account_id obrigatório" });
@@ -1111,14 +1041,13 @@ app.delete("/templates/:template_id", async (req, res) => {
   const hsm_id = req.query.hsm_id;
   try {
     const params = { name, access_token: account.token };
-    if (hsm_id) params.hsm_id = hsm_id; // exclui o template específico (recomendado pela Meta)
+    if (hsm_id) params.hsm_id = hsm_id;
     await axios.delete(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, { params });
     console.log("🗑️ Template excluído:", name);
     res.json({ success: true });
   } catch (err) {
     const metaErr = err.response?.data?.error;
     console.error("❌ Erro ao deletar template:", metaErr || err.message);
-    // Devolve a mensagem detalhada da Meta (código/subcódigo) para diagnóstico
     const msg = metaErr
       ? `${metaErr.message || 'erro'}${metaErr.code ? ' (código ' + metaErr.code + (metaErr.error_subcode ? '/' + metaErr.error_subcode : '') + ')' : ''}`
       : (err.message || "Erro ao deletar template");
@@ -1173,8 +1102,6 @@ app.post("/send-template", async (req, res) => {
 });
 
 // ── Pipeline / Kanban ──
-
-// Listar estágios
 app.get("/pipeline/stages", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
@@ -1183,7 +1110,6 @@ app.get("/pipeline/stages", async (req, res) => {
   res.json(data || []);
 });
 
-// Criar estágio
 app.post("/pipeline/stages", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { name, position } = req.body;
@@ -1194,7 +1120,6 @@ app.post("/pipeline/stages", async (req, res) => {
   res.json(data);
 });
 
-// Renomear / reordenar estágio
 app.put("/pipeline/stages/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { name, position } = req.body;
@@ -1207,7 +1132,6 @@ app.put("/pipeline/stages/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// Excluir estágio (move leads para sem-status)
 app.delete("/pipeline/stages/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   await supabase.from("contacts").update({ stage_id: null }).eq("stage_id", req.params.id).eq("owner", req.owner || ' ');
@@ -1216,7 +1140,6 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-// Listar contatos (com stage_id, unread_count e prévia)
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { account_id, with_messages } = req.query;
@@ -1224,16 +1147,13 @@ app.get("/contacts", async (req, res) => {
     .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
     .eq("owner", req.owner || ' ')
     .order("last_message_at", { ascending: false });
-  if (account_id) query = query.eq("account_id", account_id); // filtra pela conta quando informada
-  // Lista de CONVERSAS: só contatos que já tiveram mensagem real (preview só é preenchido por mensagem,
-  // nunca por importação — diferente de last_message_direction, que tem padrão 'inbound' no banco)
+  if (account_id) query = query.eq("account_id", account_id);
   if (with_messages) query = query.not("last_message_preview", "is", null);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
 
-// Mover lead para estágio
 app.put("/contacts/:phone/stage", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { stage_id } = req.body;
@@ -1241,24 +1161,20 @@ app.put("/contacts/:phone/stage", async (req, res) => {
   const { error } = await supabase
     .from("contacts").update({ stage_id: stage_id || null }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
-  // Dispara bots com gatilho de etapa — só quando a etapa realmente mudou
   if (stage_id && old?.stage_id !== stage_id) await fireStageBots(req.params.phone, stage_id, req.owner);
   res.json({ success: true });
 });
 
-// ── Bulk actions ──
 app.put("/contacts/bulk-stage", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phones, stage_id } = req.body;
   if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
-  // Guarda etapas anteriores para disparar bot só em quem mudou de verdade
   const { data: prevRows } = await supabase.from("contacts").select("phone, stage_id").in("phone", phones).eq("owner", req.owner || ' ');
   const prevMap = {}; for (const r of prevRows || []) prevMap[r.phone] = r.stage_id;
   const { error } = await supabase.from("contacts")
     .update({ stage_id: stage_id || null })
     .in("phone", phones).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
-  // Dispara bots com gatilho "entrou na etapa" para cada lead que realmente mudou
   if (stage_id) { for (const ph of phones) { if (prevMap[ph] !== stage_id) { try { await fireStageBots(ph, stage_id, req.owner); } catch(e) { console.error('fireStageBots (bulk):', e.message); } } } }
   res.json({ success: true });
 });
@@ -1277,7 +1193,6 @@ app.put("/contacts/bulk-tags", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phones, tags } = req.body;
   if (!Array.isArray(phones) || !Array.isArray(tags)) return res.status(400).json({ error: "phones e tags obrigatórios" });
-  // For each phone, merge new tags with existing
   for (const phone of phones) {
     const { data: contact } = await supabase.from("contacts").select("tags").eq("phone", phone).eq("owner", req.owner || ' ').maybeSingle();
     const merged = Array.from(new Set([...(contact?.tags || []), ...tags]));
@@ -1286,7 +1201,6 @@ app.put("/contacts/bulk-tags", async (req, res) => {
   res.json({ success: true });
 });
 
-// ── Marcar conversa como lida ──
 app.put("/contacts/:phone/read", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { error } = await supabase
@@ -1299,7 +1213,6 @@ app.put("/contacts/:phone/read", async (req, res) => {
 // SISTEMA DE BOTS — motor de execução
 // ═══════════════════════════════════════
 
-// Substitui variáveis aceitando vários formatos: {nome} (nome) [nome] {{nome}}, maiúsc/minúsc
 function applyVars(str, name, phone, notes) {
   if (!str) return str;
   return String(str)
@@ -1324,7 +1237,7 @@ async function sendBotMsg(phone, accountId, text, owner) {
     if (supabase) {
       const ts = new Date().toISOString();
       await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid, owner:owner||null });
-      await applyPendingStatus(wamid); // aplica status que chegou antes do insert
+      await applyPendingStatus(wamid);
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
     }
@@ -1340,7 +1253,6 @@ async function botGetAcct(accountId) {
   return { phone_number_id: process.env.PHONE_NUMBER_ID, token: process.env.WHATSAPP_TOKEN, waba_id: process.env.WABA_ID };
 }
 
-// Busca o corpo (BODY) de um modelo aprovado na Meta — com cache em memória
 const _tmplBodyCache = {};
 async function getTemplateBodyText(token, wabaId, name, lang) {
   if (!token || !wabaId || !name) return null;
@@ -1359,18 +1271,15 @@ async function getTemplateBodyText(token, wabaId, name, lang) {
   } catch(e) { _tmplBodyCache[key] = null; return null; }
 }
 
-// Substitui {{1}}, {{2}}… pelos valores das variáveis (posicional)
 function renderTemplateBody(bodyText, vars) {
   let txt = bodyText || '';
   (vars || []).forEach((val, i) => { txt = txt.split('{{' + (i + 1) + '}}').join(val); });
   return txt;
 }
 
-// Envia um MODELO aprovado pelo bot (com variáveis no corpo)
 async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   const acct = await botGetAcct(accountId);
   if (!acct.phone_number_id || !acct.token) return null;
-  // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
   let bodyText = null;
   try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR'); } catch(_) {}
   const provided = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone, notes));
@@ -1378,7 +1287,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   const vars = [];
   for (let i = 0; i < needed; i++) {
     const p = provided[i];
-    vars.push(p && p.trim() ? p : (i === 0 ? (name || phone) : ' ')); // preenche o que faltar (1ª = nome)
+    vars.push(p && p.trim() ? p : (i === 0 ? (name || phone) : ' '));
   }
   const tmpl = { name: cfg.template_name, language: { code: cfg.language || 'pt_BR' } };
   if (vars.length) tmpl.components = [{ type: 'body', parameters: vars.map(t => ({ type: 'text', text: t })) }];
@@ -1388,7 +1297,6 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
     if (supabase) {
       const ts = new Date().toISOString();
-      // Monta o texto real do modelo (troca {{n}} pelas variáveis)
       let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
       const tWamid = r.data?.messages?.[0]?.id || null;
@@ -1400,13 +1308,12 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   } catch(e) { console.error('❌ Bot template:', e.response?.data || e.message); return null; }
 }
 
-// Verifica horário comercial (UTC-3) e calcula a próxima abertura
 function businessHoursState(nowMs, cfg) {
-  const days = (cfg.days && cfg.days.length) ? cfg.days.map(Number) : [1,2,3,4,5]; // 0=Dom..6=Sáb
+  const days = (cfg.days && cfg.days.length) ? cfg.days.map(Number) : [1,2,3,4,5];
   const [sh, sm] = String(cfg.start || '08:00').split(':').map(Number);
   const [eh, em] = String(cfg.end   || '18:00').split(':').map(Number);
   const startMin = sh*60 + sm, endMin = eh*60 + em;
-  const brt = new Date(nowMs - 3*3600000); // relógio de Brasília nos campos UTC
+  const brt = new Date(nowMs - 3*3600000);
   const dow = brt.getUTCDay();
   const minNow = brt.getUTCHours()*60 + brt.getUTCMinutes();
   const isOpen = days.includes(dow) && minNow >= startMin && minNow < endMin;
@@ -1414,9 +1321,9 @@ function businessHoursState(nowMs, cfg) {
   for (let off = 0; off <= 7; off++) {
     const d = new Date(Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate() + off));
     if (!days.includes(d.getUTCDay())) continue;
-    if (off === 0 && minNow >= startMin) continue; // hoje já passou da abertura
+    if (off === 0 && minNow >= startMin) continue;
     const openBrtMs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), sh, sm);
-    return { open: false, nextOpenMs: openBrtMs + 3*3600000 }; // volta para UTC real
+    return { open: false, nextOpenMs: openBrtMs + 3*3600000 };
   }
   return { open: false, nextOpenMs: nowMs + 3600000 };
 }
@@ -1438,9 +1345,9 @@ async function stopRun(runId, status='completed') {
 }
 
 async function processNode(run, depth=0) {
-  if (!supabase || depth > 30) return; // prevent infinite loops
+  if (!supabase || depth > 30) return;
   const { id:runId, contact_phone:phone, account_id:acctId, current_node_id:nodeId, owner:botOwner } = run;
-  const OW = botOwner || ' '; // sentinela p/ escopo por dono
+  const OW = botOwner || ' ';
   const { data:node } = await supabase.from('bot_nodes').select('*').eq('id', nodeId).maybeSingle();
   if (!node) { await stopRun(runId,'stopped'); return; }
   const cfg = node.config || {};
@@ -1459,9 +1366,8 @@ async function processNode(run, depth=0) {
       sendOk = await sendBotTemplate(phone, acctId, cfg, name, notes, botOwner);
     } else {
       const text = applyVars(cfg.text || '', name, phone, notes);
-      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner) : true; // sem texto = nada a enviar (não é falha)
+      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner) : true;
     }
-    // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
     const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
     const okNxt   = medges?.find(e=>!e.label||e.label===''||e.label==='default')?.to_node_id || null;
     const failNxt = medges?.find(e=>(e.label||'').toLowerCase()==='__failed__')?.to_node_id || null;
@@ -1472,7 +1378,6 @@ async function processNode(run, depth=0) {
     } else if (!sendOk) {
       await stopRun(runId,'failed');
     } else if (hasButtons) {
-      // Modelo com botões: aguarda o lead clicar num botão (ramifica conforme o botão)
       let pauseUntil = null;
       if (cfg.timeout_hours && cfg.timeout_hours > 0) pauseUntil = new Date(Date.now() + cfg.timeout_hours*3600000).toISOString();
       await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
@@ -1553,7 +1458,6 @@ async function processNode(run, depth=0) {
       if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
       else await stopRun(runId,'completed');
     } else if (cfg.wait !== false) {
-      // Fora do expediente: aguarda até reabrir (permanece neste nó; o timer re-avalia)
       await supabase.from('bot_runs').update({ status:'paused', pause_until:new Date(st.nextOpenMs).toISOString(), updated_at:new Date().toISOString() }).eq('id',runId);
     } else {
       const nxt = await getNextNodeId(nodeId, '__closed__');
@@ -1579,7 +1483,7 @@ async function processNode(run, depth=0) {
 async function handleBotReply(phone, text, owner) {
   if (!supabase) return false;
   let rq = supabase.from('bot_runs').select('*').eq('contact_phone',phone).eq('status','waiting_reply').order('created_at',{ascending:false}).limit(1);
-  if (owner) rq = rq.eq('owner', owner); // só a run do dono certo (telefone pode repetir entre donos)
+  if (owner) rq = rq.eq('owner', owner);
   const { data:run } = await rq.maybeSingle();
   if (!run) return false;
   const { data:edges } = await supabase.from('bot_edges').select('*').eq('from_node_id', run.current_node_id);
@@ -1599,12 +1503,11 @@ async function handleBotReply(phone, text, owner) {
   return true;
 }
 
-// Dispara todos os bots com gatilho "entrou na etapa" para um lead (do dono certo)
 async function fireStageBots(phone, stageId, owner) {
   if (!supabase || !stageId || !phone) return;
   try {
     let bq = supabase.from('bots').select('*').eq('trigger_type','stage_enter').eq('trigger_stage_id',stageId).eq('active',true);
-    if (owner) bq = bq.eq('owner', owner); // só os bots do dono do lead
+    if (owner) bq = bq.eq('owner', owner);
     const { data: bots } = await bq;
     if (!bots || !bots.length) return;
     let cq = supabase.from('contacts').select('account_id').eq('phone',phone);
@@ -1636,13 +1539,11 @@ async function startBot(botId, phone, accountId, owner) {
   return run;
 }
 
-// Timer: resume paused/timed-out runs every 5s
 setInterval(async () => {
   if (!supabase) return;
   const now = new Date().toISOString();
   const { data:paused } = await supabase.from('bot_runs').select('*').in('status',['paused','waiting_reply']).lte('pause_until',now).not('pause_until','is',null);
   for (const run of paused||[]) {
-    // Se o nó atual é "Horário comercial", re-avalia o próprio nó (não avança)
     const { data:curNode } = await supabase.from('bot_nodes').select('type').eq('id', run.current_node_id).maybeSingle();
     if (curNode?.type === 'business_hours') {
       await supabase.from('bot_runs').update({ status:'running', pause_until:null, updated_at:now }).eq('id',run.id);
@@ -1690,7 +1591,6 @@ app.put('/bots/:id', async (req,res) => {
 app.delete('/bots/:id', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const id = req.params.id;
-  // confirma que o bot é do dono antes de apagar os filhos
   const { data: own } = await supabase.from('bots').select('id').eq('id',id).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
   await supabase.from('bot_runs').delete().eq('bot_id',id);
@@ -1703,7 +1603,6 @@ app.delete('/bots/:id', async (req,res) => {
 app.get('/bots/:id/flow', async (req,res) => {
   if (!supabase) return res.json({nodes:[],edges:[]});
   const id = req.params.id;
-  // só devolve o fluxo se o bot for do dono
   const { data: own } = await supabase.from('bots').select('id').eq('id',id).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.json({nodes:[],edges:[]});
   const [nr,er] = await Promise.all([
@@ -1726,13 +1625,11 @@ app.put('/bots/:id/flow', async (req,res) => {
     res.json({success:true});
   } catch(err) { res.status(500).json({error:err.message}); }
 });
-// Duplicar um bot (copia config, nós e arestas com novos ids)
 app.post('/bots/:id/duplicate', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const srcId = req.params.id;
   const { data: bot, error: be } = await supabase.from('bots').select('*').eq('id', srcId).eq('owner', req.owner || ' ').single();
   if (be || !bot) return res.status(404).json({error:'Bot não encontrado'});
-  // novo bot: começa MANUAL e INATIVO para não disparar sem querer
   const { data: newBot, error: ne } = await supabase.from('bots').insert({
     name: (bot.name || 'Bot') + ' (cópia)', trigger_type: 'manual', trigger_stage_id: null,
     account_id: bot.account_id || null, active: false, owner: req.owner || null
@@ -1762,7 +1659,6 @@ app.post('/bots/:id/duplicate', async (req,res) => {
 app.post('/bots/:id/start', async (req,res) => {
   const { phone,account_id } = req.body;
   if (!phone) return res.status(400).json({error:'phone obrigatório'});
-  // confirma que o bot é do dono
   const { data: own } = await supabase.from('bots').select('id').eq('id',req.params.id).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
   const run = await startBot(req.params.id, phone, account_id, req.owner);
@@ -1784,7 +1680,6 @@ app.get('/bot-runs/contact/:phone', async (req,res) => {
 // SETTINGS + INTEGRAÇÃO N8N
 // ═══════════════════════════════════════
 
-// Cache de settings (evita consulta ao DB em cada mensagem)
 let _settings = {};
 async function loadSettings() {
   if (!supabase) return;
@@ -1811,7 +1706,6 @@ app.put('/settings/:key', async (req, res) => {
   res.json({ success: true });
 });
 
-// Teste de conexão N8N — envia evento de teste para o webhook configurado
 app.post('/n8n/test', async (req, res) => {
   const n8nUrl = _settings['n8n_webhook_url'];
   if (!n8nUrl) return res.status(400).json({ error: 'URL do N8N não configurada' });
@@ -1843,12 +1737,9 @@ const BACKEND_URL   = process.env.BACKEND_PUBLIC_URL || 'https://meucrm-backend-
 
 const evoHdr = () => ({ apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' });
 
-// Cache de QR Code por instância — preenchido pelo webhook QRCODE_UPDATED (QR assíncrono)
 const qrCache = {};
 
-// Envia mensagem via Evolution API
 async function sendViaEvolution(instanceName, to, text) {
-  // Evolution API v2: body usa "text" direto
   const r = await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
     number: to,
     text,
@@ -1857,11 +1748,9 @@ async function sendViaEvolution(instanceName, to, text) {
   return r.data;
 }
 
-// POST /evolution/connect — limpa instâncias antigas, cria nova e retorna QR
 app.post('/evolution/connect', async (req, res) => {
   const instanceName = `meucrm_${Date.now()}`;
   try {
-    // 1. Limpa instâncias antigas desconectadas (evita acúmulo)
     try {
       const { data: list } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
       for (const inst of list || []) {
@@ -1874,7 +1763,6 @@ app.post('/evolution/connect', async (req, res) => {
       }
     } catch(cleanErr) { console.warn('Cleanup warn:', cleanErr.message); }
 
-    // 2. Cria nova instância
     const webhookUrl = `${BACKEND_URL}/evolution-webhook`;
     const { data } = await axios.post(`${EVOLUTION_URL}/instance/create`, {
       instanceName,
@@ -1890,15 +1778,12 @@ app.post('/evolution/connect', async (req, res) => {
 
     console.log('Evolution create raw keys:', Object.keys(data || {}));
 
-    // QR pode vir imediatamente na resposta de criação
     let qr = data?.qrcode?.base64 || data?.base64 || null;
 
-    // Se não veio, faz APENAS algumas tentativas rápidas (não trava a requisição).
-    // O QR também chega de forma assíncrona via webhook (qrCache) e pelo polling do frontend.
     if (!qr) {
       console.log(`⏳ QR não veio na criação, tentando rápido via /instance/connect...`);
       for (let i = 0; i < 3; i++) {
-        await new Promise(r => setTimeout(r, 2000)); // 3 tentativas x 2s = 6s no máximo
+        await new Promise(r => setTimeout(r, 2000));
         try {
           const { data: qrData } = await axios.get(
             `${EVOLUTION_URL}/instance/connect/${instanceName}`,
@@ -1913,7 +1798,6 @@ app.post('/evolution/connect', async (req, res) => {
       }
     }
 
-    // Retorna já — o frontend continua buscando o QR em /evolution/qr (cache do webhook + connect)
     console.log(`Instância criada: ${instanceName}, QR: ${qr ? 'SIM' : 'NAO (frontend faz polling)'}`);
     res.json({ success: true, instance: instanceName, qr });
   } catch(e) {
@@ -1922,15 +1806,11 @@ app.post('/evolution/connect', async (req, res) => {
   }
 });
 
-// GET /evolution/qr/:instance — QR code (Evolution API v2)
 app.get('/evolution/qr/:instance', async (req, res) => {
-  // 0. Se o webhook já entregou o QR, serve do cache (mais rápido e confiável)
   if (qrCache[req.params.instance]) {
     return res.json({ qr: qrCache[req.params.instance], code: null, pairingCode: null, raw: { cached: true } });
   }
   try {
-    // Evolution API v2: o QR vem de GET /instance/connect/:instance
-    // Resposta: { pairingCode, code, base64, count }
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/connect/${req.params.instance}`, {
       headers: evoHdr(), timeout: 10000
     });
@@ -1940,7 +1820,6 @@ app.get('/evolution/qr/:instance', async (req, res) => {
     res.json({ qr, code, pairingCode: data?.pairingCode || null, raw: data });
   } catch(e) {
     console.error('Evolution QR error:', e.response?.data || e.message);
-    // Fallback: endpoint legado /instance/qrcode
     try {
       const { data: d2 } = await axios.get(`${EVOLUTION_URL}/instance/qrcode/${req.params.instance}`, { headers: evoHdr(), timeout: 8000, params: { image: true } });
       const qr = d2?.base64 || d2?.qrcode?.base64 || null;
@@ -1951,7 +1830,6 @@ app.get('/evolution/qr/:instance', async (req, res) => {
   }
 });
 
-// GET /evolution/debug — mostra info bruta da Evolution API
 app.get('/evolution/debug', async (req, res) => {
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
@@ -1961,12 +1839,10 @@ app.get('/evolution/debug', async (req, res) => {
   }
 });
 
-// GET /evolution/status/:instance — verifica estado (Evolution API v2)
 app.get('/evolution/status/:instance', async (req, res) => {
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/connectionState/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
     console.log('Evolution status raw:', JSON.stringify(data).substring(0, 200));
-    // v2: { instance: { instanceName, state } } ou { state }
     const state = data?.instance?.state || data?.state || 'close';
     let phone = null;
     if (state === 'open') {
@@ -1983,7 +1859,6 @@ app.get('/evolution/status/:instance', async (req, res) => {
   }
 });
 
-// POST /evolution/save-account — salva conta Evolution no Supabase após conexão
 app.post('/evolution/save-account', async (req, res) => {
   const { instance, phone } = req.body;
   if (!instance) return res.status(400).json({ error: 'instance obrigatório' });
@@ -1997,7 +1872,6 @@ app.post('/evolution/save-account', async (req, res) => {
   res.json({ success: true, data });
 });
 
-// DELETE /evolution/disconnect/:instance
 app.delete('/evolution/disconnect/:instance', async (req, res) => {
   try {
     await axios.delete(`${EVOLUTION_URL}/instance/delete/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
@@ -2008,7 +1882,6 @@ app.delete('/evolution/disconnect/:instance', async (req, res) => {
   }
 });
 
-// POST /evolution-webhook — recebe mensagens da Evolution API
 app.post('/evolution-webhook', async (req, res) => {
   res.sendStatus(200);
   try {
@@ -2017,9 +1890,9 @@ app.post('/evolution-webhook', async (req, res) => {
 
     if (event === 'messages.upsert') {
       if (!data) return;
-      const fromMe    = !!data.key?.fromMe;        // true = mensagem enviada pelo celular/CRM
+      const fromMe    = !!data.key?.fromMe;
       const remoteJid = data.key?.remoteJid || '';
-      if (remoteJid.includes('@g.us')) return; // ignora grupos
+      if (remoteJid.includes('@g.us')) return;
 
       const phone     = remoteJid.replace('@s.whatsapp.net', '');
       const name      = data.pushName || phone;
@@ -2027,7 +1900,6 @@ app.post('/evolution-webhook', async (req, res) => {
       const wamid     = data.key?.id || null;
       const direction = fromMe ? 'outbound' : 'inbound';
 
-      // Extrai conteúdo
       let content = fromMe ? '[Mensagem enviada]' : '[Mensagem recebida]', type = 'text';
       const msg = data.message || {};
       if      (msg.conversation)          { content = msg.conversation; type = 'text'; }
@@ -2037,7 +1909,6 @@ app.post('/evolution-webhook', async (req, res) => {
       else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
       else if (msg.documentMessage)       { content = msg.documentMessage.fileName || '[Documento]'; type = 'document'; }
 
-      // Busca account_id
       let accountId = null;
       if (supabase && instanceName) {
         const { data: acc } = await supabase.from('accounts').select('id').eq('evolution_instance', instanceName).maybeSingle();
@@ -2045,7 +1916,6 @@ app.post('/evolution-webhook', async (req, res) => {
       }
 
       if (supabase) {
-        // Dedup: evita duplicar mensagens já salvas (ex.: enviadas pelo próprio CRM)
         if (wamid) {
           const { data: exists } = await supabase.from('messages').select('id').eq('wamid', wamid).maybeSingle();
           if (exists) return;
@@ -2056,7 +1926,6 @@ app.post('/evolution-webhook', async (req, res) => {
         if (accountId) contactData.account_id = accountId;
         await supabase.from('contacts').upsert(contactData, { onConflict: 'phone' });
 
-        // Incrementa não-lidos só para mensagens RECEBIDAS
         if (!fromMe) {
           const { data: cRow } = await supabase.from('contacts').select('unread_count, first_unread_at').eq('phone', phone).maybeSingle();
           const currentUnread = cRow?.unread_count || 0;
@@ -2069,7 +1938,6 @@ app.post('/evolution-webhook', async (req, res) => {
         if (accountId) msgData.account_id = accountId;
         await supabase.from('messages').insert(msgData);
 
-        // Bot e n8n só para mensagens RECEBIDAS
         if (!fromMe && type === 'text' && content) {
           try { await handleBotReply(phone, content); } catch(be) { console.error('Bot reply error:', be.message); }
         }
@@ -2081,7 +1949,6 @@ app.post('/evolution-webhook', async (req, res) => {
         }
       }
     } else if (event === 'qrcode.updated') {
-      // Evolution gera o QR de forma assíncrona e o entrega aqui
       const b64 = data?.qrcode?.base64 || data?.base64 || null;
       if (b64) {
         qrCache[instanceName] = b64.startsWith('data:') ? b64 : 'data:image/png;base64,' + b64;
@@ -2089,7 +1956,6 @@ app.post('/evolution-webhook', async (req, res) => {
       }
     } else if (event === 'connection.update') {
       console.log(`🔌 Evolution ${instanceName}: ${data?.state}`);
-      // Ao conectar (ou desconectar), o QR antigo não serve mais
       if (data?.state === 'open' || data?.state === 'close') delete qrCache[instanceName];
     }
   } catch(err) {
