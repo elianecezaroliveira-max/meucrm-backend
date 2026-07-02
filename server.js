@@ -146,7 +146,8 @@ app.post("/webhook", async (req, res) => {
 
       if (!value?.messages?.length) continue;
 
-      const message = value.messages[0];
+      // Processa TODAS as mensagens do lote (a Meta pode agrupar várias num só webhook)
+      for (const message of value.messages) {
       const contact = value.contacts?.[0];
       const from = message.from;
       const name = contact?.profile?.name || "Desconhecido";
@@ -299,6 +300,7 @@ app.post("/webhook", async (req, res) => {
           } catch(ne) { console.error('N8N forward error:', ne.message); }
         }
       }
+      } // fim do for (message of value.messages)
     }
 
     res.sendStatus(200);
@@ -492,8 +494,9 @@ app.post("/send", async (req, res) => {
       if (supabase) {
         const safeAccountId = account_id || null;
         const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
-        await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound' }, { onConflict: 'phone' });
-        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, wamid, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
+        // Inclui owner — sem ele a mensagem não aparece no CRM (o GET /messages filtra por owner)
+        await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', owner: req.owner || null }, { onConflict: 'owner,phone' });
+        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
       }
       return res.json({ success: true, via: 'evolution' });
     } catch(e) {
@@ -2037,11 +2040,12 @@ app.post('/evolution-webhook', async (req, res) => {
       else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
       else if (msg.documentMessage)       { content = msg.documentMessage.fileName || '[Documento]'; type = 'document'; }
 
-      // Busca account_id
+      // Busca account_id + dono (owner) — sem o owner a mensagem não aparece no CRM
       let accountId = null;
+      let ownerEmail = null;
       if (supabase && instanceName) {
-        const { data: acc } = await supabase.from('accounts').select('id').eq('evolution_instance', instanceName).maybeSingle();
-        if (acc) accountId = acc.id;
+        const { data: acc } = await supabase.from('accounts').select('id, owner').eq('evolution_instance', instanceName).maybeSingle();
+        if (acc) { accountId = acc.id; ownerEmail = acc.owner || null; }
       }
 
       if (supabase) {
@@ -2054,24 +2058,28 @@ app.post('/evolution-webhook', async (req, res) => {
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
         const contactData = { phone, name, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
         if (accountId) contactData.account_id = accountId;
-        await supabase.from('contacts').upsert(contactData, { onConflict: 'phone' });
+        if (ownerEmail) contactData.owner = ownerEmail;
+        const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
+        if (cErr) console.error('❌ Evolution: erro ao salvar contato:', cErr.message);
 
         // Incrementa não-lidos só para mensagens RECEBIDAS
         if (!fromMe) {
-          const { data: cRow } = await supabase.from('contacts').select('unread_count, first_unread_at').eq('phone', phone).maybeSingle();
+          const { data: cRow } = await supabase.from('contacts').select('unread_count, first_unread_at').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
           const currentUnread = cRow?.unread_count || 0;
           const unreadUpdate = { unread_count: currentUnread + 1 };
           if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp;
-          await supabase.from('contacts').update(unreadUpdate).eq('phone', phone);
+          await supabase.from('contacts').update(unreadUpdate).eq('phone', phone).eq('owner', ownerEmail || ' ');
         }
 
         const msgData = { phone, content, type, direction, timestamp, wamid };
         if (accountId) msgData.account_id = accountId;
-        await supabase.from('messages').insert(msgData);
+        if (ownerEmail) msgData.owner = ownerEmail;
+        const { error: mErr } = await supabase.from('messages').insert(msgData);
+        if (mErr) console.error('❌ Evolution: erro ao salvar mensagem:', mErr.message);
 
         // Bot e n8n só para mensagens RECEBIDAS
         if (!fromMe && type === 'text' && content) {
-          try { await handleBotReply(phone, content); } catch(be) { console.error('Bot reply error:', be.message); }
+          try { await handleBotReply(phone, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
         }
         if (!fromMe) {
           const n8nUrl = _settings['n8n_webhook_url'];
