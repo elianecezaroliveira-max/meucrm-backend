@@ -317,6 +317,14 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.log("✅ Mensagem salva:", content.substring(0, 50));
         }
+
+        // Notificação push nos aparelhos do dono (não bloqueia o processamento)
+        sendPushToOwner(ownerEmail, {
+          title: existing?.name || name || from,
+          body: preview,
+          phone: from,
+          tag: 'chat-' + from,
+        }).catch(() => {});
         // Processa reply de bot ativo (texto OU clique em botão/lista)
         if (['text','button','interactive'].includes(type) && content) {
           try { await handleBotReply(from, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
@@ -1831,6 +1839,77 @@ app.put('/settings/:key', async (req, res) => {
   res.json({ success: true });
 });
 
+// ═══════════════════════════════════════
+// NOTIFICAÇÕES PUSH (Web Push / PWA)
+// ═══════════════════════════════════════
+let webpush = null;
+try { webpush = require('web-push'); } catch (e) { console.log('⚠️ web-push não instalado — notificações push desativadas'); }
+
+let _vapid = null;
+async function initPush() {
+  if (!webpush || !supabase) return;
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'vapid_keys').maybeSingle();
+    if (data?.value) {
+      _vapid = JSON.parse(data.value);
+    } else {
+      // Gera o par de chaves UMA vez e persiste (trocar as chaves invalida as inscrições)
+      const crypto = require('crypto');
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+      _vapid = {
+        publicKey: publicKey.export({ type: 'spki', format: 'der' }).subarray(-65).toString('base64url'),
+        privateKey: privateKey.export({ format: 'jwk' }).d,
+      };
+      await supabase.from('settings').upsert({ key: 'vapid_keys', value: JSON.stringify(_vapid), updated_at: new Date().toISOString() });
+      console.log('🔑 Chaves VAPID geradas e salvas nos settings');
+    }
+    webpush.setVapidDetails('mailto:solucoesvalorize@gmail.com', _vapid.publicKey, _vapid.privateKey);
+    console.log('✅ Web Push pronto');
+  } catch (e) { console.error('Push init error:', e.message); }
+}
+initPush();
+
+app.get('/push/public-key', (req, res) => res.json({ key: _vapid ? _vapid.publicKey : null }));
+
+app.post('/push/subscribe', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const sub = req.body?.subscription;
+  if (!sub?.endpoint) return res.status(400).json({ error: 'subscription inválida' });
+  const { error } = await supabase.from('push_subscriptions').upsert(
+    { endpoint: sub.endpoint, subscription: sub, owner: req.owner || null, updated_at: new Date().toISOString() },
+    { onConflict: 'endpoint' }
+  );
+  if (error) { console.error('Push subscribe error:', error.message); return res.status(500).json({ error: error.message }); }
+  res.json({ success: true });
+});
+
+app.post('/push/unsubscribe', async (req, res) => {
+  if (supabase && req.body?.endpoint) await supabase.from('push_subscriptions').delete().eq('endpoint', req.body.endpoint);
+  res.json({ success: true });
+});
+
+// Envia push para todos os aparelhos do dono; remove inscrições mortas (404/410)
+async function sendPushToOwner(owner, payload) {
+  if (!webpush || !_vapid || !supabase) return;
+  try {
+    let q = supabase.from('push_subscriptions').select('endpoint, subscription');
+    q = owner ? q.eq('owner', owner) : q.is('owner', null);
+    const { data: subs } = await q;
+    for (const s of subs || []) {
+      try {
+        await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: 3600 });
+      } catch (e) {
+        if (e.statusCode === 404 || e.statusCode === 410) {
+          await supabase.from('push_subscriptions').delete().eq('endpoint', s.endpoint);
+          console.log('🧹 Inscrição push expirada removida');
+        } else {
+          console.error('Push send error:', e.statusCode || e.message);
+        }
+      }
+    }
+  } catch (e) { console.error('Push error:', e.message); }
+}
+
 // Teste de conexão N8N — envia evento de teste para o webhook configurado
 app.post('/n8n/test', async (req, res) => {
   const n8nUrl = _settings['n8n_webhook_url'];
@@ -2096,6 +2175,9 @@ app.post('/evolution-webhook', async (req, res) => {
         if (ownerEmail) msgData.owner = ownerEmail;
         const { error: mErr } = await supabase.from('messages').insert(msgData);
         if (mErr) console.error('❌ Evolution: erro ao salvar mensagem:', mErr.message);
+
+        // Notificação push só para mensagens RECEBIDAS
+        if (!fromMe) sendPushToOwner(ownerEmail, { title: name || phone, body: preview, phone, tag: 'chat-' + phone }).catch(() => {});
 
         // Bot e n8n só para mensagens RECEBIDAS
         if (!fromMe && type === 'text' && content) {
