@@ -111,6 +111,9 @@ async function applyPendingStatus(wamid) {
 
 // ── Receber mensagens ──
 app.post("/webhook", async (req, res) => {
+  // Responde 200 IMEDIATAMENTE — se a resposta demorar, a Meta reenvia o webhook
+  // e a mensagem chega duplicada no CRM.
+  res.sendStatus(200);
   try {
     const body = req.body;
 
@@ -119,11 +122,12 @@ app.post("/webhook", async (req, res) => {
 
     if (body.object !== "whatsapp_business_account") {
       console.log("⚠️ Objeto ignorado:", body.object);
-      return res.sendStatus(200);
+      return;
     }
 
-    const changes = body.entry?.[0]?.changes;
-    if (!changes?.length) return res.sendStatus(200);
+    // Percorre TODOS os entries (a Meta pode agrupar vários)
+    const changes = (body.entry || []).flatMap(e => e.changes || []);
+    if (!changes.length) return;
 
     for (const change of changes) {
       const value = change.value;
@@ -163,6 +167,12 @@ app.post("/webhook", async (req, res) => {
           console.log(`😀 Reação ${emoji||'(removida)'} em ${targetWamid}`);
         }
         continue;
+      }
+
+      // Dedup: a Meta reenvia webhooks — ignora mensagem que já está salva
+      if (supabase && message.id) {
+        const { data: dupe } = await supabase.from("messages").select("id").eq("wamid", message.id).maybeSingle();
+        if (dupe) { console.log("↩️ Webhook duplicado ignorado:", message.id); continue; }
       }
 
       console.log(`📨 Mensagem de ${name} (${from}) via número ${phoneNumberId}`);
@@ -302,11 +312,8 @@ app.post("/webhook", async (req, res) => {
       }
       } // fim do for (message of value.messages)
     }
-
-    res.sendStatus(200);
   } catch (err) {
     console.error("❌ Erro no webhook:", err.message);
-    res.sendStatus(500);
   }
 });
 
@@ -668,7 +675,6 @@ async function getMediaUrl(mediaId, token, cacheKey, force) {
   return url;
 }
 
-const _mediaBufCache = {}; // cacheKey -> { buf, ctype, ts } — arquivo inteiro em memória (cache curto)
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
   const { mediaId } = req.params;
@@ -685,63 +691,42 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
 
   try {
-    // Baixa o arquivo INTEIRO uma vez (com cache curto) e serve os ranges a partir do buffer.
-    let entry = _mediaBufCache[cacheKey];
-    if (!entry || Date.now() - entry.ts > 300000) {
-      const fetchFull = async (force) => {
-        const url = await getMediaUrl(mediaId, token, cacheKey, force);
-        return axios.get(url, {
-          headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
-          responseType: "arraybuffer", timeout: 60000,
-          validateStatus: s => s >= 200 && s < 400,
-        });
-      };
-      let resp;
-      try { resp = await fetchFull(false); } catch (e) { resp = await fetchFull(true); } // URL pode ter expirado
-      entry = { buf: Buffer.from(resp.data), ctype: resp.headers["content-type"], ts: Date.now() };
-      _mediaBufCache[cacheKey] = entry;
-      // Limita o cache em memória (remove os mais antigos)
-      const keys = Object.keys(_mediaBufCache);
-      if (keys.length > 12) { keys.sort((a,b)=>_mediaBufCache[a].ts-_mediaBufCache[b].ts); delete _mediaBufCache[keys[0]]; }
-    }
+    // STREAMING real: repassa o Range do navegador direto para o CDN da Meta e
+    // encaminha os bytes conforme chegam. O vídeo/áudio começa a tocar imediatamente,
+    // sem baixar o arquivo inteiro na memória (que causava demora e travadas).
+    const fetchStream = async (force) => {
+      const url = await getMediaUrl(mediaId, token, cacheKey, force);
+      const headers = { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" };
+      if (req.headers.range && download !== "1") headers.Range = req.headers.range;
+      return axios.get(url, {
+        headers, responseType: "stream", timeout: 30000,
+        validateStatus: s => s === 200 || s === 206,
+      });
+    };
+    let up;
+    try { up = await fetchStream(false); } catch (e) { up = await fetchStream(true); } // URL pode ter expirado
 
-    const buf = entry.buf;
-    const total = buf.length;
-    const ctype = req.query.mime || entry.ctype || "application/octet-stream";
+    res.status(up.status); // 200 ou 206 (parcial)
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Content-Type", ctype);
+    res.setHeader("Accept-Ranges", up.headers["accept-ranges"] || "bytes");
+    res.setHeader("Content-Type", req.query.mime || up.headers["content-type"] || "application/octet-stream");
+    if (up.headers["content-length"]) res.setHeader("Content-Length", up.headers["content-length"]);
+    if (up.headers["content-range"])  res.setHeader("Content-Range", up.headers["content-range"]);
 
     if (download === "1") {
-      const safeFilename = filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`;
+      const safeFilename = (filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`).replace(/["\r\n]/g, "");
       res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-      res.setHeader("Content-Length", total);
-      return res.status(200).end(buf);
-    }
-    res.setHeader("Cache-Control", "public, max-age=600");
-
-    // Pedido com Range (áudio/vídeo): responde 206 com o pedaço certo
-    const range = req.headers.range;
-    if (range) {
-      const m = /bytes=(\d*)-(\d*)/.exec(range);
-      let start = m && m[1] !== "" ? parseInt(m[1], 10) : 0;
-      let end   = m && m[2] !== "" ? parseInt(m[2], 10) : total - 1;
-      if (isNaN(start)) start = 0;
-      if (isNaN(end) || end >= total) end = total - 1;
-      if (start > end || start >= total) {
-        res.setHeader("Content-Range", `bytes */${total}`);
-        return res.status(416).end();
-      }
-      res.status(206);
-      res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
-      res.setHeader("Content-Length", end - start + 1);
-      return res.end(buf.subarray(start, end + 1));
+    } else {
+      res.setHeader("Cache-Control", "public, max-age=600");
     }
 
-    // Sem Range: arquivo inteiro
-    res.status(200);
-    res.setHeader("Content-Length", total);
-    return res.end(buf);
+    up.data.pipe(res);
+    up.data.on("error", (e) => {
+      console.error("❌ Stream de mídia interrompido:", e.message);
+      try { res.destroy(); } catch (_) {}
+    });
+    // Se o navegador cancelar (fechou o vídeo, pulou trecho), corta o download da Meta
+    res.on("close", () => { try { up.data.destroy(); } catch (_) {} });
   } catch (err) {
     console.error("❌ Erro ao baixar mídia:", err.response?.status || err.message);
     if (!res.headersSent) res.status(500).json({ error: "Falha ao baixar mídia" });
