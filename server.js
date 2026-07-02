@@ -109,6 +109,28 @@ async function applyPendingStatus(wamid) {
   await supabase.from('messages').update(u).eq('wamid', wamid);
 }
 
+// ── Normalização de telefone BR (nono dígito) ──
+// O WhatsApp pode devolver o número do cliente SEM o nono dígito (55 DDD 8ddddddd)
+// mesmo quando o envio foi feito COM ele (55 DDD 9dddddddd) — o que criava uma
+// conversa nova quando o cliente respondia a um template.
+function phoneVariants(phone) {
+  const p = String(phone || '').replace(/\D/g, '');
+  const set = new Set([p]);
+  if (/^55\d{2}9\d{8}$/.test(p)) set.add(p.slice(0, 4) + p.slice(5));      // com 9 → sem 9
+  if (/^55\d{2}[6-9]\d{7}$/.test(p)) set.add(p.slice(0, 4) + '9' + p.slice(4)); // sem 9 → com 9
+  return [...set];
+}
+// Se já existe contato numa variante equivalente, usa o telefone JÁ CADASTRADO
+async function resolveExistingPhone(phone, owner) {
+  if (!supabase) return phone;
+  const variants = phoneVariants(phone);
+  if (variants.length === 1) return phone;
+  const { data } = await supabase.from('contacts').select('phone, last_message_at')
+    .in('phone', variants).eq('owner', owner || ' ')
+    .order('last_message_at', { ascending: false }).limit(1).maybeSingle();
+  return data?.phone || phone;
+}
+
 // ── Receber mensagens ──
 app.post("/webhook", async (req, res) => {
   // Responde 200 IMEDIATAMENTE — se a resposta demorar, a Meta reenvia o webhook
@@ -153,7 +175,7 @@ app.post("/webhook", async (req, res) => {
       // Processa TODAS as mensagens do lote (a Meta pode agrupar várias num só webhook)
       for (const message of value.messages) {
       const contact = value.contacts?.[0];
-      const from = message.from;
+      let from = message.from;
       const name = contact?.profile?.name || "Desconhecido";
       const timestamp = new Date(parseInt(message.timestamp) * 1000).toISOString();
       const phoneNumberId = value.metadata?.phone_number_id;
@@ -191,6 +213,13 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.log("⚠️ Nenhuma conta com phone_number_id:", phoneNumberId, "- salvando sem account_id");
         }
+      }
+
+      // Unifica a conversa se o contato já existe com/sem o nono dígito
+      const resolvedFrom = await resolveExistingPhone(from, ownerEmail);
+      if (resolvedFrom !== from) {
+        console.log(`🔗 Número ${from} unificado com contato existente ${resolvedFrom}`);
+        from = resolvedFrom;
       }
 
       // Extrai conteúdo da mensagem
@@ -466,8 +495,9 @@ app.delete("/accounts/:id", async (req, res) => {
 
 // ── Enviar mensagem ──
 app.post("/send", async (req, res) => {
-  const { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
+  let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
+  to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
 
   let phoneNumberId, token, evolutionInstance = null, accountType = 'cloudapi';
 
@@ -579,9 +609,10 @@ app.post("/react", async (req, res) => {
 
 // ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
 app.post("/send-media", async (req, res) => {
-  const { to, account_id, fileBase64, fileName, mimeType } = req.body;
+  let { to, account_id, fileBase64, fileName, mimeType } = req.body;
   if (!to || !fileBase64 || !fileName || !mimeType)
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
+  to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
 
   let phoneNumberId, token;
   if (supabase && account_id) {
@@ -1116,9 +1147,10 @@ app.delete("/templates/:template_id", async (req, res) => {
 
 // ── Enviar template ──
 app.post("/send-template", async (req, res) => {
-  const { to, account_id, template_name, language_code, components, body_text } = req.body;
+  let { to, account_id, template_name, language_code, components, body_text } = req.body;
   if (!to || !account_id || !template_name)
     return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
+  to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { data: account, error: accErr } = await supabase
     .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
@@ -2009,7 +2041,7 @@ app.post('/evolution-webhook', async (req, res) => {
       const remoteJid = data.key?.remoteJid || '';
       if (remoteJid.includes('@g.us')) return; // ignora grupos
 
-      const phone     = remoteJid.replace('@s.whatsapp.net', '');
+      let phone       = remoteJid.replace('@s.whatsapp.net', '');
       const name      = data.pushName || phone;
       const timestamp = new Date((data.messageTimestamp || Date.now() / 1000) * 1000).toISOString();
       const wamid     = data.key?.id || null;
@@ -2032,6 +2064,9 @@ app.post('/evolution-webhook', async (req, res) => {
         const { data: acc } = await supabase.from('accounts').select('id, owner').eq('evolution_instance', instanceName).maybeSingle();
         if (acc) { accountId = acc.id; ownerEmail = acc.owner || null; }
       }
+
+      // Unifica a conversa se o contato já existe com/sem o nono dígito
+      phone = await resolveExistingPhone(phone, ownerEmail);
 
       if (supabase) {
         // Dedup: evita duplicar mensagens já salvas (ex.: enviadas pelo próprio CRM)
