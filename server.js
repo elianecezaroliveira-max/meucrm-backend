@@ -1888,6 +1888,37 @@ app.post('/push/unsubscribe', async (req, res) => {
   res.json({ success: true });
 });
 
+// Teste de ponta a ponta: envia uma notificação real e devolve o diagnóstico
+app.post('/push/test', async (req, res) => {
+  if (!webpush || !_vapid) return res.status(500).json({ error: 'web-push não está ativo no servidor' });
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  try {
+    // Total geral (para diferenciar "tabela vazia" de "owner diferente")
+    const { count: totalAll, error: tblErr } = await supabase
+      .from('push_subscriptions').select('endpoint', { count: 'exact', head: true });
+    if (tblErr) return res.status(500).json({ error: 'Tabela push_subscriptions: ' + tblErr.message });
+
+    let q = supabase.from('push_subscriptions').select('endpoint, subscription');
+    q = req.owner ? q.eq('owner', req.owner) : q.is('owner', null);
+    const { data: subs } = await q;
+
+    const results = [];
+    for (const s of subs || []) {
+      try {
+        await webpush.sendNotification(s.subscription,
+          JSON.stringify({ title: 'MeuCRM', body: '🔔 Notificações funcionando!', tag: 'push-test' }), { TTL: 300 });
+        results.push({ ok: true });
+      } catch (e) {
+        results.push({ ok: false, status: e.statusCode || null, msg: String(e.body || e.message || '').substring(0, 150) });
+        if (e.statusCode === 404 || e.statusCode === 410) {
+          await supabase.from('push_subscriptions').delete().eq('endpoint', s.endpoint);
+        }
+      }
+    }
+    res.json({ owner: req.owner || null, minhas_inscricoes: (subs || []).length, total_geral: totalAll || 0, results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Envia push para todos os aparelhos do dono; remove inscrições mortas (404/410)
 async function sendPushToOwner(owner, payload) {
   if (!webpush || !_vapid || !supabase) return;
