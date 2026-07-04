@@ -38,7 +38,7 @@ async function resolveOwner(req) {
 }
 app.use(async (req, res, next) => { try { req.owner = await resolveOwner(req); } catch (_) { req.owner = null; } next(); });
 
-app.get("/", (req, res) => res.send("✅ MeuCRM Backend funcionando!"));
+app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 
 // ── Verificação do Webhook ──
 app.get("/webhook", (req, res) => {
@@ -1906,7 +1906,7 @@ app.post('/push/test', async (req, res) => {
     for (const s of subs || []) {
       try {
         await webpush.sendNotification(s.subscription,
-          JSON.stringify({ title: 'MeuCRM', body: '🔔 Notificações funcionando!', tag: 'push-test' }), { TTL: 300 });
+          JSON.stringify({ title: 'VETRA', body: '🔔 Notificações funcionando!', tag: 'push-test' }), { TTL: 300 });
         results.push({ ok: true });
       } catch (e) {
         results.push({ ok: false, status: e.statusCode || null, msg: String(e.body || e.message || '').substring(0, 150) });
