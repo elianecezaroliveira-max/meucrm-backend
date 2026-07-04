@@ -615,6 +615,37 @@ app.post("/react", async (req, res) => {
   }
 });
 
+// ── Conversão de áudio para OGG/Opus (formato de voz do WhatsApp) ──
+// Gravações do navegador (MP4 fragmentado do iPhone, WebM do Android) são
+// rejeitadas pela Meta com o erro 131053 — a conversão resolve os dois casos.
+let _ffmpeg = null;
+try {
+  _ffmpeg = require('fluent-ffmpeg');
+  _ffmpeg.setFfmpegPath(require('@ffmpeg-installer/ffmpeg').path);
+  console.log('✅ ffmpeg disponível (conversão de áudio ativa)');
+} catch (e) { console.log('⚠️ ffmpeg não instalado — áudios gravados serão enviados sem conversão'); }
+
+function convertAudioToOpus(buf) {
+  return new Promise((resolve, reject) => {
+    if (!_ffmpeg) return reject(new Error('ffmpeg indisponível'));
+    const os = require('os'), fs = require('fs'), path = require('path');
+    const inFile = path.join(os.tmpdir(), 'rec_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+    const outFile = inFile + '.ogg';
+    const cleanup = () => { try { fs.unlinkSync(inFile); } catch (_) {} try { fs.unlinkSync(outFile); } catch (_) {} };
+    fs.writeFileSync(inFile, buf);
+    _ffmpeg(inFile)
+      .noVideo()
+      .audioCodec('libopus').audioBitrate('32k').audioChannels(1).audioFrequency(48000)
+      .format('ogg')
+      .on('end', () => {
+        try { const out = fs.readFileSync(outFile); cleanup(); resolve(out); }
+        catch (e) { cleanup(); reject(e); }
+      })
+      .on('error', err => { cleanup(); reject(err); })
+      .save(outFile);
+  });
+}
+
 // ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
 app.post("/send-media", async (req, res) => {
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
@@ -636,14 +667,29 @@ app.post("/send-media", async (req, res) => {
     return res.status(400).json({ error: "Nenhuma conta configurada." });
 
   try {
+    // 0. Áudio gravado no navegador → converte para OGG/Opus (voz do WhatsApp)
+    let fileBuf = Buffer.from(fileBase64, "base64");
+    let sendMime = mimeType, sendName = fileName;
+    const baseMime = String(mimeType).split(";")[0].trim();
+    if (baseMime.startsWith("audio/") && !["audio/ogg", "audio/mpeg", "audio/aac", "audio/amr"].includes(baseMime)) {
+      try {
+        fileBuf = await convertAudioToOpus(fileBuf);
+        sendMime = "audio/ogg";
+        sendName = fileName.replace(/\.[^.]+$/, "") + ".ogg";
+        console.log(`🎙️ Áudio convertido para OGG/Opus (${fileBuf.length} bytes)`);
+      } catch (convErr) {
+        console.error("⚠️ Conversão de áudio falhou, enviando original:", convErr.message);
+      }
+    }
+
     // 1. Faz upload da mídia para a Meta
     const FormData = require("form-data");
     const form = new FormData();
     form.append("messaging_product", "whatsapp");
-    form.append("type", mimeType);
-    form.append("file", Buffer.from(fileBase64, "base64"), {
-      filename: fileName,
-      contentType: mimeType,
+    form.append("type", sendMime);
+    form.append("file", fileBuf, {
+      filename: sendName,
+      contentType: sendMime,
     });
 
     const uploadRes = await axios.post(
@@ -686,7 +732,7 @@ app.post("/send-media", async (req, res) => {
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
         status: 'sent', wamid: mediaWamid, owner: req.owner || null,
-        media_id: mediaId, media_mime_type: mimeType, // permite exibir a mídia no CRM
+        media_id: mediaId, media_mime_type: sendMime, // permite exibir a mídia no CRM
       });
       await applyPendingStatus(mediaWamid);
     }
