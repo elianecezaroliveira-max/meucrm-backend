@@ -708,6 +708,8 @@ app.post("/send-media", async (req, res) => {
 
     const mediaObj = { id: mediaId };
     if (msgType === "document") mediaObj.filename = fileName;
+    // Mensagem de VOZ (foto de perfil + forma de onda no WhatsApp) — exige OGG/Opus
+    if (msgType === "audio" && req.body.voice === true && sendMime === "audio/ogg") mediaObj.voice = true;
 
     // 3. Envia a mensagem de mídia
     const mediaResp = await axios.post(
