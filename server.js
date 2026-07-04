@@ -638,6 +638,8 @@ function convertAudioToOpus(buf) {
       // Receita EXATA das mensagens de voz nativas do WhatsApp: 16 kHz, ~16 kbps, mono.
       // Em 48 kHz/32 kbps o acelerador (1,5x/2x) do WhatsApp distorcia a reprodução.
       .audioCodec('libopus').audioBitrate('16k').audioChannels(1).audioFrequency(16000)
+      // Normaliza o volume da fala (gravamos o microfone cru, que fica baixo)
+      .audioFilters('loudnorm=I=-16:TP=-1.5:LRA=11')
       .outputOptions(['-application', 'voip', '-vbr', 'on'])
       .format('ogg')
       .on('end', () => {
