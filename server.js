@@ -1249,7 +1249,7 @@ app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { account_id, with_messages } = req.query;
   let query = supabase
-    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
+    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite")
     .eq("owner", req.owner || ' ')
     .order("last_message_at", { ascending: false });
   if (account_id) query = query.eq("account_id", account_id); // filtra pela conta quando informada
@@ -1321,6 +1321,16 @@ app.put("/contacts/:phone/read", async (req, res) => {
     .from("contacts").update({ unread_count: 0, first_unread_at: null }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
+});
+
+// Favoritar / desfavoritar conversa (swipe no celular)
+app.put("/contacts/:phone/favorite", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const favorite = !!req.body?.favorite;
+  const { error } = await supabase
+    .from("contacts").update({ favorite }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true, favorite });
 });
 
 // ═══════════════════════════════════════
