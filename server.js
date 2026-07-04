@@ -202,13 +202,15 @@ app.post("/webhook", async (req, res) => {
       // Busca account_id + dono (owner) — roteia a mensagem para o usuário certo
       let accountId = null;
       let ownerEmail = null;
+      let accountToken = process.env.WHATSAPP_TOKEN || null;
       if (supabase && phoneNumberId) {
         const { data: account, error: accErr } = await supabase
-          .from("accounts").select("id, owner").eq("phone_number_id", phoneNumberId).maybeSingle();
+          .from("accounts").select("id, owner, token").eq("phone_number_id", phoneNumberId).maybeSingle();
         if (accErr) console.error("❌ Erro ao buscar conta:", accErr.message);
         if (account) {
           accountId = account.id;
           ownerEmail = account.owner || null;
+          if (account.token) accountToken = account.token;
           console.log("✅ Conta encontrada:", accountId, "dono:", ownerEmail);
         } else {
           console.log("⚠️ Nenhuma conta com phone_number_id:", phoneNumberId, "- salvando sem account_id");
@@ -238,7 +240,8 @@ app.post("/webhook", async (req, res) => {
       } else if (type === "audio") {
         mediaId = message.audio?.id || null;
         mediaMimeType = message.audio?.mime_type || "audio/ogg";
-        content = "[Áudio recebido]";
+        const durS = await getAudioDurationSecs(mediaId, accountToken);
+        content = "🎤 Mensagem de voz" + (durS ? ` (${_fmtDur(durS)})` : "");
       } else if (type === "document") {
         mediaId = message.document?.id || null;
         mediaMimeType = message.document?.mime_type || "application/octet-stream";
@@ -651,6 +654,34 @@ function convertAudioToOpus(buf) {
   });
 }
 
+// Formata segundos como M:SS (para "🎤 Mensagem de voz (0:07)")
+function _fmtDur(s) { s = Math.max(0, Math.round(s || 0)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
+
+// Mede a duração de um áudio recebido (a Meta não envia a duração no webhook)
+async function getAudioDurationSecs(mediaId, token) {
+  if (!_ffmpeg || !mediaId || !token) return null;
+  const os = require("os"), fs = require("fs"), path = require("path");
+  const f = path.join(os.tmpdir(), "dur_" + Date.now() + "_" + Math.random().toString(36).slice(2));
+  try {
+    const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+    if (!metaRes.data?.url) return null;
+    const media = await axios.get(metaRes.data.url, {
+      headers: { Authorization: `Bearer ${token}`, "User-Agent": "WhatsApp/2.0" },
+      responseType: "arraybuffer", timeout: 20000, maxContentLength: 20 * 1024 * 1024 });
+    fs.writeFileSync(f, Buffer.from(media.data));
+    const secs = await new Promise(resolve => {
+      const { execFile } = require("child_process");
+      execFile(require("@ffmpeg-installer/ffmpeg").path, ["-i", f], (err, so, se) => {
+        const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(String(se || ""));
+        resolve(m ? (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]) : null);
+      });
+    });
+    return secs;
+  } catch (e) { return null; }
+  finally { try { fs.unlinkSync(f); } catch (_) {} }
+}
+
 // ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
 app.post("/send-media", async (req, res) => {
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
@@ -728,7 +759,10 @@ app.post("/send-media", async (req, res) => {
       const safeAccountId = account_id || null;
       const mediaWamid = mediaResp.data?.messages?.[0]?.id || null;
       const label = msgType === "image" ? "Imagem" : msgType === "video" ? "Vídeo" : msgType === "audio" ? "Áudio" : "Documento";
-      const content = `[${label}: ${fileName}]`;
+      const durSecs = Number(req.body.duration) || 0;
+      const content = (msgType === "audio" && req.body.voice === true)
+        ? "🎤 Mensagem de voz" + (durSecs ? ` (${_fmtDur(durSecs)})` : "")
+        : `[${label}: ${fileName}]`;
       await supabase.from("contacts").upsert(
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
           last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
@@ -2236,7 +2270,11 @@ app.post('/evolution-webhook', async (req, res) => {
       if      (msg.conversation)          { content = msg.conversation; type = 'text'; }
       else if (msg.extendedTextMessage)   { content = msg.extendedTextMessage.text || ''; type = 'text'; }
       else if (msg.imageMessage)          { content = msg.imageMessage.caption || '[Imagem]'; type = 'image'; }
-      else if (msg.audioMessage || msg.pttMessage) { content = '[Áudio]'; type = 'audio'; }
+      else if (msg.audioMessage || msg.pttMessage) {
+        const secsEv = (msg.audioMessage?.seconds || msg.pttMessage?.seconds) || 0;
+        content = '🎤 Mensagem de voz' + (secsEv ? ` (${_fmtDur(secsEv)})` : '');
+        type = 'audio';
+      }
       else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
       else if (msg.documentMessage)       { content = msg.documentMessage.fileName || '[Documento]'; type = 'document'; }
 
