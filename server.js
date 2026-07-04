@@ -635,10 +635,10 @@ function convertAudioToOpus(buf) {
     fs.writeFileSync(inFile, buf);
     _ffmpeg(inFile)
       .noVideo()
-      .audioCodec('libopus').audioBitrate('32k').audioChannels(1).audioFrequency(48000)
-      // Perfil "audio" = o mesmo das mensagens de voz nativas do WhatsApp;
-      // o modo "voip" fazia o acelerador (1,5x/2x) do WhatsApp do cliente distorcer
-      .outputOptions(['-application', 'audio', '-vbr', 'on'])
+      // Receita EXATA das mensagens de voz nativas do WhatsApp: 16 kHz, ~16 kbps, mono.
+      // Em 48 kHz/32 kbps o acelerador (1,5x/2x) do WhatsApp distorcia a reprodução.
+      .audioCodec('libopus').audioBitrate('16k').audioChannels(1).audioFrequency(16000)
+      .outputOptions(['-application', 'voip', '-vbr', 'on'])
       .format('ogg')
       .on('end', () => {
         try { const out = fs.readFileSync(outFile); cleanup(); resolve(out); }
