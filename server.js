@@ -890,19 +890,21 @@ app.put("/contacts/:phone/name", async (req, res) => {
 
 // ── Anotações por contato ──
 app.get("/contacts/:phone/notes", async (req, res) => {
-  if (!supabase) return res.json({ notes: "" });
+  if (!supabase) return res.json({ notes: "", email: "" });
   const { data, error } = await supabase
-    .from("contacts").select("notes").eq("phone", req.params.phone).eq("owner", req.owner || ' ').maybeSingle();
+    .from("contacts").select("notes, email").eq("phone", req.params.phone).eq("owner", req.owner || ' ').maybeSingle();
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ notes: data?.notes || "" });
+  res.json({ notes: data?.notes || "", email: data?.email || "" });
 });
 
 app.put("/contacts/:phone/notes", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { notes } = req.body;
+  const { notes, email } = req.body;
+  const upd = { notes: notes ?? "" };
+  if (email !== undefined) upd.email = String(email || "").trim() || null;
   const { error } = await supabase
     .from("contacts")
-    .update({ notes: notes ?? "" })
+    .update(upd)
     .eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
