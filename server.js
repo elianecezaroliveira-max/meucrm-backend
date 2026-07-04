@@ -635,7 +635,8 @@ function convertAudioToOpus(buf) {
     fs.writeFileSync(inFile, buf);
     _ffmpeg(inFile)
       .noVideo()
-      .audioCodec('libopus').audioBitrate('32k').audioChannels(1).audioFrequency(48000)
+      .audioCodec('libopus').audioBitrate('48k').audioChannels(1).audioFrequency(48000)
+      .outputOptions(['-application', 'voip', '-vbr', 'on']) // otimizado para voz
       .format('ogg')
       .on('end', () => {
         try { const out = fs.readFileSync(outFile); cleanup(); resolve(out); }
