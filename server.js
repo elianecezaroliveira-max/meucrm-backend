@@ -1933,6 +1933,14 @@ app.post('/push/test', async (req, res) => {
 async function sendPushToOwner(owner, payload) {
   if (!webpush || !_vapid || !supabase) return;
   try {
+    // Total de conversas não lidas → número (badge) no ícone do app
+    try {
+      let bq = supabase.from('contacts').select('unread_count').gt('unread_count', 0);
+      bq = owner ? bq.eq('owner', owner) : bq.is('owner', null);
+      const { data: rows } = await bq;
+      payload.badge = (rows || []).length;
+    } catch (_) {}
+
     let q = supabase.from('push_subscriptions').select('endpoint, subscription');
     q = owner ? q.eq('owner', owner) : q.is('owner', null);
     const { data: subs } = await q;
