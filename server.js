@@ -2274,6 +2274,9 @@ async function waStart(instanceName) {
           instance: instanceName,
           data: {
             key: m.key,
+            // Quando o contato usa o id oculto (@lid), o Baileys entrega o número
+            // real em senderPn — preferimos ele para a conversa ficar no telefone certo
+            senderPn: m.key?.senderPn || m.key?.participantPn || null,
             pushName: m.pushName || '',
             messageTimestamp: Number(m.messageTimestamp) || Math.floor(Date.now() / 1000),
             message: m.message,
@@ -2288,7 +2291,10 @@ async function waStart(instanceName) {
 // Descobre o "endereço" (JID) REAL do número no WhatsApp — resolve o nono dígito.
 // Enviar para a variante errada não dá erro: a mensagem simplesmente não chega.
 async function waResolveJid(sock, to) {
-  const num = String(to).replace(/\D/g, '');
+  const s = String(to).trim();
+  // Endereço já pronto (ex.: id oculto "@lid" ou jid completo) → usa como está
+  if (s.endsWith('@lid') || s.endsWith('@s.whatsapp.net')) return s;
+  const num = s.replace(/\D/g, '');
   try {
     const r = await sock.onWhatsApp(num);
     if (r && r[0] && r[0].exists && r[0].jid) return r[0].jid;
@@ -2523,7 +2529,8 @@ app.post('/evolution-webhook', async (req, res) => {
     if (event === 'messages.upsert') {
       if (!data) return;
       const fromMe    = !!data.key?.fromMe;        // true = mensagem enviada pelo celular/CRM
-      const remoteJid = data.key?.remoteJid || '';
+      // Prefere o número REAL (senderPn) quando o contato usa o id oculto @lid
+      const remoteJid = (!data.key?.fromMe && data.senderPn) ? data.senderPn : (data.key?.remoteJid || '');
       if (remoteJid.includes('@g.us')) return; // ignora grupos
 
       let phone       = remoteJid.replace('@s.whatsapp.net', '');
