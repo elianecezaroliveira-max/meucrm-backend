@@ -2089,6 +2089,10 @@ const qrCache = {};
 // Sessões ficam no Supabase (tabela wa_sessions) e sobrevivem a redeploys.
 // ═══════════════════════════════════════
 const WA_EMBEDDED = !process.env.EVOLUTION_API_URL;
+// Node 18 não tem WebCrypto global (o Baileys precisa) — este polyfill resolve
+if (typeof globalThis.crypto === 'undefined' || !globalThis.crypto?.subtle) {
+  try { globalThis.crypto = require('crypto').webcrypto; } catch (_) {}
+}
 let _baileys = null, _qrcode = null, _pino = null;
 if (WA_EMBEDDED) {
   try {
