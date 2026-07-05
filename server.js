@@ -706,6 +706,63 @@ async function getAudioDurationSecs(mediaId, token) {
   finally { try { fs.unlinkSync(f); } catch (_) {} }
 }
 
+// Calcula os "pauzinhos" da mensagem de voz: envelope de volume em 64 barras (0-99)
+async function computeWaveform(audioBuf) {
+  if (!_ffmpeg) return null;
+  const os = require('os'), fs = require('fs'), path = require('path');
+  const inFile = path.join(os.tmpdir(), 'wf_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+  const outFile = inFile + '.raw';
+  try {
+    fs.writeFileSync(inFile, audioBuf);
+    await new Promise((resolve, reject) => {
+      _ffmpeg(inFile).audioChannels(1).audioFrequency(8000).format('s16le')
+        .on('end', resolve).on('error', reject).save(outFile);
+    });
+    const raw = fs.readFileSync(outFile);
+    const samples = new Int16Array(raw.buffer, raw.byteOffset, Math.floor(raw.length / 2));
+    if (!samples.length) return null;
+    const bars = 64, per = Math.max(1, Math.floor(samples.length / bars));
+    const amps = []; let maxAmp = 1;
+    for (let i = 0; i < bars; i++) {
+      let sum = 0, n = 0;
+      for (let j = i * per; j < Math.min((i + 1) * per, samples.length); j++) { sum += Math.abs(samples[j]); n++; }
+      const a = n ? sum / n : 0;
+      amps.push(a); if (a > maxAmp) maxAmp = a;
+    }
+    const wf = new Uint8Array(bars);
+    for (let i = 0; i < bars; i++) wf[i] = Math.min(99, Math.round((amps[i] / maxAmp) * 99));
+    return wf;
+  } catch (e) { return null; }
+  finally { try { fs.unlinkSync(inFile); } catch (_) {} try { fs.unlinkSync(outFile); } catch (_) {} }
+}
+
+// Converte vídeo para MP4 (o iPhone grava .mov, que o WhatsApp via QR não aceita).
+// 1ª tentativa: remux (-c copy, instantâneo); se falhar, recodifica de verdade.
+function convertVideoToMp4(buf) {
+  return new Promise((resolve, reject) => {
+    if (!_ffmpeg) return reject(new Error('ffmpeg indisponível'));
+    const os = require('os'), fs = require('fs'), path = require('path');
+    const inFile = path.join(os.tmpdir(), 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+    const outFile = inFile + '.mp4';
+    const cleanup = () => { try { fs.unlinkSync(inFile); } catch (_) {} try { fs.unlinkSync(outFile); } catch (_) {} };
+    const finish = () => { try { const out = fs.readFileSync(outFile); cleanup(); resolve(out); } catch (e) { cleanup(); reject(e); } };
+    fs.writeFileSync(inFile, buf);
+    _ffmpeg(inFile)
+      .outputOptions(['-c', 'copy', '-movflags', '+faststart']).format('mp4')
+      .on('end', finish)
+      .on('error', () => {
+        _ffmpeg(inFile)
+          .videoCodec('libx264').audioCodec('aac')
+          .outputOptions(['-preset', 'veryfast', '-crf', '28', '-movflags', '+faststart'])
+          .format('mp4')
+          .on('end', finish)
+          .on('error', err2 => { cleanup(); reject(err2); })
+          .save(outFile);
+      })
+      .save(outFile);
+  });
+}
+
 // ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
 app.post("/send-media", async (req, res) => {
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
@@ -733,17 +790,20 @@ app.post("/send-media", async (req, res) => {
       const baseMime = String(mimeType).split(";")[0].trim();
       const jid = await waResolveJid(sock, to); // endereço real (resolve o nono dígito)
       const durSecs = Number(req.body.duration) || 0;
-      let sent, content, msgType;
+      let sent, content, msgType, qrSentMime = baseMime;
       if (baseMime.startsWith('audio/')) {
         if (baseMime !== 'audio/ogg') {
           try { fileBuf = await convertAudioToOpus(fileBuf); }
           catch (e) { console.error('⚠️ Conversão (QR) falhou, enviando original:', e.message); }
         }
+        // Envelope de volume (os "pauzinhos" da mensagem de voz)
+        const wf = req.body.voice === true ? await computeWaveform(fileBuf) : null;
         sent = await sock.sendMessage(jid, {
           audio: fileBuf, mimetype: 'audio/ogg; codecs=opus',
           ptt: req.body.voice === true, seconds: durSecs || undefined,
+          ...(wf ? { waveform: wf } : {}),
         });
-        msgType = 'audio';
+        msgType = 'audio'; qrSentMime = 'audio/ogg';
         content = req.body.voice === true
           ? '🎤 Mensagem de voz' + (durSecs ? ` (${_fmtDur(durSecs)})` : '')
           : `[Áudio: ${fileName}]`;
@@ -751,8 +811,13 @@ app.post("/send-media", async (req, res) => {
         sent = await sock.sendMessage(jid, { image: fileBuf, mimetype: baseMime });
         msgType = 'image'; content = `[Imagem: ${fileName}]`;
       } else if (baseMime.startsWith('video/')) {
-        sent = await sock.sendMessage(jid, { video: fileBuf, mimetype: baseMime });
-        msgType = 'video'; content = `[Vídeo: ${fileName}]`;
+        let vMime = 'video/mp4';
+        if (baseMime !== 'video/mp4') {
+          try { fileBuf = await convertVideoToMp4(fileBuf); }
+          catch (ve) { console.error('⚠️ Conversão de vídeo falhou, enviando original:', ve.message); vMime = baseMime; }
+        }
+        sent = await sock.sendMessage(jid, { video: fileBuf, mimetype: vMime });
+        msgType = 'video'; qrSentMime = vMime; content = `[Vídeo: ${fileName}]`;
       } else {
         sent = await sock.sendMessage(jid, { document: fileBuf, mimetype: baseMime, fileName });
         msgType = 'document'; content = `[Documento: ${fileName}]`;
@@ -761,7 +826,7 @@ app.post("/send-media", async (req, res) => {
         const wamid = sent?.key?.id || null;
         // Guarda a mídia enviada para poder reproduzi-la no CRM
         let mediaPathOut = null;
-        const outMime = msgType === 'audio' ? 'audio/ogg' : baseMime;
+        const outMime = qrSentMime;
         try {
           const extOut = (outMime.split('/')[1] || 'bin').split('+')[0];
           mediaPathOut = `qr/${evolutionInstance}/out_${wamid || Date.now()}.${extOut}`;
@@ -2231,6 +2296,11 @@ if (WA_EMBEDDED) {
     _baileys = require('@whiskeysockets/baileys');
     _qrcode = require('qrcode');
     _pino = require('pino');
+    // Deixa o ffmpeg visível no PATH (o motor usa para gerar miniaturas de vídeo)
+    try {
+      const _p = require('path');
+      process.env.PATH = (process.env.PATH || '') + _p.delimiter + _p.dirname(require('@ffmpeg-installer/ffmpeg').path);
+    } catch (_) {}
     console.log('✅ Motor de WhatsApp QR embutido (Baileys) carregado');
   } catch (e) { console.log('⚠️ Baileys não instalado — conexão por QR indisponível:', e.message); }
 }
