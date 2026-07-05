@@ -2099,7 +2099,17 @@ if (WA_EMBEDDED) {
   } catch (e) { console.log('⚠️ Baileys não instalado — conexão por QR indisponível:', e.message); }
 }
 
-const _waSocks = {}, _waState = {}, _waPhone = {};
+const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
+let _waVersion = null;
+
+// Diagnóstico do motor embutido (para depurar sem acesso aos logs)
+app.get('/wa/debug', (req, res) => {
+  const instances = {};
+  for (const k of new Set([...Object.keys(_waSocks), ...Object.keys(_waState)])) {
+    instances[k] = { state: _waState[k] || null, phone: _waPhone[k] || null, err: _waErr[k] || null, temQr: !!qrCache[k] };
+  }
+  res.json({ embedded: WA_EMBEDDED, baileysCarregado: !!_baileys, versaoWA: _waVersion, instances });
+});
 
 // Guarda credenciais/chaves da sessão no Supabase (preserva Buffers via BufferJSON)
 async function useSupabaseAuthState(instance) {
@@ -2144,7 +2154,11 @@ async function waStart(instanceName) {
   if (!_baileys || !supabase) throw new Error('Motor de QR indisponível no servidor');
   if (_waSocks[instanceName]) { try { _waSocks[instanceName].end(undefined); } catch (_) {} delete _waSocks[instanceName]; }
   const { state, saveCreds } = await useSupabaseAuthState(instanceName);
-  const { version } = await _baileys.fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+  const { version } = await _baileys.fetchLatestBaileysVersion().catch(e => {
+    _waErr[instanceName] = 'fetchVersion: ' + e.message;
+    return { version: undefined };
+  });
+  _waVersion = version || 'padrão da lib';
   const sock = _baileys.default({
     version,
     auth: state,
@@ -2161,7 +2175,10 @@ async function waStart(instanceName) {
 
   sock.ev.on('connection.update', (u) => {
     const { connection, qr, lastDisconnect } = u;
-    if (qr && _qrcode) _qrcode.toDataURL(qr).then(url => { qrCache[instanceName] = url; }).catch(() => {});
+    if (qr && _qrcode) {
+      console.log(`📲 QR emitido para ${instanceName}`);
+      _qrcode.toDataURL(qr).then(url => { qrCache[instanceName] = url; }).catch(e => { _waErr[instanceName] = 'qrcode: ' + e.message; });
+    }
     if (connection === 'open') {
       _waState[instanceName] = 'open';
       delete qrCache[instanceName];
@@ -2171,6 +2188,7 @@ async function waStart(instanceName) {
     if (connection === 'close') {
       _waState[instanceName] = 'close';
       const code = lastDisconnect?.error?.output?.statusCode;
+      _waErr[instanceName] = `close ${code || '?'}: ${lastDisconnect?.error?.message || 'sem detalhe'}`;
       if (code === _baileys.DisconnectReason.loggedOut) {
         console.log(`🔌 ${instanceName}: sessão encerrada (logout no celular)`);
         delete _waSocks[instanceName];
