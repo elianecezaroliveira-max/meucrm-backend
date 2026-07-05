@@ -1535,7 +1535,7 @@ app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { account_id, with_messages } = req.query;
   let query = supabase
-    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite")
+    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite, avatar")
     .eq("owner", req.owner || ' ')
     .order("last_message_at", { ascending: false });
   if (account_id) query = query.eq("account_id", account_id); // filtra pela conta quando informada
@@ -2488,6 +2488,27 @@ async function waResolveJid(sock, to) {
   return num + '@s.whatsapp.net';
 }
 
+// Busca a foto de perfil do cliente (1x por contato) e guarda no cofre de mídias
+async function waFetchAvatar(instanceName, phone, owner) {
+  try {
+    const sock = _waSocks[instanceName];
+    if (!sock || !supabase) return;
+    const { data: c } = await supabase.from('contacts').select('avatar')
+      .eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+    if (c && c.avatar) return; // já tem foto
+    const jid = String(phone).endsWith('@lid') ? String(phone) : String(phone).replace(/\D/g, '') + '@s.whatsapp.net';
+    const url = await sock.profilePictureUrl(jid, 'image').catch(() => null);
+    if (!url) return; // sem foto ou privacidade
+    const img = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+    const p = `qr/avatars/${String(phone).replace(/\W/g, '') || Date.now()}.jpg`;
+    const { error: upErr } = await supabase.storage.from('wa-media')
+      .upload(p, Buffer.from(img.data), { contentType: 'image/jpeg', upsert: true });
+    if (upErr) return;
+    await supabase.from('contacts').update({ avatar: p }).eq('phone', phone).eq('owner', owner || ' ');
+    console.log(`🖼️ Foto de perfil salva: ${phone}`);
+  } catch (_) {}
+}
+
 async function waSendText(instanceName, to, text) {
   const sock = _waSocks[instanceName];
   if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
@@ -2769,6 +2790,9 @@ app.post('/evolution-webhook', async (req, res) => {
         if (ownerEmail) contactData.owner = ownerEmail;
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
         if (cErr) console.error('❌ Evolution: erro ao salvar contato:', cErr.message);
+
+        // Foto de perfil do cliente (busca em segundo plano, só se ainda não tiver)
+        if (!fromMe) waFetchAvatar(instanceName, phone, ownerEmail).catch(() => {});
 
         // Incrementa não-lidos só para mensagens RECEBIDAS
         if (!fromMe) {
