@@ -293,6 +293,10 @@ app.post("/webhook", async (req, res) => {
           console.log("✅ Contato salvo:", from);
         }
 
+        // Foto de perfil via motor QR (serve também para contatos da API oficial)
+        const avatarInst = anyOpenWaInstance();
+        if (avatarInst) waFetchAvatar(avatarInst, from, ownerEmail).catch(() => {});
+
         // Incrementa contador de não lidas e marca hora da 1ª mensagem não lida
         const currentUnread = existing?.unread_count || 0;
         const unreadUpdate = { unread_count: currentUnread + 1 };
@@ -2488,6 +2492,12 @@ async function waResolveJid(sock, to) {
   return num + '@s.whatsapp.net';
 }
 
+// Qualquer instância QR conectada (usada como "fotógrafo" para todos os contatos)
+function anyOpenWaInstance() {
+  for (const k in _waSocks) if (_waState[k] === 'open') return k;
+  return null;
+}
+
 // Busca a foto de perfil do cliente (1x por contato) e guarda no cofre de mídias
 async function waFetchAvatar(instanceName, phone, owner) {
   try {
@@ -2532,6 +2542,23 @@ async function initEmbeddedWa() {
       await new Promise(r => setTimeout(r, 1500));
     }
   } catch (e) { console.error('initEmbeddedWa:', e.message); }
+
+  // Varredura inicial: preenche as fotos dos contatos recentes que ainda não têm
+  setTimeout(async () => {
+    try {
+      const inst = anyOpenWaInstance();
+      if (!inst) return;
+      const { data: rows } = await supabase.from('contacts')
+        .select('phone, owner').is('avatar', null)
+        .not('last_message_at', 'is', null)
+        .order('last_message_at', { ascending: false }).limit(40);
+      for (const r of rows || []) {
+        await waFetchAvatar(inst, r.phone, r.owner);
+        await new Promise(rs => setTimeout(rs, 400)); // ritmo suave, sem parecer robô
+      }
+      console.log(`🖼️ Varredura de fotos concluída (${(rows || []).length} contatos verificados)`);
+    } catch (_) {}
+  }, 15000);
 }
 setTimeout(initEmbeddedWa, 2500);
 
