@@ -602,6 +602,30 @@ app.post("/send", async (req, res) => {
 app.post("/react", async (req, res) => {
   const { to, wamid, emoji, account_id } = req.body;
   if (!to || !wamid) return res.status(400).json({ error: "Informe 'to' e 'wamid'" });
+
+  // Conta QR (motor embutido): reage direto pelo WhatsApp pareado
+  if (WA_EMBEDDED && supabase && account_id) {
+    const { data: accQ } = await supabase.from('accounts')
+      .select('type, evolution_instance').eq('id', account_id).maybeSingle();
+    if (accQ?.type === 'evolution' && accQ.evolution_instance) {
+      try {
+        const sock = _waSocks[accQ.evolution_instance];
+        if (!sock || _waState[accQ.evolution_instance] !== 'open')
+          return res.status(400).json({ error: 'WhatsApp QR desconectado — gere o QR novamente em Contas' });
+        const { data: msgRow } = await supabase.from('messages').select('direction').eq('wamid', wamid).maybeSingle();
+        const jid = await waResolveJid(sock, to);
+        await sock.sendMessage(jid, {
+          react: { text: emoji || '', key: { remoteJid: jid, fromMe: msgRow?.direction === 'outbound', id: wamid } },
+        });
+        await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid);
+        return res.json({ success: true, via: 'qr' });
+      } catch (e) {
+        console.error('❌ Reação via QR:', e.message);
+        return res.status(500).json({ error: 'Falha ao reagir pelo WhatsApp QR: ' + e.message });
+      }
+    }
+  }
+
   const acct = await botGetAcct(account_id);
   if (!acct.phone_number_id || !acct.token) return res.status(400).json({ error: "Nenhuma conta configurada." });
   try {
@@ -2288,6 +2312,17 @@ async function waStart(instanceName) {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // Tiques de entrega/leitura das mensagens enviadas por QR (✓✓ e ✓✓ azul)
+  sock.ev.on('messages.update', async (updates) => {
+    if (!supabase) return;
+    for (const u of updates || []) {
+      const st = u.update?.status, id = u.key?.id;
+      if (!st || !id) continue;
+      const mapped = st === 4 || st === 'READ' ? 'read' : (st === 3 || st === 'DELIVERY_ACK' ? 'delivered' : null);
+      if (mapped) { try { await supabase.from('messages').update({ status: mapped }).eq('wamid', id); } catch (_) {} }
+    }
+  });
+
   sock.ev.on('connection.update', (u) => {
     const { connection, qr, lastDisconnect } = u;
     if (qr && _qrcode) {
@@ -2320,6 +2355,18 @@ async function waStart(instanceName) {
     if (type !== 'notify' && type !== 'append') return;
     for (const m of messages || []) {
       if (!m.message) continue;
+      // Reação (emoji sobre uma mensagem) → atualiza a mensagem alvo, não cria nova
+      if (m.message.reactionMessage) {
+        const r = m.message.reactionMessage;
+        if (supabase && r.key?.id) {
+          try {
+            await supabase.from('messages')
+              .update({ reaction: r.text || null, reaction_by: m.key?.fromMe ? 'me' : 'contact' })
+              .eq('wamid', r.key.id);
+          } catch (_) {}
+        }
+        continue;
+      }
       // Baixa a mídia (foto/áudio/vídeo/documento) e guarda no Supabase Storage
       let mediaPath = null, mediaMime = null;
       try {
@@ -2625,7 +2672,8 @@ app.post('/evolution-webhook', async (req, res) => {
         type = 'audio';
       }
       else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
-      else if (msg.documentMessage)       { content = msg.documentMessage.fileName || '[Documento]'; type = 'document'; }
+      else if (msg.documentMessage)       { content = `[Documento: ${msg.documentMessage.fileName || 'arquivo'}]`; type = 'document'; }
+      else if (msg.stickerMessage)        { content = '[Figurinha]'; type = 'sticker'; }
 
       // Busca account_id + dono (owner) — sem o owner a mensagem não aparece no CRM
       let accountId = null;
