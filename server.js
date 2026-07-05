@@ -2083,8 +2083,151 @@ const evoHdr = () => ({ apikey: EVOLUTION_KEY, 'Content-Type': 'application/json
 // Cache de QR Code por instância — preenchido pelo webhook QRCODE_UPDATED (QR assíncrono)
 const qrCache = {};
 
+// ═══════════════════════════════════════
+// MOTOR DE WHATSAPP QR EMBUTIDO (Baileys)
+// Sem Evolution externa configurada, o QR roda DENTRO deste backend — custo zero.
+// Sessões ficam no Supabase (tabela wa_sessions) e sobrevivem a redeploys.
+// ═══════════════════════════════════════
+const WA_EMBEDDED = !process.env.EVOLUTION_API_URL;
+let _baileys = null, _qrcode = null, _pino = null;
+if (WA_EMBEDDED) {
+  try {
+    _baileys = require('@whiskeysockets/baileys');
+    _qrcode = require('qrcode');
+    _pino = require('pino');
+    console.log('✅ Motor de WhatsApp QR embutido (Baileys) carregado');
+  } catch (e) { console.log('⚠️ Baileys não instalado — conexão por QR indisponível:', e.message); }
+}
+
+const _waSocks = {}, _waState = {}, _waPhone = {};
+
+// Guarda credenciais/chaves da sessão no Supabase (preserva Buffers via BufferJSON)
+async function useSupabaseAuthState(instance) {
+  const { initAuthCreds, BufferJSON, proto } = _baileys;
+  const read = async (key) => {
+    const { data } = await supabase.from('wa_sessions').select('data').eq('instance', instance).eq('key', key).maybeSingle();
+    return data ? JSON.parse(JSON.stringify(data.data), BufferJSON.reviver) : null;
+  };
+  const write = async (key, value) => {
+    await supabase.from('wa_sessions').upsert(
+      { instance, key, data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)), updated_at: new Date().toISOString() },
+      { onConflict: 'instance,key' });
+  };
+  const del = async (key) => { await supabase.from('wa_sessions').delete().eq('instance', instance).eq('key', key); };
+  const creds = (await read('creds')) || initAuthCreds();
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const out = {};
+          for (const id of ids) {
+            let v = await read(`${type}-${id}`);
+            if (type === 'app-state-sync-key' && v) v = proto.Message.AppStateSyncKeyData.fromObject(v);
+            out[id] = v;
+          }
+          return out;
+        },
+        set: async (data) => {
+          for (const type in data) for (const id in data[type]) {
+            const v = data[type][id];
+            if (v) await write(`${type}-${id}`, v); else await del(`${type}-${id}`);
+          }
+        },
+      },
+    },
+    saveCreds: async () => write('creds', creds),
+  };
+}
+
+async function waStart(instanceName) {
+  if (!_baileys || !supabase) throw new Error('Motor de QR indisponível no servidor');
+  if (_waSocks[instanceName]) { try { _waSocks[instanceName].end(undefined); } catch (_) {} delete _waSocks[instanceName]; }
+  const { state, saveCreds } = await useSupabaseAuthState(instanceName);
+  const { version } = await _baileys.fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+  const sock = _baileys.default({
+    version,
+    auth: state,
+    logger: _pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: ['VETRA CRM', 'Chrome', '120.0'],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+  });
+  _waSocks[instanceName] = sock;
+  _waState[instanceName] = 'connecting';
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (u) => {
+    const { connection, qr, lastDisconnect } = u;
+    if (qr && _qrcode) _qrcode.toDataURL(qr).then(url => { qrCache[instanceName] = url; }).catch(() => {});
+    if (connection === 'open') {
+      _waState[instanceName] = 'open';
+      delete qrCache[instanceName];
+      _waPhone[instanceName] = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
+      console.log(`✅ WhatsApp QR conectado: ${instanceName} (${_waPhone[instanceName]})`);
+    }
+    if (connection === 'close') {
+      _waState[instanceName] = 'close';
+      const code = lastDisconnect?.error?.output?.statusCode;
+      if (code === _baileys.DisconnectReason.loggedOut) {
+        console.log(`🔌 ${instanceName}: sessão encerrada (logout no celular)`);
+        delete _waSocks[instanceName];
+        supabase.from('wa_sessions').delete().eq('instance', instanceName).then(() => {}, () => {});
+      } else if (_waSocks[instanceName] === sock) {
+        console.log(`↩️ ${instanceName}: reconectando em 4s (código ${code || '?'})`);
+        setTimeout(() => waStart(instanceName).catch(e => console.error('WA reconnect:', e.message)), 4000);
+      }
+    }
+  });
+
+  // Mensagens recebidas → reaproveita TODO o fluxo existente do /evolution-webhook
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify' && type !== 'append') return;
+    for (const m of messages || []) {
+      if (!m.message) continue;
+      try {
+        await axios.post(`http://127.0.0.1:${PORT}/evolution-webhook`, {
+          event: 'messages.upsert',
+          instance: instanceName,
+          data: {
+            key: m.key,
+            pushName: m.pushName || '',
+            messageTimestamp: Number(m.messageTimestamp) || Math.floor(Date.now() / 1000),
+            message: m.message,
+          },
+        }, { timeout: 10000 });
+      } catch (e) { console.error('WA→webhook interno:', e.message); }
+    }
+  });
+  return sock;
+}
+
+async function waSendText(instanceName, to, text) {
+  const sock = _waSocks[instanceName];
+  if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
+  const jid = String(to).replace(/\D/g, '') + '@s.whatsapp.net';
+  return await sock.sendMessage(jid, { text });
+}
+
+// Reconecta as contas QR já cadastradas quando o servidor sobe
+async function initEmbeddedWa() {
+  if (!WA_EMBEDDED || !_baileys || !supabase) return;
+  try {
+    const { data } = await supabase.from('accounts').select('evolution_instance').eq('type', 'evolution');
+    for (const a of data || []) {
+      if (!a.evolution_instance) continue;
+      waStart(a.evolution_instance).catch(e => console.error('WA boot:', a.evolution_instance, e.message));
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  } catch (e) { console.error('initEmbeddedWa:', e.message); }
+}
+setTimeout(initEmbeddedWa, 2500);
+
 // Envia mensagem via Evolution API
 async function sendViaEvolution(instanceName, to, text) {
+  if (WA_EMBEDDED) return await waSendText(instanceName, to, text); // motor embutido
   // Evolution API v2: body usa "text" direto
   const r = await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
     number: to,
@@ -2097,6 +2240,18 @@ async function sendViaEvolution(instanceName, to, text) {
 // POST /evolution/connect — limpa instâncias antigas, cria nova e retorna QR
 app.post('/evolution/connect', async (req, res) => {
   const instanceName = `meucrm_${Date.now()}`;
+  if (WA_EMBEDDED) {
+    try {
+      await waStart(instanceName);
+      let qr = null;
+      for (let i = 0; i < 16 && !qr; i++) { await new Promise(r => setTimeout(r, 500)); qr = qrCache[instanceName] || null; }
+      console.log(`Instância embutida criada: ${instanceName}, QR: ${qr ? 'SIM' : 'NAO (polling)'}`);
+      return res.json({ success: true, instance: instanceName, qr });
+    } catch (e) {
+      console.error('WA connect error:', e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
   try {
     // 1. Limpa instâncias antigas desconectadas (evita acúmulo)
     try {
@@ -2165,6 +2320,7 @@ app.get('/evolution/qr/:instance', async (req, res) => {
   if (qrCache[req.params.instance]) {
     return res.json({ qr: qrCache[req.params.instance], code: null, pairingCode: null, raw: { cached: true } });
   }
+  if (WA_EMBEDDED) return res.json({ qr: null, code: null, pairingCode: null, raw: { embedded: true } });
   try {
     // Evolution API v2: o QR vem de GET /instance/connect/:instance
     // Resposta: { pairingCode, code, base64, count }
@@ -2200,6 +2356,9 @@ app.get('/evolution/debug', async (req, res) => {
 
 // GET /evolution/status/:instance — verifica estado (Evolution API v2)
 app.get('/evolution/status/:instance', async (req, res) => {
+  if (WA_EMBEDDED) {
+    return res.json({ state: _waState[req.params.instance] || 'close', phone: _waPhone[req.params.instance] || null });
+  }
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/connectionState/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
     console.log('Evolution status raw:', JSON.stringify(data).substring(0, 200));
@@ -2227,7 +2386,7 @@ app.post('/evolution/save-account', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const name = phone ? `WhatsApp ${phone}` : `WhatsApp QR (${instance})`;
   const { data, error } = await supabase.from('accounts')
-    .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '' }, { onConflict: 'phone_number_id' })
+    .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '', owner: req.owner || null }, { onConflict: 'phone_number_id' })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   console.log('✅ Conta Evolution salva:', name);
@@ -2236,9 +2395,26 @@ app.post('/evolution/save-account', async (req, res) => {
 
 // DELETE /evolution/disconnect/:instance
 app.delete('/evolution/disconnect/:instance', async (req, res) => {
+  const inst = req.params.instance;
+  if (WA_EMBEDDED) {
+    try {
+      const sock = _waSocks[inst];
+      if (sock) {
+        try { await sock.logout(); } catch (_) {}
+        try { sock.end(undefined); } catch (_) {}
+        delete _waSocks[inst];
+      }
+      delete _waState[inst]; delete _waPhone[inst]; delete qrCache[inst];
+      if (supabase) {
+        await supabase.from('wa_sessions').delete().eq('instance', inst);
+        await supabase.from('accounts').delete().eq('evolution_instance', inst);
+      }
+      return res.json({ success: true });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
   try {
-    await axios.delete(`${EVOLUTION_URL}/instance/delete/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
-    if (supabase) await supabase.from('accounts').delete().eq('evolution_instance', req.params.instance);
+    await axios.delete(`${EVOLUTION_URL}/instance/delete/${inst}`, { headers: evoHdr(), timeout: 10000 });
+    if (supabase) await supabase.from('accounts').delete().eq('evolution_instance', inst);
     res.json({ success: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
