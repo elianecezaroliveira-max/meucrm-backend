@@ -689,12 +689,69 @@ app.post("/send-media", async (req, res) => {
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
 
-  let phoneNumberId, token;
+  let phoneNumberId, token, accountType = 'cloudapi', evolutionInstance = null;
   if (supabase && account_id) {
     const { data: account } = await supabase
-      .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
-    if (account) { phoneNumberId = account.phone_number_id; token = account.token; }
+      .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).single();
+    if (account) {
+      phoneNumberId = account.phone_number_id; token = account.token;
+      accountType = account.type || 'cloudapi'; evolutionInstance = account.evolution_instance || null;
+    }
   }
+
+  // ── Conta QR (motor embutido): envia a mídia direto pelo WhatsApp pareado ──
+  if (accountType === 'evolution' && evolutionInstance && WA_EMBEDDED) {
+    try {
+      const sock = _waSocks[evolutionInstance];
+      if (!sock || _waState[evolutionInstance] !== 'open')
+        return res.status(400).json({ error: 'WhatsApp QR desconectado — gere o QR novamente em Contas' });
+      let fileBuf = Buffer.from(fileBase64, "base64");
+      const baseMime = String(mimeType).split(";")[0].trim();
+      const jid = String(to).replace(/\D/g, '') + '@s.whatsapp.net';
+      const durSecs = Number(req.body.duration) || 0;
+      let sent, content, msgType;
+      if (baseMime.startsWith('audio/')) {
+        if (baseMime !== 'audio/ogg') {
+          try { fileBuf = await convertAudioToOpus(fileBuf); }
+          catch (e) { console.error('⚠️ Conversão (QR) falhou, enviando original:', e.message); }
+        }
+        sent = await sock.sendMessage(jid, {
+          audio: fileBuf, mimetype: 'audio/ogg; codecs=opus',
+          ptt: req.body.voice === true, seconds: durSecs || undefined,
+        });
+        msgType = 'audio';
+        content = req.body.voice === true
+          ? '🎤 Mensagem de voz' + (durSecs ? ` (${_fmtDur(durSecs)})` : '')
+          : `[Áudio: ${fileName}]`;
+      } else if (baseMime.startsWith('image/')) {
+        sent = await sock.sendMessage(jid, { image: fileBuf, mimetype: baseMime });
+        msgType = 'image'; content = `[Imagem: ${fileName}]`;
+      } else if (baseMime.startsWith('video/')) {
+        sent = await sock.sendMessage(jid, { video: fileBuf, mimetype: baseMime });
+        msgType = 'video'; content = `[Vídeo: ${fileName}]`;
+      } else {
+        sent = await sock.sendMessage(jid, { document: fileBuf, mimetype: baseMime, fileName });
+        msgType = 'document'; content = `[Documento: ${fileName}]`;
+      }
+      if (supabase) {
+        const wamid = sent?.key?.id || null;
+        await supabase.from('contacts').upsert(
+          { phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null,
+            last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
+          { onConflict: 'owner,phone' });
+        await supabase.from('messages').insert({
+          phone: to, content, type: msgType, direction: 'outbound',
+          timestamp: new Date().toISOString(), account_id: account_id || null,
+          status: 'sent', wamid, owner: req.owner || null });
+      }
+      console.log(`📤 Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
+      return res.json({ success: true, via: 'qr' });
+    } catch (e) {
+      console.error('❌ Mídia via QR:', e.message);
+      return res.status(500).json({ error: 'Falha ao enviar pelo WhatsApp QR: ' + e.message });
+    }
+  }
+
   if (!phoneNumberId || !token) {
     phoneNumberId = process.env.PHONE_NUMBER_ID;
     token = process.env.WHATSAPP_TOKEN;
