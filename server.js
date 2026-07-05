@@ -735,6 +735,16 @@ app.post("/send-media", async (req, res) => {
       }
       if (supabase) {
         const wamid = sent?.key?.id || null;
+        // Guarda a mídia enviada para poder reproduzi-la no CRM
+        let mediaPathOut = null;
+        const outMime = msgType === 'audio' ? 'audio/ogg' : baseMime;
+        try {
+          const extOut = (outMime.split('/')[1] || 'bin').split('+')[0];
+          mediaPathOut = `qr/${evolutionInstance}/out_${wamid || Date.now()}.${extOut}`;
+          const { error: upErr } = await supabase.storage.from('wa-media')
+            .upload(mediaPathOut, fileBuf, { contentType: outMime, upsert: true });
+          if (upErr) { console.error('Storage (saída):', upErr.message); mediaPathOut = null; }
+        } catch (_) { mediaPathOut = null; }
         await supabase.from('contacts').upsert(
           { phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null,
             last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
@@ -742,7 +752,8 @@ app.post("/send-media", async (req, res) => {
         await supabase.from('messages').insert({
           phone: to, content, type: msgType, direction: 'outbound',
           timestamp: new Date().toISOString(), account_id: account_id || null,
-          status: 'sent', wamid, owner: req.owner || null });
+          status: 'sent', wamid, owner: req.owner || null,
+          media_id: mediaPathOut, media_mime_type: mediaPathOut ? outMime : null });
       }
       console.log(`📤 Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
       return res.json({ success: true, via: 'qr' });
@@ -870,6 +881,46 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     if (account?.token) token = account.token;
   }
   if (!token) return res.status(400).json({ error: "Token não encontrado" });
+
+  // Mídia de conta QR: servida do Supabase Storage (com suporte a Range para áudio/vídeo)
+  if (mediaId.startsWith('qr/')) {
+    try {
+      if (!supabase) return res.status(500).json({ error: 'Storage indisponível' });
+      const { data: blob, error } = await supabase.storage.from('wa-media').download(mediaId);
+      if (error || !blob) return res.status(404).json({ error: 'Mídia não encontrada' });
+      const buf = Buffer.from(await blob.arrayBuffer());
+      const total = buf.length;
+      const ctype = req.query.mime || blob.type || 'application/octet-stream';
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Type', ctype);
+      if (download === '1') {
+        const safeFilename = (filename ? decodeURIComponent(filename) : 'midia').replace(/["\r\n]/g, '');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+        res.setHeader('Content-Length', total);
+        return res.status(200).end(buf);
+      }
+      res.setHeader('Cache-Control', 'public, max-age=600');
+      const range = req.headers.range;
+      if (range) {
+        const m = /bytes=(\d*)-(\d*)/.exec(range);
+        let start = m && m[1] !== '' ? parseInt(m[1], 10) : 0;
+        let end   = m && m[2] !== '' ? parseInt(m[2], 10) : total - 1;
+        if (isNaN(start)) start = 0;
+        if (isNaN(end) || end >= total) end = total - 1;
+        if (start > end || start >= total) { res.setHeader('Content-Range', `bytes */${total}`); return res.status(416).end(); }
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+        res.setHeader('Content-Length', end - start + 1);
+        return res.end(buf.subarray(start, end + 1));
+      }
+      res.setHeader('Content-Length', total);
+      return res.status(200).end(buf);
+    } catch (e) {
+      console.error('❌ Mídia QR:', e.message);
+      return res.status(500).json({ error: 'Falha ao carregar mídia' });
+    }
+  }
 
   const cacheKey = `${mediaId}_${token.substring(0, 20)}`;
 
@@ -2229,7 +2280,8 @@ async function waStart(instanceName) {
     // pareamento falhar com "não foi possível conectar novos dispositivos"
     browser: _baileys.Browsers ? _baileys.Browsers.macOS('Google Chrome') : ['Mac OS', 'Chrome', '120.0.0'],
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    // "online" = o WhatsApp entrega as mensagens na hora (offline ele segura/atrasa)
+    markOnlineOnConnect: true,
   });
   _waSocks[instanceName] = sock;
   _waState[instanceName] = 'connecting';
@@ -2268,11 +2320,28 @@ async function waStart(instanceName) {
     if (type !== 'notify' && type !== 'append') return;
     for (const m of messages || []) {
       if (!m.message) continue;
+      // Baixa a mídia (foto/áudio/vídeo/documento) e guarda no Supabase Storage
+      let mediaPath = null, mediaMime = null;
+      try {
+        const mm = m.message.imageMessage || m.message.audioMessage || m.message.videoMessage
+                || m.message.documentMessage || m.message.stickerMessage;
+        if (mm && supabase) {
+          const buf = await _baileys.downloadMediaMessage(m, 'buffer', {}, {
+            logger: _pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
+          mediaMime = (mm.mimetype || 'application/octet-stream').split(';')[0];
+          const ext = mediaMime.split('/')[1] || 'bin';
+          mediaPath = `qr/${instanceName}/${(m.key.id || Date.now())}.${ext}`;
+          const { error: upErr } = await supabase.storage.from('wa-media')
+            .upload(mediaPath, buf, { contentType: mediaMime, upsert: true });
+          if (upErr) { console.error('Storage upload:', upErr.message); mediaPath = null; }
+        }
+      } catch (me) { console.error('Download de mídia QR:', me.message); mediaPath = null; }
       try {
         await axios.post(`http://127.0.0.1:${PORT}/evolution-webhook`, {
           event: 'messages.upsert',
           instance: instanceName,
           data: {
+            mediaPath, mediaMime,
             key: m.key,
             // Quando o contato usa o id oculto (@lid), o Baileys entrega o número
             // real em senderPn — preferimos ele para a conversa ficar no telefone certo
@@ -2312,6 +2381,11 @@ async function waSendText(instanceName, to, text) {
 // Reconecta as contas QR já cadastradas quando o servidor sobe
 async function initEmbeddedWa() {
   if (!WA_EMBEDDED || !_baileys || !supabase) return;
+  // Garante o "cofre" de mídias das contas QR (ignora se já existir)
+  try {
+    const { error: bErr } = await supabase.storage.createBucket('wa-media', { public: false });
+    if (!bErr) console.log('🗂️ Bucket wa-media criado');
+  } catch (_) {}
   try {
     const { data } = await supabase.from('accounts').select('evolution_instance').eq('type', 'evolution');
     for (const a of data || []) {
@@ -2590,6 +2664,7 @@ app.post('/evolution-webhook', async (req, res) => {
         const msgData = { phone, content, type, direction, timestamp, wamid };
         if (accountId) msgData.account_id = accountId;
         if (ownerEmail) msgData.owner = ownerEmail;
+        if (data.mediaPath) { msgData.media_id = data.mediaPath; msgData.media_mime_type = data.mediaMime || null; }
         const { error: mErr } = await supabase.from('messages').insert(msgData);
         if (mErr) console.error('❌ Evolution: erro ao salvar mensagem:', mErr.message);
 
