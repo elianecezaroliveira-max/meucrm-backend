@@ -21,7 +21,7 @@ if (SUPABASE_URL && SUPABASE_KEY) {
 }
 
 // ── Multi-tenant: identifica o usuário logado (dono) a partir do token do Supabase ──
-const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlmcnhneWhreWdxaGpyd3Brc3J5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1Mjk4MDcsImV4cCI6MjA5NDEwNTgwN30.6vjbaJdWk-u55xegMrHnv64pvlo0DByfPdtDSj2C7z4';
+const SUPABASE_ANON = process.env.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_xoU54iyT3KyxNR6i7fh3aw_1qpEKpua';
 const _tokenOwner = {}; // cache token -> { email, ts }
 async function resolveOwner(req) {
   const a = req.headers.authorization || '';
