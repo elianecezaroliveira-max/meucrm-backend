@@ -2168,7 +2168,9 @@ async function waStart(instanceName) {
     auth: state,
     logger: _pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: ['VETRA CRM', 'Chrome', '120.0'],
+    // Identidade reconhecida pelo WhatsApp — nomes personalizados fazem o
+    // pareamento falhar com "não foi possível conectar novos dispositivos"
+    browser: _baileys.Browsers ? _baileys.Browsers.macOS('Google Chrome') : ['Mac OS', 'Chrome', '120.0.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
