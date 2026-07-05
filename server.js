@@ -707,7 +707,7 @@ app.post("/send-media", async (req, res) => {
         return res.status(400).json({ error: 'WhatsApp QR desconectado — gere o QR novamente em Contas' });
       let fileBuf = Buffer.from(fileBase64, "base64");
       const baseMime = String(mimeType).split(";")[0].trim();
-      const jid = String(to).replace(/\D/g, '') + '@s.whatsapp.net';
+      const jid = await waResolveJid(sock, to); // endereço real (resolve o nono dígito)
       const durSecs = Number(req.body.duration) || 0;
       let sent, content, msgType;
       if (baseMime.startsWith('audio/')) {
@@ -2285,10 +2285,21 @@ async function waStart(instanceName) {
   return sock;
 }
 
+// Descobre o "endereço" (JID) REAL do número no WhatsApp — resolve o nono dígito.
+// Enviar para a variante errada não dá erro: a mensagem simplesmente não chega.
+async function waResolveJid(sock, to) {
+  const num = String(to).replace(/\D/g, '');
+  try {
+    const r = await sock.onWhatsApp(num);
+    if (r && r[0] && r[0].exists && r[0].jid) return r[0].jid;
+  } catch (e) { console.warn('onWhatsApp falhou, usando número direto:', e.message); }
+  return num + '@s.whatsapp.net';
+}
+
 async function waSendText(instanceName, to, text) {
   const sock = _waSocks[instanceName];
   if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
-  const jid = String(to).replace(/\D/g, '') + '@s.whatsapp.net';
+  const jid = await waResolveJid(sock, to);
   return await sock.sendMessage(jid, { text });
 }
 
