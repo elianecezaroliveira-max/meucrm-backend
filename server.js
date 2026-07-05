@@ -31,8 +31,18 @@ async function resolveOwner(req) {
   if (c && Date.now() - c.ts < 300000) return c.email;
   try {
     const r = await axios.get(`${SUPABASE_URL}/auth/v1/user`, { headers: { Authorization: 'Bearer ' + tok, apikey: SUPABASE_ANON } });
-    const email = (r.data?.email || '').toLowerCase() || null;
-    if (email) _tokenOwner[tok] = { email, ts: Date.now() };
+    let email = (r.data?.email || '').toLowerCase() || null;
+    // Cofre compartilhado: todo e-mail autenticado enxerga o cofre principal.
+    // 1) 'owner_aliases' mapeia e-mails específicos; 2) 'owner_default' vale para
+    // todos os demais — assim novos membros só precisam entrar na lista de login.
+    if (email) {
+      try {
+        const aliases = JSON.parse(_settings['owner_aliases'] || '{}');
+        if (aliases[email]) email = String(aliases[email]).toLowerCase();
+        else if (_settings['owner_default']) email = String(_settings['owner_default']).toLowerCase();
+      } catch (_) {}
+      _tokenOwner[tok] = { email, ts: Date.now() };
+    }
     return email;
   } catch (e) { return null; }
 }
@@ -2123,6 +2133,7 @@ async function loadSettings() {
   } catch(e) { console.error('Settings load error:', e.message); }
 }
 loadSettings();
+setInterval(loadSettings, 5 * 60 * 1000); // recarrega settings (ex.: novos membros da equipe) sem precisar de redeploy
 
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
@@ -2771,6 +2782,7 @@ app.post('/evolution-webhook', async (req, res) => {
       // Prefere o número REAL (senderPn) quando o contato usa o id oculto @lid
       const remoteJid = (!data.key?.fromMe && data.senderPn) ? data.senderPn : (data.key?.remoteJid || '');
       if (remoteJid.includes('@g.us')) return; // ignora grupos
+      if (remoteJid.includes('@broadcast') || remoteJid.includes('@newsletter')) return; // ignora status/canais
 
       let phone       = remoteJid.replace('@s.whatsapp.net', '');
       const name      = data.pushName || phone;
