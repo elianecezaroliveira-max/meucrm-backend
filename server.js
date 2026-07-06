@@ -593,7 +593,7 @@ app.post("/send", async (req, res) => {
       const { error: msgErr } = await supabase.from("messages").insert({
         phone: to, content: message, type: "text", direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'sent', wamid, owner: req.owner || null,
+        status: 'pending', wamid, owner: req.owner || null,
         quoted_id: quoted_id || null,
         quoted_content: quoted_content || null,
         quoted_direction: quoted_direction || null,
@@ -943,7 +943,7 @@ app.post("/send-media", async (req, res) => {
         phone: to, content,
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'sent', wamid: mediaWamid, owner: req.owner || null,
+        status: 'pending', wamid: mediaWamid, owner: req.owner || null,
         media_id: mediaId, media_mime_type: sendMime, // permite exibir a mídia no CRM
       });
       await applyPendingStatus(mediaWamid);
@@ -1486,7 +1486,7 @@ app.post("/send-template", async (req, res) => {
     await supabase.from("messages").insert({
       phone: to, content: shownText, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
-      status: 'sent', wamid: tplWamid, owner: req.owner || null,
+      status: 'pending', wamid: tplWamid, owner: req.owner || null,
     });
     await applyPendingStatus(tplWamid);
     console.log("✅ Template enviado:", template_name, "→", to, "wamid:", tplWamid);
@@ -1661,7 +1661,7 @@ async function sendBotMsg(phone, accountId, text, owner) {
     const wamid = r.data?.messages?.[0]?.id || null;
     if (supabase) {
       const ts = new Date().toISOString();
-      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'sent', wamid, owner:owner||null });
+      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'pending', wamid, owner:owner||null });
       await applyPendingStatus(wamid); // aplica status que chegou antes do insert
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
@@ -1730,7 +1730,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
       const tWamid = r.data?.messages?.[0]?.id || null;
-      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'sent', wamid: tWamid, owner: owner || null });
+      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
     }
@@ -2324,12 +2324,32 @@ const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
 let _waVersion = null;
 
 // Diagnóstico do motor embutido (para depurar sem acesso aos logs)
-app.get('/wa/debug', (req, res) => {
+app.get('/wa/debug', async (req, res) => {
   const instances = {};
   for (const k of new Set([...Object.keys(_waSocks), ...Object.keys(_waState)])) {
     instances[k] = { state: _waState[k] || null, phone: _waPhone[k] || null, err: _waErr[k] || null, temQr: !!qrCache[k] };
   }
-  res.json({ embedded: WA_EMBEDDED, baileysCarregado: !!_baileys, versaoWA: _waVersion, instances });
+  let contatosComFoto = null;
+  try {
+    const { count } = await supabase.from('contacts').select('phone', { count: 'exact', head: true }).not('avatar', 'is', null);
+    contatosComFoto = count;
+  } catch (_) {}
+  res.json({ embedded: WA_EMBEDDED, baileysCarregado: !!_baileys, versaoWA: _waVersion, contatosComFoto, instances });
+});
+
+// Serve a foto de perfil (rota simples, sem barra codificada na URL)
+app.get('/avatar/:file', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).end();
+    const file = String(req.params.file).replace(/[^\w.\-]/g, '');
+    const { data: blob, error } = await supabase.storage.from('wa-media').download(`qr/avatars/${file}`);
+    if (error || !blob) return res.status(404).end();
+    const buf = Buffer.from(await blob.arrayBuffer());
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.end(buf);
+  } catch (e) { res.status(500).end(); }
 });
 
 // Guarda credenciais/chaves da sessão no Supabase (preserva Buffers via BufferJSON)
@@ -2554,11 +2574,15 @@ async function initEmbeddedWa() {
     }
   } catch (e) { console.error('initEmbeddedWa:', e.message); }
 
-  // Varredura inicial: preenche as fotos dos contatos recentes que ainda não têm
-  setTimeout(async () => {
+  // Varredura de fotos: espera alguma instância QR abrir (re-tenta por ~3 min)
+  let _sweepTries = 0;
+  const _avatarSweep = async () => {
     try {
       const inst = anyOpenWaInstance();
-      if (!inst) return;
+      if (!inst) {
+        if (++_sweepTries < 10) setTimeout(_avatarSweep, 20000);
+        return;
+      }
       const { data: rows } = await supabase.from('contacts')
         .select('phone, owner').is('avatar', null)
         .not('last_message_at', 'is', null)
@@ -2568,8 +2592,9 @@ async function initEmbeddedWa() {
         await new Promise(rs => setTimeout(rs, 400)); // ritmo suave, sem parecer robô
       }
       console.log(`🖼️ Varredura de fotos concluída (${(rows || []).length} contatos verificados)`);
-    } catch (_) {}
-  }, 15000);
+    } catch (e) { console.error('Varredura de fotos:', e.message); }
+  };
+  setTimeout(_avatarSweep, 20000);
 }
 setTimeout(initEmbeddedWa, 2500);
 
