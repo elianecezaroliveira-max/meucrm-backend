@@ -280,7 +280,7 @@ app.post("/webhook", async (req, res) => {
       if (supabase) {
         // Já existe? (para NÃO sobrescrever o nome que o usuário editou manualmente)
         const { data: existing } = await supabase
-          .from("contacts").select("name, unread_count, first_unread_at").eq("phone", from).eq("owner", ownerEmail || ' ').maybeSingle();
+          .from("contacts").select("name, unread_count, first_unread_at, account_id").eq("phone", from).eq("owner", ownerEmail || ' ').maybeSingle();
 
         // Salva contato com prévia da última mensagem
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
@@ -290,7 +290,9 @@ app.post("/webhook", async (req, res) => {
           last_message_direction: 'inbound',
         };
         if (!existing) contactData.name = name; // só define o nome do WhatsApp na CRIAÇÃO; depois respeita o editado
-        if (accountId) contactData.account_id = accountId;
+        // NÚMERO da conversa: mantém o número do ÚLTIMO ENVIO seu. Mensagem recebida
+        // NÃO troca o número; só define quando o contato é novo ou ainda não tem número.
+        if (accountId && (!existing || existing.account_id == null)) contactData.account_id = accountId;
         if (ownerEmail) contactData.owner = ownerEmail; // dono = dono da conta de WhatsApp
 
         const { error: contactErr } = await supabase
@@ -2930,18 +2932,14 @@ app.post('/evolution-webhook', async (req, res) => {
 
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
         const contactData = { phone, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
-        if (accountId) contactData.account_id = accountId;
         if (ownerEmail) contactData.owner = ownerEmail;
-        // NOME do contato:
-        //  - mensagem RECEBIDA: o pushName é o nome do LEAD → usa.
-        //  - mensagem ENVIADA (fromMe): o pushName é o SEU nome → NÃO sobrescreve o lead.
-        //    Só define um fallback (o telefone) quando o contato ainda não existe.
-        if (!fromMe) {
-          contactData.name = name;
-        } else {
-          const { data: exist } = await supabase.from('contacts').select('id').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
-          if (!exist) contactData.name = phone;
-        }
+        // Estado atual do contato (para decidir NOME e NÚMERO sem sobrescrever indevidamente)
+        const { data: existC } = await supabase.from('contacts').select('id, account_id').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
+        // NOME: recebida → nome do lead (pushName). Enviada (fromMe) → é o SEU nome, não mexe (só fallback p/ novo).
+        if (!fromMe) contactData.name = name;
+        else if (!existC) contactData.name = phone;
+        // NÚMERO da conversa: seu envio (fromMe) fixa no número usado; recebida só define se ainda não houver.
+        if (accountId && (fromMe || !existC || existC.account_id == null)) contactData.account_id = accountId;
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
         if (cErr) console.error('❌ Evolution: erro ao salvar contato:', cErr.message);
 
