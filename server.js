@@ -2849,9 +2849,19 @@ app.post('/evolution-webhook', async (req, res) => {
         }
 
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
-        const contactData = { phone, name, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
+        const contactData = { phone, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
         if (accountId) contactData.account_id = accountId;
         if (ownerEmail) contactData.owner = ownerEmail;
+        // NOME do contato:
+        //  - mensagem RECEBIDA: o pushName é o nome do LEAD → usa.
+        //  - mensagem ENVIADA (fromMe): o pushName é o SEU nome → NÃO sobrescreve o lead.
+        //    Só define um fallback (o telefone) quando o contato ainda não existe.
+        if (!fromMe) {
+          contactData.name = name;
+        } else {
+          const { data: exist } = await supabase.from('contacts').select('id').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
+          if (!exist) contactData.name = phone;
+        }
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
         if (cErr) console.error('❌ Evolution: erro ao salvar contato:', cErr.message);
 
