@@ -348,6 +348,10 @@ app.post("/webhook", async (req, res) => {
         if (['text','button','interactive'].includes(type) && content) {
           try { await handleBotReply(from, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
         }
+        // IA / FAQ: resposta automática só para perguntas cadastradas
+        if (['text','button','interactive'].includes(type) && content) {
+          try { await handleFaqAutoReply(from, content, ownerEmail, accountId); } catch(fe) { console.error('FAQ auto-reply error:', fe.message); }
+        }
         // Encaminha para N8N se configurado
         const n8nUrl = _settings['n8n_webhook_url'];
         if (n8nUrl) {
@@ -2004,6 +2008,181 @@ setInterval(async () => {
     else { await stopRun(run.id,'completed'); }
   }
 }, 5000);
+
+// ═══════════════════════════════════════════════════════════════════
+//  IA / FAQ — responde automaticamente SÓ a perguntas cadastradas
+// ═══════════════════════════════════════════════════════════════════
+
+// Normaliza texto: minúsculas, sem acento, sem pontuação, espaços colapsados
+function _faqNorm(s) {
+  return (s || '')
+    .toString()
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '') // remove acentos (marcas combinantes)
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')                // pontuação -> espaço
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Palavras muito comuns (não contam na comparação por palavras-chave)
+const _FAQ_STOP = new Set(('de a o que e do da em um para com nao uma os no se na por mais as dos ' +
+  'como mas ao ele das a seu sua ou quando muito nos ja eu tambem so pelo pela ate isso ela entre ' +
+  'era depois sem mesmo aos seus quem nas me esse eles voce essa num nem suas meu as minha numa ' +
+  'pelos elas qual nos lhe deles essas esses pelas este dele tu te voces vos ai oi ola bom dia boa ' +
+  'tarde noite por favor gostaria queria quero saber sobre voce voces tem teria').split(' '));
+
+function _faqTokens(norm) {
+  return norm.split(' ').filter(t => t && t.length > 1 && !_FAQ_STOP.has(t));
+}
+
+// Uma palavra "casa" se for igual OU prefixo (>=4 letras) — tolera conjugação/plural
+// ex.: fica/ficam, preco/precos, entreg/entrega
+function _faqTokHit(kw, msgTokens) {
+  return msgTokens.some(m => m === kw || (kw.length >= 4 && (m.startsWith(kw) || kw.startsWith(m))));
+}
+
+// Pontua o quão bem a mensagem casa com UM gatilho (0 a 1)
+function _faqScoreTrigger(msgNorm, msgTokens, trigger) {
+  const tNorm = _faqNorm(trigger);
+  if (!tNorm) return 0;
+
+  // modo palavras-chave: gatilho com vírgula = TODAS as palavras precisam aparecer
+  if (trigger.includes(',')) {
+    const groups = tNorm.split(' ').filter(Boolean); // já sem vírgula após normalizar
+    const kws = _faqTokens(tNorm);
+    const need = kws.length ? kws : groups;
+    if (!need.length) return 0;
+    const hit = need.every(k => _faqTokHit(k, msgTokens));
+    return hit ? 0.95 : 0;
+  }
+
+  // frase exata
+  if (msgNorm === tNorm) return 1;
+  // frase contida na mensagem (com limites de palavra)
+  if ((' ' + msgNorm + ' ').includes(' ' + tNorm + ' ')) return 0.95;
+
+  // sobreposição de palavras-chave (quantas palavras do gatilho aparecem na msg)
+  const tTokens = _faqTokens(tNorm);
+  if (!tTokens.length) return 0;
+  const inter = tTokens.filter(t => _faqTokHit(t, msgTokens)).length;
+  const ratio = inter / tTokens.length;
+  if (ratio >= 0.8) return 0.85;
+  if (ratio >= 0.6) return 0.7;
+  return 0;
+}
+
+// Escolhe o melhor FAQ para uma mensagem. Retorna { faq, score } ou null.
+// (Estruturado para, no futuro, trocar/complementar por um LLM sem mexer no resto.)
+async function matchFaq(text, owner) {
+  if (!supabase || !text) return null;
+  let q = supabase.from('faqs').select('*').eq('enabled', true);
+  q = owner ? q.eq('owner', owner) : q.is('owner', null);
+  const { data: faqs } = await q;
+  if (!faqs || !faqs.length) return null;
+
+  const msgNorm = _faqNorm(text);
+  const msgTokens = _faqTokens(msgNorm);
+  const THRESHOLD = 0.6;
+
+  let best = null;
+  for (const faq of faqs) {
+    // gatilhos = 1 por linha; se vazio, usa a própria pergunta como gatilho
+    const lines = (faq.triggers || '').split('\n').map(s => s.trim()).filter(Boolean);
+    if (!lines.length && faq.question) lines.push(faq.question);
+    let score = 0;
+    for (const line of lines) {
+      const s = _faqScoreTrigger(msgNorm, msgTokens, line);
+      if (s > score) score = s;
+      if (score >= 1) break;
+    }
+    if (score >= THRESHOLD && (!best || score > best.score)) best = { faq, score };
+  }
+  return best;
+}
+
+// Executa a auto-resposta: valida interruptor, casa a pergunta, respeita "1x por cliente" e envia
+async function handleFaqAutoReply(phone, text, owner, accountId) {
+  if (!supabase) return false;
+  if ((_settings['faq_enabled'] || 'off') !== 'on') return false; // interruptor GERAL
+
+  const m = await matchFaq(text, owner);
+  if (!m) return false;
+
+  // "só 1x por cliente/pergunta": já respondeu esse FAQ para esse contato?
+  const { data: already } = await supabase.from('faq_replies')
+    .select('id').eq('owner', owner || null).eq('phone', phone).eq('faq_id', m.faq.id).maybeSingle();
+  if (already) { console.log(`🤖 FAQ #${m.faq.id} já respondido a ${phone} — ignorado`); return false; }
+
+  // descobre a conta de WhatsApp certa (número do lead), se não veio
+  let acct = accountId;
+  if (!acct) {
+    let cq = supabase.from('contacts').select('account_id').eq('phone', phone);
+    if (owner) cq = cq.eq('owner', owner);
+    const { data: ct } = await cq.maybeSingle();
+    acct = ct?.account_id || null;
+  }
+
+  const wamid = await sendBotMsg(phone, acct, m.faq.answer, owner);
+  if (!wamid) { console.error('🤖 FAQ: falha ao enviar resposta a', phone, '(sem conta/token ou fora da janela 24h)'); return false; }
+
+  // registra para não repetir (só após envio confirmado)
+  await supabase.from('faq_replies').insert({ owner: owner || null, phone, faq_id: m.faq.id });
+  console.log(`🤖 FAQ #${m.faq.id} respondido a ${phone} (score ${m.score.toFixed(2)})`);
+  return true;
+}
+
+// ── CRUD de FAQ (perguntas/respostas da IA) ──
+app.get('/faqs', async (req, res) => {
+  if (!supabase) return res.json([]);
+  const { data, error } = await supabase.from('faqs')
+    .select('*').eq('owner', req.owner || ' ').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post('/faqs', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const { question, answer, triggers, enabled } = req.body || {};
+  if (!question || !answer) return res.status(400).json({ error: 'pergunta e resposta são obrigatórias' });
+  const { data, error } = await supabase.from('faqs').insert({
+    owner: req.owner || null,
+    question: String(question).trim(),
+    answer: String(answer),
+    triggers: String(triggers || '').trim(),
+    enabled: enabled !== false
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.put('/faqs/:id', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const upd = { updated_at: new Date().toISOString() };
+  if (req.body.question !== undefined) upd.question = String(req.body.question).trim();
+  if (req.body.answer !== undefined) upd.answer = String(req.body.answer);
+  if (req.body.triggers !== undefined) upd.triggers = String(req.body.triggers).trim();
+  if (req.body.enabled !== undefined) upd.enabled = !!req.body.enabled;
+  const { data, error } = await supabase.from('faqs')
+    .update(upd).eq('id', req.params.id).eq('owner', req.owner || ' ').select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/faqs/:id', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const { error } = await supabase.from('faqs')
+    .delete().eq('id', req.params.id).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// Teste rápido: "o que a IA responderia para esta mensagem?" (não envia nada)
+app.post('/faqs/test', async (req, res) => {
+  const text = (req.body && req.body.text) || '';
+  const m = await matchFaq(text, req.owner || null);
+  if (!m) return res.json({ match: false });
+  res.json({ match: true, question: m.faq.question, answer: m.faq.answer, score: m.score });
+});
 
 // ── CRUD de Bots ──
 app.get('/bots', async (req,res) => {
