@@ -348,9 +348,12 @@ app.post("/webhook", async (req, res) => {
         if (['text','button','interactive'].includes(type) && content) {
           try { await handleBotReply(from, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
         }
-        // IA / FAQ: resposta automática só para perguntas cadastradas
+        // IA: regra de "contato errado" primeiro; se não tratou, tenta o FAQ
         if (['text','button','interactive'].includes(type) && content) {
-          try { await handleFaqAutoReply(from, content, ownerEmail, accountId); } catch(fe) { console.error('FAQ auto-reply error:', fe.message); }
+          try {
+            const wp = await handleWrongPerson(from, content, ownerEmail, accountId);
+            if (!wp) await handleFaqAutoReply(from, content, ownerEmail, accountId);
+          } catch(fe) { console.error('IA auto-reply error:', fe.message); }
         }
         // Encaminha para N8N se configurado
         const n8nUrl = _settings['n8n_webhook_url'];
@@ -1083,6 +1086,7 @@ app.get("/tags", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   const set = new Set();
   (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) set.add(t); }));
+  _tagCatalog().forEach(t => set.add(t)); // inclui tags criadas no gerenciador (catálogo)
   res.json(Array.from(set).sort((a, b) => a.localeCompare(b)));
 });
 
@@ -2215,6 +2219,150 @@ app.post('/faqs/test', async (req, res) => {
   const m = await matchFaq(text, req.owner || null);
   if (!m) return res.json({ match: false });
   res.json({ match: true, question: m.faq.question, answer: m.faq.answer, score: m.score });
+});
+
+// ═══════════════════════ Regra "contato errado" ═══════════════════════
+// Quando o cliente avisa que a mensagem foi para a pessoa errada, envia um
+// pedido de desculpas e aplica uma TAG no lead. Config via settings (dedicada,
+// não polui o cadastro geral de perguntas). Reusa scoring e atraso do FAQ.
+const WRONGPERSON_DEFAULT_TRIGGERS = [
+  'pessoa errada','numero errado','nao conheco','nao te conheco','quem e voce',
+  'foi engano','nao sou essa pessoa','parem de mandar mensagem','tirar meu contato',
+  'remover meu contato','sair da lista','nao quero receber','me descadastrar'
+].join('\n');
+const WRONGPERSON_DEFAULT_ANSWER = 'Desculpe o incômodo, vou retirar seu contato da lista 🙏🏼';
+const WRONGPERSON_DEFAULT_TAG = 'REMOVER';
+const WRONGPERSON_FAQ_ID = -1; // sentinela no controle de "1x por contato" (tabela faq_replies)
+
+function matchWrongPerson(text) {
+  const raw = _settings['wrongperson_triggers'] || WRONGPERSON_DEFAULT_TRIGGERS;
+  const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+  const msgNorm = _faqNorm(text);
+  const msgTokens = _faqTokens(msgNorm);
+  let score = 0;
+  for (const line of lines) {
+    const s = _faqScoreTrigger(msgNorm, msgTokens, line);
+    if (s > score) score = s;
+    if (score >= 1) break;
+  }
+  return score >= 0.6 ? score : 0;
+}
+
+async function addTagToContact(phone, owner, tag) {
+  if (!supabase || !tag) return;
+  const { data: ct } = await supabase.from('contacts').select('tags')
+    .eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+  const tags = Array.isArray(ct?.tags) ? ct.tags.slice() : [];
+  if (!tags.includes(tag)) {
+    tags.push(tag);
+    await supabase.from('contacts').update({ tags }).eq('phone', phone).eq('owner', owner || ' ');
+  }
+}
+
+// Retorna true se assumiu a resposta (para o FAQ não responder também)
+async function handleWrongPerson(phone, text, owner, accountId) {
+  if (!supabase) return false;
+  if ((_settings['wrongperson_enabled'] || 'off') !== 'on') return false;
+
+  // mesmo filtro de contas do FAQ
+  const accSetting = _settings['faq_accounts'];
+  if (accSetting !== undefined && accSetting !== null && accSetting !== '') {
+    try {
+      const list = JSON.parse(accSetting);
+      if (Array.isArray(list) && !list.map(String).includes(String(accountId))) return false;
+    } catch (_) {}
+  }
+
+  if (!matchWrongPerson(text)) return false;
+
+  // 1x por contato (reserva antes do atraso; índice único evita duplicidade)
+  const { error: resErr } = await supabase.from('faq_replies')
+    .insert({ owner: owner || null, phone, faq_id: WRONGPERSON_FAQ_ID });
+  if (resErr) { console.log('🤖 Contato errado já tratado para', phone, '— ignorado'); return true; }
+
+  let acct = accountId;
+  if (!acct) {
+    let cq = supabase.from('contacts').select('account_id').eq('phone', phone);
+    if (owner) cq = cq.eq('owner', owner);
+    const { data: ct } = await cq.maybeSingle();
+    acct = ct?.account_id || null;
+  }
+
+  const answer = _settings['wrongperson_answer'] || WRONGPERSON_DEFAULT_ANSWER;
+  const tag = _settings['wrongperson_tag'] || WRONGPERSON_DEFAULT_TAG;
+  const delaySec = parseInt(_settings['faq_delay_seconds'], 10);
+  const delayMs = Math.max(0, (Number.isFinite(delaySec) ? delaySec : 25) * 1000);
+
+  setTimeout(async () => {
+    try {
+      const wamid = await sendBotMsg(phone, acct, answer, owner);
+      if (!wamid) {
+        await supabase.from('faq_replies').delete()
+          .eq('owner', owner || null).eq('phone', phone).eq('faq_id', WRONGPERSON_FAQ_ID);
+        console.error('🤖 Contato errado: falha ao enviar a', phone, '(sem conta/token ou fora da janela 24h)');
+        return;
+      }
+      await addTagToContact(phone, owner, tag);
+      console.log(`🤖 Contato errado tratado: ${phone} (tag "${tag}", após ${delayMs/1000}s)`);
+    } catch (e) {
+      try {
+        await supabase.from('faq_replies').delete()
+          .eq('owner', owner || null).eq('phone', phone).eq('faq_id', WRONGPERSON_FAQ_ID);
+      } catch (_) {}
+      console.error('🤖 Contato errado: erro no envio a', phone, e.message);
+    }
+  }, delayMs);
+
+  return true;
+}
+
+// ═══════════════════════ Gerenciador de Tags ═══════════════════════
+// Catálogo de tags "criadas" (mesmo sem lead) em settings 'tag_catalog' (array JSON)
+function _tagCatalog() {
+  try { const a = JSON.parse(_settings['tag_catalog'] || '[]'); return Array.isArray(a) ? a : []; }
+  catch (_) { return []; }
+}
+async function _saveTagCatalog(arr) {
+  const uniq = Array.from(new Set(arr.filter(Boolean)));
+  await supabase.from('settings').upsert({ key: 'tag_catalog', value: JSON.stringify(uniq), updated_at: new Date().toISOString() });
+  _settings['tag_catalog'] = JSON.stringify(uniq);
+}
+
+// Lista tags com contagem de leads (inclui as do catálogo com contagem 0)
+app.get('/tags/manage', async (req, res) => {
+  if (!supabase) return res.json([]);
+  const { data, error } = await supabase.from('contacts').select('tags').eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  const counts = {};
+  (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) counts[t] = (counts[t] || 0) + 1; }));
+  _tagCatalog().forEach(t => { if (!(t in counts)) counts[t] = 0; });
+  const out = Object.keys(counts).sort((a, b) => a.localeCompare(b)).map(name => ({ name, count: counts[name] }));
+  res.json(out);
+});
+
+// Cria/cadastra uma tag no catálogo
+app.post('/tags/manage', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const name = ((req.body && req.body.name) || '').toString().trim();
+  if (!name) return res.status(400).json({ error: 'nome obrigatório' });
+  await _saveTagCatalog([..._tagCatalog(), name]);
+  res.json({ ok: true, name });
+});
+
+// Exclui uma tag de TODOS os leads e do catálogo
+app.delete('/tags/manage', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const name = ((req.body && req.body.name) || '').toString();
+  if (!name) return res.status(400).json({ error: 'nome obrigatório' });
+  const { data } = await supabase.from('contacts').select('phone, tags').eq('owner', req.owner || ' ');
+  for (const c of data || []) {
+    if ((c.tags || []).includes(name)) {
+      const tags = c.tags.filter(t => t !== name);
+      await supabase.from('contacts').update({ tags }).eq('phone', c.phone).eq('owner', req.owner || ' ');
+    }
+  }
+  await _saveTagCatalog(_tagCatalog().filter(t => t !== name));
+  res.json({ ok: true });
 });
 
 // ── CRUD de Bots ──
