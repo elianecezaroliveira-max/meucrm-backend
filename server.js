@@ -2122,6 +2122,42 @@ app.post('/bot-runs/:id/stop', async (req,res) => {
   await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() }).eq('id',req.params.id).eq('owner', req.owner || ' ');
   res.json({success:true});
 });
+
+// Disparo EM MASSA de um bot para todos os leads com TAREFA EM ABERTO (não concluída).
+// Responde imediatamente com a contagem e processa em segundo plano (com throttle).
+app.post('/bots/:id/start-open-tasks', async (req,res) => {
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  const owner = req.owner || ' ';
+  const botId = req.params.id;
+  // confirma que o bot é do dono
+  const { data: own } = await supabase.from('bots').select('id, account_id, active').eq('id',botId).eq('owner', owner).maybeSingle();
+  if (!own) return res.status(404).json({error:'Bot não encontrado'});
+  // Leads com tarefa em aberto (done=false) e com telefone
+  const { data: tasks } = await supabase.from('tasks').select('phone').eq('owner', owner).eq('done', false).not('phone','is',null);
+  const phones = [...new Set((tasks||[]).map(t=>t.phone).filter(Boolean))];
+  res.json({ success:true, total: phones.length }); // responde já; processa em background
+  if (!phones.length) return;
+
+  (async () => {
+    // account_id de cada contato (o bot dispara pelo número do lead)
+    const { data: contacts } = await supabase.from('contacts').select('phone, account_id').eq('owner', owner).in('phone', phones);
+    const acctByPhone = {}; (contacts||[]).forEach(c=>{ acctByPhone[c.phone]=c.account_id; });
+    let started=0, skipped=0;
+    for (const phone of phones) {
+      try {
+        // pula quem já está com ESTE bot rodando (evita disparo duplicado)
+        const { data: active } = await supabase.from('bot_runs').select('id')
+          .eq('contact_phone',phone).eq('bot_id',botId)
+          .in('status',['running','waiting_reply','paused']).maybeSingle();
+        if (active) { skipped++; continue; }
+        const run = await startBot(botId, phone, acctByPhone[phone] || own.account_id || null, req.owner);
+        if (run) started++; else skipped++;
+      } catch(e){ skipped++; console.error('start-open-tasks:', phone, e.message); }
+      await new Promise(r=>setTimeout(r, 200)); // ~5/seg — respeita limites do WhatsApp
+    }
+    console.log(`📢 Disparo em massa (tarefas abertas) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${phones.length}`);
+  })().catch(e=>console.error('Disparo em massa falhou:', e.message));
+});
 app.get('/bot-runs/contact/:phone', async (req,res) => {
   if (!supabase) return res.json([]);
   const { data } = await supabase.from('bot_runs').select('*, bots(name)').eq('contact_phone',req.params.phone).eq('owner', req.owner || ' ').in('status',['running','waiting_reply','paused']).order('created_at',{ascending:false});
