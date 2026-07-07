@@ -2105,6 +2105,16 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
   if (!supabase) return false;
   if ((_settings['faq_enabled'] || 'off') !== 'on') return false; // interruptor GERAL
 
+  // Filtro por conta de WhatsApp: se 'faq_accounts' foi configurado (lista JSON de IDs),
+  // a IA só responde nas contas dessa lista. Se nunca foi configurado, vale para TODAS.
+  const accSetting = _settings['faq_accounts'];
+  if (accSetting !== undefined && accSetting !== null && accSetting !== '') {
+    try {
+      const list = JSON.parse(accSetting);
+      if (Array.isArray(list) && !list.map(String).includes(String(accountId))) return false;
+    } catch (_) {}
+  }
+
   const m = await matchFaq(text, owner);
   if (!m) return false;
 
