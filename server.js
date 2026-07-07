@@ -2119,7 +2119,14 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
     } catch (_) {}
   }
 
-  const m = await matchFaq(text, owner);
+  // Modo IA (Groq): entende o contexto da conversa. Se falhar, cai no texto grátis.
+  let m = null;
+  if (_faqAiOn()) {
+    try { m = await matchFaqLLM(phone, text, owner); }
+    catch (e) { console.error('🤖 IA classificador falhou, usando texto:', e.response?.data?.error?.message || e.message); m = await matchFaq(text, owner); }
+  } else {
+    m = await matchFaq(text, owner);
+  }
   if (!m) return false;
 
   // "só 1x por cliente/pergunta": já respondeu esse FAQ para esse contato?
@@ -2221,14 +2228,92 @@ app.post('/faqs/test', async (req, res) => {
   res.json({ match: true, question: m.faq.question, answer: m.faq.answer, score: m.score });
 });
 
+// ═══════════════════════ Classificador por IA (Groq) ═══════════════════════
+// A IA NÃO escreve respostas: ela lê o contexto da conversa e escolhe QUAL das
+// perguntas cadastradas encaixa (ou nenhuma). A resposta enviada é a sua, pronta.
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_DEFAULT_MODEL = 'openai/gpt-oss-20b'; // barato e ativo (jul/2026); trocável via settings
+const _faqAiOn = () => _settings['faq_mode'] === 'ai' && !!process.env.GROQ_API_KEY;
+
+// Últimas mensagens da conversa (contexto), mais antigas primeiro
+async function getRecentConversation(phone, owner, limit) {
+  if (!supabase) return [];
+  let q = supabase.from('messages').select('direction, content, timestamp').eq('phone', phone);
+  if (owner) q = q.eq('owner', owner);
+  const { data } = await q.order('timestamp', { ascending: false }).limit(limit || 12);
+  const rows = (data || []).reverse();
+  return rows.map(r => ({
+    who: r.direction === 'outbound' ? 'atendente' : 'cliente',
+    text: (r.content || '').toString().slice(0, 300)
+  }));
+}
+
+// Classifica via Groq: retorna { faq, score } ou null. Lança erro se a API falhar.
+async function matchFaqLLM(phone, text, owner) {
+  if (!supabase) return null;
+  let fq = supabase.from('faqs').select('*').eq('enabled', true);
+  fq = owner ? fq.eq('owner', owner) : fq.is('owner', null);
+  const { data: faqs } = await fq;
+  if (!faqs || !faqs.length) return null;
+
+  const list = faqs.map((f, i) => `${i + 1}) ${f.question}`).join('\n');
+  const convo = await getRecentConversation(phone, owner, 12);
+  const convoTxt = convo.map(m => `${m.who}: ${m.text}`).join('\n')
+    || `cliente: ${(text || '').toString().slice(0, 300)}`;
+
+  const sys = 'Você classifica a intenção do cliente em um atendimento por WhatsApp. '
+    + 'Receberá uma lista de PERGUNTAS numeradas e a CONVERSA. Considerando o contexto de toda a conversa, '
+    + 'identifique qual PERGUNTA corresponde à intenção ATUAL do cliente (a última coisa que ele quis dizer). '
+    + 'Responda SOMENTE com JSON no formato {"id": N}, onde N é o número da pergunta. '
+    + 'Se nenhuma corresponder, responda {"id": 0}. Não escreva mais nada.';
+  const usr = `PERGUNTAS:\n${list}\n\nCONVERSA:\n${convoTxt}`;
+
+  const model = _settings['faq_ai_model'] || GROQ_DEFAULT_MODEL;
+  const r = await axios.post(GROQ_URL, {
+    model,
+    messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+    temperature: 0,
+    max_tokens: 20
+  }, { headers: { Authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' }, timeout: 12000 });
+
+  const out = r.data?.choices?.[0]?.message?.content || '';
+  let idNum = null;
+  try { idNum = parseInt(JSON.parse(out).id, 10); }
+  catch (_) { const mm = out.match(/\d+/); idNum = mm ? parseInt(mm[0], 10) : null; }
+  if (!idNum || idNum < 1 || idNum > faqs.length) return null; // 0 ou inválido = nenhuma
+  return { faq: faqs[idNum - 1], score: 1 };
+}
+
+// GET /faqs/ai-status — modo atual, se a chave está no servidor, e o modelo
+app.get('/faqs/ai-status', (req, res) => {
+  res.json({
+    mode: _settings['faq_mode'] || 'text',
+    keyConfigured: !!process.env.GROQ_API_KEY,
+    model: _settings['faq_ai_model'] || GROQ_DEFAULT_MODEL
+  });
+});
+
+// POST /faqs/ai-test — testa a classificação por IA com uma mensagem de exemplo
+app.post('/faqs/ai-test', async (req, res) => {
+  if (!process.env.GROQ_API_KEY) return res.json({ ok: false, error: 'Chave GROQ_API_KEY não configurada no servidor.' });
+  const text = (req.body && req.body.text) || 'quanto tempo demora pra liberar o dinheiro?';
+  try {
+    const m = await matchFaqLLM('__teste__' + Date.now(), text, req.owner || null);
+    if (!m) return res.json({ ok: true, match: false });
+    res.json({ ok: true, match: true, question: m.faq.question, answer: m.faq.answer });
+  } catch (e) {
+    res.json({ ok: false, error: e.response?.data?.error?.message || e.message });
+  }
+});
+
 // ═══════════════════════ Regra "contato errado" ═══════════════════════
 // Quando o cliente avisa que a mensagem foi para a pessoa errada, envia um
 // pedido de desculpas e aplica uma TAG no lead. Config via settings (dedicada,
 // não polui o cadastro geral de perguntas). Reusa scoring e atraso do FAQ.
 const WRONGPERSON_DEFAULT_TRIGGERS = [
-  'pessoa errada','numero errado','nao conheco','nao te conheco','quem e voce',
-  'foi engano','nao sou essa pessoa','parem de mandar mensagem','tirar meu contato',
-  'remover meu contato','sair da lista','nao quero receber','me descadastrar'
+  'pessoa errada','numero errado','foi engano','nao sou essa pessoa','nao te conheco',
+  'esse nome','com esse nome','descadastrar','me descadastrar','remover meu contato',
+  'tirar meu contato','sair da lista','nao quero receber','parar de receber'
 ].join('\n');
 const WRONGPERSON_DEFAULT_ANSWER = 'Desculpe o incômodo, vou retirar seu contato da lista 🙏🏼';
 const WRONGPERSON_DEFAULT_TAG = 'REMOVER';
