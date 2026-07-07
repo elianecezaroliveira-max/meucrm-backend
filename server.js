@@ -2123,6 +2123,40 @@ app.post('/bot-runs/:id/stop', async (req,res) => {
   res.json({success:true});
 });
 
+// Disparo EM MASSA para uma LISTA de leads selecionados (telefones enviados pelo front).
+// Responde na hora com a contagem e processa em segundo plano (com throttle e dedupe).
+app.post('/bots/:id/start-bulk', async (req,res) => {
+  if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  const owner = req.owner || ' ';
+  const botId = req.params.id;
+  const { data: own } = await supabase.from('bots').select('id, account_id').eq('id',botId).eq('owner', owner).maybeSingle();
+  if (!own) return res.status(404).json({error:'Bot não encontrado'});
+  let phones = Array.isArray(req.body?.phones) ? req.body.phones.filter(Boolean).map(String) : [];
+  phones = [...new Set(phones)];
+  if (!phones.length) return res.status(400).json({error:'Nenhum lead selecionado'});
+  // Segurança: só dispara para contatos do próprio dono
+  const { data: contacts } = await supabase.from('contacts').select('phone, account_id').eq('owner', owner).in('phone', phones);
+  const valid = contacts || [];
+  res.json({ success:true, total: valid.length }); // responde já; processa em background
+  if (!valid.length) return;
+
+  (async () => {
+    let started=0, skipped=0;
+    for (const c of valid) {
+      try {
+        const { data: active } = await supabase.from('bot_runs').select('id')
+          .eq('contact_phone',c.phone).eq('bot_id',botId)
+          .in('status',['running','waiting_reply','paused']).maybeSingle();
+        if (active) { skipped++; continue; }
+        const run = await startBot(botId, c.phone, c.account_id || own.account_id || null, req.owner);
+        if (run) started++; else skipped++;
+      } catch(e){ skipped++; console.error('start-bulk:', c.phone, e.message); }
+      await new Promise(r=>setTimeout(r, 200)); // ~5/seg
+    }
+    console.log(`📢 Disparo em massa (selecionados) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${valid.length}`);
+  })().catch(e=>console.error('Disparo em massa falhou:', e.message));
+});
+
 // Disparo EM MASSA de um bot para todos os leads com TAREFA EM ABERTO (não concluída).
 // Responde imediatamente com a contagem e processa em segundo plano (com throttle).
 app.post('/bots/:id/start-open-tasks', async (req,res) => {
