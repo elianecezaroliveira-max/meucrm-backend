@@ -2122,12 +2122,35 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
     acct = ct?.account_id || null;
   }
 
-  const wamid = await sendBotMsg(phone, acct, m.faq.answer, owner);
-  if (!wamid) { console.error('🤖 FAQ: falha ao enviar resposta a', phone, '(sem conta/token ou fora da janela 24h)'); return false; }
+  // Reserva JÁ o "respondido" (o índice único evita corrida/duplicidade se chegarem
+  // mais mensagens durante o atraso). Se o envio falhar depois, a reserva é removida.
+  const { error: resErr } = await supabase.from('faq_replies')
+    .insert({ owner: owner || null, phone, faq_id: m.faq.id });
+  if (resErr) { console.log(`🤖 FAQ #${m.faq.id} já respondido a ${phone} — ignorado`); return false; }
 
-  // registra para não repetir (só após envio confirmado)
-  await supabase.from('faq_replies').insert({ owner: owner || null, phone, faq_id: m.faq.id });
-  console.log(`🤖 FAQ #${m.faq.id} respondido a ${phone} (score ${m.score.toFixed(2)})`);
+  // Atraso humanizado antes de enviar. Padrão 25s; ajustável via settings 'faq_delay_seconds'.
+  const delaySec = parseInt(_settings['faq_delay_seconds'], 10);
+  const delayMs = Math.max(0, (Number.isFinite(delaySec) ? delaySec : 25) * 1000);
+  setTimeout(async () => {
+    try {
+      const wamid = await sendBotMsg(phone, acct, m.faq.answer, owner);
+      if (!wamid) {
+        // envio falhou: remove a reserva para permitir nova tentativa numa próxima mensagem
+        await supabase.from('faq_replies').delete()
+          .eq('owner', owner || null).eq('phone', phone).eq('faq_id', m.faq.id);
+        console.error('🤖 FAQ: falha ao enviar resposta a', phone, '(sem conta/token ou fora da janela 24h)');
+        return;
+      }
+      console.log(`🤖 FAQ #${m.faq.id} respondido a ${phone} (score ${m.score.toFixed(2)}, após ${delayMs/1000}s)`);
+    } catch (e) {
+      try {
+        await supabase.from('faq_replies').delete()
+          .eq('owner', owner || null).eq('phone', phone).eq('faq_id', m.faq.id);
+      } catch (_) {}
+      console.error('🤖 FAQ: erro no envio atrasado a', phone, e.message);
+    }
+  }, delayMs);
+
   return true;
 }
 
