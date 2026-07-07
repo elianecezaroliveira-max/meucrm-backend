@@ -1859,10 +1859,20 @@ async function processNode(run, depth=0) {
     let chosen = acctId, branchIdx = 0;
     if (branches.length) {
       const key = 'rr_' + nodeId;
-      const { data:s } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
-      let idx = parseInt(s?.value || '0', 10); if (isNaN(idx)) idx = 0;
+      // Rodízio À PROVA DE CONCORRÊNCIA: incrementa o contador de forma ATÔMICA no banco.
+      // Dois leads simultâneos recebem índices distintos (o Postgres serializa na linha).
+      let idx = 0;
+      const { data: rr, error: rrErr } = await supabase.rpc('rr_next', { p_key: key });
+      if (!rrErr && rr != null) {
+        idx = Number(rr);
+      } else {
+        // Fallback: se a função rr_next ainda não existir no banco, usa o contador antigo
+        if (rrErr) console.warn('rr_next indisponível, usando contador não-atômico:', rrErr.message);
+        const { data:s } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+        idx = parseInt(s?.value || '0', 10); if (isNaN(idx)) idx = 0;
+        await supabase.from('settings').upsert({ key, value: String(idx + 1), updated_at: new Date().toISOString() });
+      }
       branchIdx = idx % branches.length;
-      await supabase.from('settings').upsert({ key, value: String(idx + 1), updated_at: new Date().toISOString() });
       const accId = branches[branchIdx]?.account_id;
       if (accId) {
         chosen = accId;
