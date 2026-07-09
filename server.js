@@ -1656,6 +1656,22 @@ function applyVars(str, name, phone, notes) {
     .replace(/[\{\(\[]{1,2}\s*(?:notas?|anota[cç][aã]o|anota[cç][oõ]es|observa[cç][aã]o|observa[cç][oõ]es)\s*[\}\)\]]{1,2}/gi, notes || '');
 }
 
+// Registra no CRM uma mensagem de bot que FALHOU — fica visível na conversa com ⚠️ e o MOTIVO,
+// para o usuário saber que houve tentativa e por que não foi enviada.
+async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
+  if (!supabase) return;
+  try {
+    const ts = new Date().toISOString();
+    const content = shown || '[Falha no envio]';
+    await supabase.from('messages').insert({
+      phone, content, type: type || 'text', direction: 'outbound', timestamp: ts,
+      account_id: accountId || null, status: 'failed', error_info: errText || 'Falha no envio', owner: owner || null
+    });
+    const prev = ('⚠️ ' + content).slice(0, 80);
+    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone).eq('owner', owner || ' ');
+  } catch(e) { console.error('recordBotFail:', e.message); }
+}
+
 async function sendBotMsg(phone, accountId, text, owner) {
   let phoneNumberId, token;
   if (supabase && accountId) {
@@ -1663,7 +1679,10 @@ async function sendBotMsg(phone, accountId, text, owner) {
     if (acct) { phoneNumberId = acct.phone_number_id; token = acct.token; }
   }
   if (!phoneNumberId) { phoneNumberId = process.env.PHONE_NUMBER_ID; token = process.env.WHATSAPP_TOKEN; }
-  if (!phoneNumberId || !token) return null;
+  if (!phoneNumberId || !token) {
+    await _recordBotFail(phone, text, 'Este número não tem credenciais da API oficial (Phone Number ID/Token). Mensagem do bot não pode ser enviada por ele.', accountId, owner, 'text');
+    return null;
+  }
   try {
     const r = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
       { messaging_product:'whatsapp', to:phone, type:'text', text:{body:text} },
@@ -1677,7 +1696,11 @@ async function sendBotMsg(phone, accountId, text, owner) {
       await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
     }
     return wamid;
-  } catch(e) { console.error('❌ Bot sendMsg:', e.response?.data||e.message); return null; }
+  } catch(e) {
+    console.error('❌ Bot sendMsg:', e.response?.data||e.message);
+    await _recordBotFail(phone, text, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio'), accountId, owner, 'text');
+    return null;
+  }
 }
 
 async function botGetAcct(accountId) {
@@ -1717,7 +1740,10 @@ function renderTemplateBody(bodyText, vars) {
 // Envia um MODELO aprovado pelo bot (com variáveis no corpo)
 async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   const acct = await botGetAcct(accountId);
-  if (!acct.phone_number_id || !acct.token) return null;
+  if (!acct.phone_number_id || !acct.token) {
+    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Este número não é da API oficial (sem Phone Number ID/Token). Modelos só podem ser enviados por número da API oficial — não por número de QR Code.', accountId, owner, 'template');
+    return null;
+  }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
   let bodyText = null;
   try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR'); } catch(_) {}
@@ -1745,7 +1771,12 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
     }
     return true;
-  } catch(e) { console.error('❌ Bot template:', e.response?.data || e.message); return null; }
+  } catch(e) {
+    console.error('❌ Bot template:', e.response?.data || e.message);
+    const shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
+    await _recordBotFail(phone, shown, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio do modelo'), accountId, owner, 'template');
+    return null;
+  }
 }
 
 // Verifica horário comercial (UTC-3) e calcula a próxima abertura
@@ -2251,9 +2282,8 @@ async function getRecentConversation(phone, owner, limit) {
 // Classifica via Groq: retorna { faq, score } ou null. Lança erro se a API falhar.
 async function matchFaqLLM(phone, text, owner) {
   if (!supabase) return null;
-  let fq = supabase.from('faqs').select('*').eq('enabled', true);
-  fq = owner ? fq.eq('owner', owner) : fq.is('owner', null);
-  const { data: faqs } = await fq;
+  const { data: faqs } = await supabase.from('faqs').select('*')
+    .eq('enabled', true).eq('owner', owner || ' '); // mesmo filtro do GET /faqs
   if (!faqs || !faqs.length) return null;
 
   const list = faqs.map((f, i) => `${i + 1}) ${f.question}`).join('\n');
@@ -2269,17 +2299,25 @@ async function matchFaqLLM(phone, text, owner) {
   const usr = `PERGUNTAS:\n${list}\n\nCONVERSA:\n${convoTxt}`;
 
   const model = _settings['faq_ai_model'] || GROQ_DEFAULT_MODEL;
-  const r = await axios.post(GROQ_URL, {
+  const body = {
     model,
     messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
     temperature: 0,
-    max_tokens: 20
-  }, { headers: { Authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' }, timeout: 12000 });
+    max_tokens: 800 // modelos de raciocínio (gpt-oss) usam parte do orçamento pensando
+  };
+  // gpt-oss aceita esforço de raciocínio: baixo = mais rápido e barato
+  if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
+  const r = await axios.post(GROQ_URL, body, {
+    headers: { Authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' },
+    timeout: 15000
+  });
 
-  const out = r.data?.choices?.[0]?.message?.content || '';
+  const msg = r.data?.choices?.[0]?.message || {};
+  const out = ((msg.content || '') + ' ' + (msg.reasoning || '')).trim();
   let idNum = null;
-  try { idNum = parseInt(JSON.parse(out).id, 10); }
-  catch (_) { const mm = out.match(/\d+/); idNum = mm ? parseInt(mm[0], 10) : null; }
+  const jm = out.match(/["']?id["']?\s*[:=]\s*(\d+)/i); // procura o "id": N que pedimos
+  if (jm) idNum = parseInt(jm[1], 10);
+  else { const nums = out.match(/\d+/g); if (nums) idNum = parseInt(nums[nums.length - 1], 10); } // senão, último número
   if (!idNum || idNum < 1 || idNum > faqs.length) return null; // 0 ou inválido = nenhuma
   return { faq: faqs[idNum - 1], score: 1 };
 }
@@ -2297,12 +2335,15 @@ app.get('/faqs/ai-status', (req, res) => {
 app.post('/faqs/ai-test', async (req, res) => {
   if (!process.env.GROQ_API_KEY) return res.json({ ok: false, error: 'Chave GROQ_API_KEY não configurada no servidor.' });
   const text = (req.body && req.body.text) || 'quanto tempo demora pra liberar o dinheiro?';
+  // diagnóstico: quantas perguntas ativas existem para este dono
+  let faqCount = 0;
+  try { const { data } = await supabase.from('faqs').select('id').eq('enabled', true).eq('owner', req.owner || ' '); faqCount = (data || []).length; } catch (_) {}
   try {
     const m = await matchFaqLLM('__teste__' + Date.now(), text, req.owner || null);
-    if (!m) return res.json({ ok: true, match: false });
-    res.json({ ok: true, match: true, question: m.faq.question, answer: m.faq.answer });
+    if (!m) return res.json({ ok: true, match: false, faqCount });
+    res.json({ ok: true, match: true, question: m.faq.question, answer: m.faq.answer, faqCount });
   } catch (e) {
-    res.json({ ok: false, error: e.response?.data?.error?.message || e.message });
+    res.json({ ok: false, error: e.response?.data?.error?.message || e.message, faqCount });
   }
 });
 
