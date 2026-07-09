@@ -650,7 +650,7 @@ app.post("/react", async (req, res) => {
     }
   }
 
-  const acct = await botGetAcct(account_id);
+  const acct = await botGetAcct(account_id, req.owner);
   if (!acct.phone_number_id || !acct.token) return res.status(400).json({ error: "Nenhuma conta configurada." });
   try {
     await axios.post(
@@ -1678,14 +1678,12 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
 }
 
 async function sendBotMsg(phone, accountId, text, owner) {
-  let phoneNumberId, token;
-  if (supabase && accountId) {
-    const { data: acct } = await supabase.from('accounts').select('phone_number_id,token').eq('id', accountId).maybeSingle();
-    if (acct) { phoneNumberId = acct.phone_number_id; token = acct.token; }
-  }
-  if (!phoneNumberId) { phoneNumberId = process.env.PHONE_NUMBER_ID; token = process.env.WHATSAPP_TOKEN; }
+  // Resolve a conta com fallback inteligente (conta excluída → conta oficial ativa do dono)
+  const acct = await botGetAcct(accountId, owner);
+  const phoneNumberId = acct.phone_number_id, token = acct.token;
+  const usedAcctId = acct.id || accountId || null;
   if (!phoneNumberId || !token) {
-    await _recordBotFail(phone, text, 'Este número não tem credenciais da API oficial (Phone Number ID/Token). Mensagem do bot não pode ser enviada por ele.', accountId, owner, 'text');
+    await _recordBotFail(phone, text, 'Este número não tem credenciais da API oficial (Phone Number ID/Token). Mensagem do bot não pode ser enviada por ele.', usedAcctId, owner, 'text');
     return null;
   }
   try {
@@ -1695,7 +1693,7 @@ async function sendBotMsg(phone, accountId, text, owner) {
     const wamid = r.data?.messages?.[0]?.id || null;
     if (supabase) {
       const ts = new Date().toISOString();
-      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:accountId||null, status:'pending', wamid, owner:owner||null });
+      await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:usedAcctId, status:'pending', wamid, owner:owner||null });
       await applyPendingStatus(wamid); // aplica status que chegou antes do insert
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
@@ -1703,15 +1701,30 @@ async function sendBotMsg(phone, accountId, text, owner) {
     return wamid;
   } catch(e) {
     console.error('❌ Bot sendMsg:', e.response?.data||e.message);
-    await _recordBotFail(phone, text, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio'), accountId, owner, 'text');
+    await _recordBotFail(phone, text, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio'), usedAcctId, owner, 'text');
     return null;
   }
 }
 
-async function botGetAcct(accountId) {
+async function botGetAcct(accountId, owner) {
   if (supabase && accountId) {
-    const { data } = await supabase.from('accounts').select('phone_number_id,token,waba_id').eq('id', accountId).maybeSingle();
-    if (data && data.phone_number_id) return data;
+    const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id').eq('id', accountId).maybeSingle();
+    if (data && data.phone_number_id && data.token) return data;
+  }
+  // Conta não encontrada (ex.: foi EXCLUÍDA) ou sem API oficial (ex.: QR Code) —
+  // usa a conta oficial ATIVA do dono (a mesma do envio manual), em vez de cair
+  // num número antigo do .env que pode estar em MODO DE TESTE na Meta (erro 131030).
+  if (supabase) {
+    try {
+      let q = supabase.from('accounts').select('id,phone_number_id,token,waba_id,owner').order('created_at', { ascending: true });
+      if (owner !== undefined) q = q.eq('owner', owner || ' ');
+      const { data: list } = await q;
+      const alt = (list || []).find(a => a.phone_number_id && a.token);
+      if (alt) {
+        if (accountId) console.warn(`⚠️ Bot: conta ${accountId} não existe mais/não é API oficial — usando a conta oficial ${alt.id} do dono no lugar.`);
+        return alt;
+      }
+    } catch (e) { console.error('botGetAcct fallback:', e.message); }
   }
   return { phone_number_id: process.env.PHONE_NUMBER_ID, token: process.env.WHATSAPP_TOKEN, waba_id: process.env.WABA_ID };
 }
@@ -1744,9 +1757,10 @@ function renderTemplateBody(bodyText, vars) {
 
 // Envia um MODELO aprovado pelo bot (com variáveis no corpo)
 async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
-  const acct = await botGetAcct(accountId);
+  const acct = await botGetAcct(accountId, owner);
+  const usedAcctId = acct.id || accountId || null;
   if (!acct.phone_number_id || !acct.token) {
-    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Este número não é da API oficial (sem Phone Number ID/Token). Modelos só podem ser enviados por número da API oficial — não por número de QR Code.', accountId, owner, 'template');
+    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Este número não é da API oficial (sem Phone Number ID/Token). Modelos só podem ser enviados por número da API oficial — não por número de QR Code.', usedAcctId, owner, 'template');
     return null;
   }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
@@ -1771,7 +1785,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
       const tWamid = r.data?.messages?.[0]?.id || null;
-      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: accountId || null, status: 'pending', wamid: tWamid, owner: owner || null });
+      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
     }
@@ -1779,7 +1793,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   } catch(e) {
     console.error('❌ Bot template:', e.response?.data || e.message);
     const shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
-    await _recordBotFail(phone, shown, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio do modelo'), accountId, owner, 'template');
+    await _recordBotFail(phone, shown, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio do modelo'), usedAcctId, owner, 'template');
     return null;
   }
 }
@@ -2007,7 +2021,9 @@ async function fireStageBots(phone, stageId, owner) {
     const leadAcct = ct?.account_id || null;
     for (const bot of bots) {
       console.log(`🤖 Gatilho de etapa: bot "${bot.name}" para ${phone}`);
-      await startBot(bot.id, phone, bot.account_id || leadAcct, owner || bot.owner);
+      // Prioriza a conta do LEAD (o número com que ele já conversa) — a conta gravada
+      // no bot pode ter sido excluída ou ser de outro número
+      await startBot(bot.id, phone, leadAcct || bot.account_id, owner || bot.owner);
     }
   } catch(e) { console.error('fireStageBots error:', e.message); }
 }
