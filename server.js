@@ -73,6 +73,7 @@ const META_ERROR_CODES = {
   131000: 'Erro interno da Meta ao processar a mensagem.',
   131042: 'Problema de pagamento da conta: o envio falhou por causa do método de pagamento do WhatsApp Business. Verifique o faturamento/cartão no Gerenciador de Negócios da Meta (WhatsApp > Configurações de pagamento).',
   131031: 'Conta do WhatsApp Business BLOQUEADA pela Meta. Geralmente por pagamento pendente/recusado ou violação de política. Resolva em business.facebook.com > Qualidade da conta / Central de Segurança (e regularize o pagamento). Pode ser necessário solicitar revisão.',
+  131030: 'Número do destinatário NÃO está na lista de permitidos. Este número da API oficial ainda está em MODO DE TESTE na Meta — nesse modo só é possível enviar para destinatários cadastrados. Para enviar a qualquer número: conclua a verificação do negócio e coloque o app em modo PRODUÇÃO (Live) no Meta for Developers. Para testar agora: adicione o número do destinatário na lista de teste (WhatsApp > API Setup > destinatários).',
   130472: 'A Meta optou por não entregar (experimento/qualidade do número).',
   470:    'Fora da janela de 24h: use um modelo aprovado para reabrir a conversa.',
   132000: 'Modelo: número de variáveis não confere com o aprovado.',
@@ -1663,9 +1664,13 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
   try {
     const ts = new Date().toISOString();
     const content = shown || '[Falha no envio]';
+    // Identifica QUAL número tentou enviar (útil no Round Robin com vários números)
+    let acctName = '';
+    if (accountId) { try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', accountId).maybeSingle(); if (a) acctName = a.phone_display || a.name || ''; } catch(_){} }
+    const fullErr = acctName ? `[Número: ${acctName}] ${errText || 'Falha no envio'}` : (errText || 'Falha no envio');
     await supabase.from('messages').insert({
       phone, content, type: type || 'text', direction: 'outbound', timestamp: ts,
-      account_id: accountId || null, status: 'failed', error_info: errText || 'Falha no envio', owner: owner || null
+      account_id: accountId || null, status: 'failed', error_info: fullErr, owner: owner || null
     });
     const prev = ('⚠️ ' + content).slice(0, 80);
     await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone).eq('owner', owner || ' ');
