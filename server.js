@@ -3009,8 +3009,10 @@ async function waStart(instanceName) {
     logger: _pino({ level: 'silent' }),
     printQRInTerminal: false,
     // Identidade reconhecida pelo WhatsApp — nomes personalizados fazem o
-    // pareamento falhar com "não foi possível conectar novos dispositivos"
-    browser: _baileys.Browsers ? _baileys.Browsers.macOS('Google Chrome') : ['Mac OS', 'Chrome', '120.0.0'],
+    // pareamento falhar com "não foi possível conectar novos dispositivos".
+    // "Desktop" = aparece como app WhatsApp Desktop (identidade mais natural),
+    // o que reduz o aviso de "suspeita de golpe" na hora de escanear o QR.
+    browser: _baileys.Browsers ? _baileys.Browsers.macOS('Desktop') : ['Mac OS', 'Desktop', '10.15.7'],
     syncFullHistory: false,
     // "online" = o WhatsApp entrega as mensagens na hora (offline ele segura/atrasa)
     markOnlineOnConnect: true,
@@ -3052,8 +3054,13 @@ async function waStart(instanceName) {
         delete _waSocks[instanceName];
         supabase.from('wa_sessions').delete().eq('instance', instanceName).then(() => {}, () => {});
       } else if (_waSocks[instanceName] === sock) {
-        console.log(`↩️ ${instanceName}: reconectando em 4s (código ${code || '?'})`);
-        setTimeout(() => waStart(instanceName).catch(e => console.error('WA reconnect:', e.message)), 4000);
+        // 515 (restartRequired) chega LOGO APÓS escanear o QR: o WhatsApp exige
+        // reiniciar a conexão imediatamente para concluir o pareamento. Esperar 4s
+        // aqui fazia o celular desistir com "Não foi possível conectar o dispositivo".
+        const restartNow = code === _baileys.DisconnectReason.restartRequired;
+        const waitMs = restartNow ? 300 : 4000;
+        console.log(`↩️ ${instanceName}: reconectando em ${waitMs}ms (código ${code || '?'}${restartNow ? ' — pós-pareamento' : ''})`);
+        setTimeout(() => waStart(instanceName).catch(e => console.error('WA reconnect:', e.message)), waitMs);
       }
     }
   });
