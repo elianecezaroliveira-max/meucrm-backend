@@ -3077,6 +3077,20 @@ async function waStart(instanceName) {
           if (upErr) { console.error('Storage upload:', upErr.message); mediaPath = null; }
         }
       } catch (me) { console.error('Download de mídia QR:', me.message); mediaPath = null; }
+      // Quando o chat usa o id oculto (@lid), descobre o número REAL do contato:
+      // 1) remoteJidAlt (Baileys 7 traz o número real do chat, em qualquer direção),
+      // 2) senderPn/participantPn (só em mensagens recebidas — em enviadas seria o SEU número),
+      // 3) mapa LID→número interno do Baileys
+      let realPn = null, lidJid = null;
+      const _rj = String(m.key?.remoteJid || '');
+      if (_rj.endsWith('@lid')) {
+        lidJid = _rj;
+        realPn = m.key?.remoteJidAlt || null;
+        if (!realPn && !m.key?.fromMe) realPn = m.key?.senderPn || m.key?.participantPn || null;
+        if (!realPn) { try { realPn = await sock.signalRepository?.lidMapping?.getPNForLID?.(_rj) || null; } catch (_) {} }
+      } else if (!m.key?.fromMe) {
+        realPn = m.key?.senderPn || m.key?.participantPn || null;
+      }
       try {
         await axios.post(`http://127.0.0.1:${PORT}/evolution-webhook`, {
           event: 'messages.upsert',
@@ -3084,9 +3098,8 @@ async function waStart(instanceName) {
           data: {
             mediaPath, mediaMime,
             key: m.key,
-            // Quando o contato usa o id oculto (@lid), o Baileys entrega o número
-            // real em senderPn — preferimos ele para a conversa ficar no telefone certo
-            senderPn: m.key?.senderPn || m.key?.participantPn || null,
+            senderPn: realPn, // número real já resolvido (ou null se impossível)
+            lidJid,           // id oculto original — usado para migrar contatos salvos errados
             pushName: m.pushName || '',
             messageTimestamp: Number(m.messageTimestamp) || Math.floor(Date.now() / 1000),
             message: m.message,
@@ -3393,13 +3406,19 @@ app.post('/evolution-webhook', async (req, res) => {
     if (event === 'messages.upsert') {
       if (!data) return;
       const fromMe    = !!data.key?.fromMe;        // true = mensagem enviada pelo celular/CRM
-      // Prefere o número REAL (senderPn) quando o contato usa o id oculto @lid
-      const remoteJid = (!data.key?.fromMe && data.senderPn) ? data.senderPn : (data.key?.remoteJid || '');
-      if (remoteJid.includes('@g.us')) return; // ignora grupos
-      if (remoteJid.includes('@broadcast') || remoteJid.includes('@newsletter')) return; // ignora status/canais
+      const _rjRaw    = data.key?.remoteJid || '';
+      if (_rjRaw.includes('@g.us')) return; // ignora grupos
+      if (_rjRaw.includes('@broadcast') || _rjRaw.includes('@newsletter')) return; // ignora status/canais
+      // Prefere o número REAL quando o chat usa o id oculto @lid:
+      // senderPn já chega resolvido da conexão interna; remoteJidAlt (Baileys 7)
+      // vale para qualquer direção; senderPn/participantPn do key só em recebidas
+      const chatPn    = data.senderPn || data.key?.remoteJidAlt
+                     || (!fromMe ? (data.key?.senderPn || data.key?.participantPn) : null) || null;
+      const remoteJid = String(chatPn || _rjRaw);
 
       let phone       = remoteJid.replace('@s.whatsapp.net', '');
-      const name      = data.pushName || phone;
+      const isLid     = String(phone).endsWith('@lid');
+      const name      = data.pushName || (isLid ? 'Contato (número oculto)' : phone);
       const timestamp = new Date((data.messageTimestamp || Date.now() / 1000) * 1000).toISOString();
       const wamid     = data.key?.id || null;
       const direction = fromMe ? 'outbound' : 'inbound';
@@ -3430,6 +3449,20 @@ app.post('/evolution-webhook', async (req, res) => {
       // Unifica a conversa se o contato já existe com/sem o nono dígito
       phone = await resolveExistingPhone(phone, ownerEmail);
 
+      // Se este contato foi salvo antes com o id oculto (@lid), migra para o número real
+      if (supabase && data.lidJid && phone && !String(phone).endsWith('@lid')) {
+        try {
+          const { data: lidC } = await supabase.from('contacts').select('id').eq('phone', data.lidJid).eq('owner', ownerEmail || ' ').maybeSingle();
+          if (lidC) {
+            const { data: realC } = await supabase.from('contacts').select('id').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
+            if (realC) await supabase.from('contacts').delete().eq('id', lidC.id);  // já existe com o número certo — remove o duplicado @lid
+            else await supabase.from('contacts').update({ phone }).eq('id', lidC.id); // corrige o número do contato
+            await supabase.from('messages').update({ phone }).eq('phone', data.lidJid); // histórico acompanha
+            console.log(`🔁 Contato @lid migrado para o número real: ${data.lidJid} → ${phone}`);
+          }
+        } catch (e) { console.error('Migração @lid:', e.message); }
+      }
+
       if (supabase) {
         // Dedup: evita duplicar mensagens já salvas (ex.: enviadas pelo próprio CRM)
         if (wamid) {
@@ -3444,7 +3477,7 @@ app.post('/evolution-webhook', async (req, res) => {
         const { data: existC } = await supabase.from('contacts').select('id, account_id').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
         // NOME: recebida → nome do lead (pushName). Enviada (fromMe) → é o SEU nome, não mexe (só fallback p/ novo).
         if (!fromMe) contactData.name = name;
-        else if (!existC) contactData.name = phone;
+        else if (!existC) contactData.name = isLid ? 'Contato (número oculto)' : phone;
         // NÚMERO da conversa: seu envio (fromMe) fixa no número usado; recebida só define se ainda não houver.
         if (accountId && (fromMe || !existC || existC.account_id == null)) contactData.account_id = accountId;
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
