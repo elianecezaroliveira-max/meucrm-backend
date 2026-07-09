@@ -520,6 +520,20 @@ app.post("/accounts", async (req, res) => {
   res.json({ success: true, data });
 });
 
+// ── Renomear conta (API oficial ou QR Code) ──
+app.patch("/accounts/:id", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const name = String(req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ error: "Informe o novo nome" });
+  if (name.length > 40) return res.status(400).json({ error: "Nome muito longo (máx. 40 caracteres)" });
+  const { data, error } = await supabase.from("accounts")
+    .update({ name }).eq("id", req.params.id).eq("owner", req.owner || ' ')
+    .select("id, name").maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: "Conta não encontrada" });
+  res.json({ success: true, data });
+});
+
 // ── Remover conta ──
 app.delete("/accounts/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
