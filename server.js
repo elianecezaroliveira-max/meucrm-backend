@@ -2060,7 +2060,9 @@ async function startBot(botId, phone, accountId, owner) {
   return run;
 }
 
-// Timer: resume paused/timed-out runs every 5s
+// Timer: retoma runs pausadas/expiradas do bot.
+// 30s (era 5s) — economiza CPU/banda no Railway; as esperas dos bots são de
+// minutos/horas, então até 30s de folga não muda nada na prática.
 setInterval(async () => {
   if (!supabase) return;
   const now = new Date().toISOString();
@@ -2077,7 +2079,7 @@ setInterval(async () => {
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, status:'running', pause_until:null, updated_at:now }).eq('id',run.id); await processNode({...run,current_node_id:nxt,status:'running'}); }
     else { await stopRun(run.id,'completed'); }
   }
-}, 5000);
+}, 30000);
 
 // ═══════════════════════════════════════════════════════════════════
 //  IA / FAQ — responde automaticamente SÓ a perguntas cadastradas
