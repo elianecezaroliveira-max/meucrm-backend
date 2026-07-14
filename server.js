@@ -3503,6 +3503,9 @@ app.post('/evolution-webhook', async (req, res) => {
         else if (!existC) contactData.name = isLid ? 'Contato (número oculto)' : phone;
         // NÚMERO da conversa: seu envio (fromMe) fixa no número usado; recebida só define se ainda não houver.
         if (accountId && (fromMe || !existC || existC.account_id == null)) contactData.account_id = accountId;
+        // Você respondeu pelo CELULAR/WhatsApp Web → a conversa deixa de ser "não lida"
+        // no CRM (mensagens enviadas pelo próprio CRM não passam por aqui — dedupe acima)
+        if (fromMe) { contactData.unread_count = 0; contactData.first_unread_at = null; }
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
         if (cErr) console.error('❌ Evolution: erro ao salvar contato:', cErr.message);
 
