@@ -3681,7 +3681,7 @@ app.post('/evolution-webhook', async (req, res) => {
           contactData.name = !fromMe ? name : (isLid ? 'Contato (número oculto)' : phone);
         } else if (!fromMe && data.pushName) {
           const atual = String(existC.name || '');
-          const nuncaPersonalizado = !atual || atual === phone || atual === 'Contato (número oculto)' || /^\d+$/.test(atual.replace(/\D/g, '') === atual.replace(/\s/g, '') ? atual.replace(/\D/g, '') : 'x');
+          // Só adota o pushName se o nome atual nunca foi personalizado
           if (!atual || atual === phone || atual === 'Contato (número oculto)') contactData.name = name;
         }
         // NÚMERO da conversa: seu envio (fromMe) fixa no número usado; recebida só define se ainda não houver.
