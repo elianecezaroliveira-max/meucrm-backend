@@ -2927,6 +2927,8 @@ if (WA_EMBEDDED) {
 
 const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
 const _waQrRetries = {}, _waCreatedAt = {}, _waRegistered = {}; // controle de instâncias que nunca parearam
+const _waReconnDelay = {}; // espera progressiva entre reconexões (economia no Railway)
+let _waVerCache = { v: null, ts: 0 }; // cache da versão do Baileys (evita consulta na internet a cada reconexão)
 let _waVersion = null;
 
 // Encerra e limpa uma instância que nunca chegou a parear (evita "zumbis" que
@@ -3013,10 +3015,16 @@ async function waStart(instanceName) {
   if (_waSocks[instanceName]) { try { _waSocks[instanceName].end(undefined); } catch (_) {} delete _waSocks[instanceName]; }
   const { state, saveCreds } = await useSupabaseAuthState(instanceName);
   _waRegistered[instanceName] = !!state?.creds?.registered; // já pareado antes? (protege da limpeza)
-  const { version } = await _baileys.fetchLatestBaileysVersion().catch(e => {
-    _waErr[instanceName] = 'fetchVersion: ' + e.message;
-    return { version: undefined };
-  });
+  // Versão do WhatsApp Web: consulta na internet no máximo a cada 6h (cache)
+  let version = _waVerCache.v;
+  if (!version || Date.now() - _waVerCache.ts > 6 * 3600000) {
+    const r = await _baileys.fetchLatestBaileysVersion().catch(e => {
+      _waErr[instanceName] = 'fetchVersion: ' + e.message;
+      return { version: undefined };
+    });
+    version = r.version;
+    if (version) _waVerCache = { v: version, ts: Date.now() };
+  }
   _waVersion = version || 'padrão da lib';
   const sock = _baileys.default({
     version,
@@ -3059,6 +3067,7 @@ async function waStart(instanceName) {
       delete qrCache[instanceName];
       _waQrRetries[instanceName] = 0; // pareou — zera o contador de tentativas
       _waRegistered[instanceName] = true;
+      _waReconnDelay[instanceName] = 4000; // conexão ok — volta à espera mínima
       _waPhone[instanceName] = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
       console.log(`✅ WhatsApp QR conectado: ${instanceName} (${_waPhone[instanceName]})`);
     }
@@ -3083,7 +3092,16 @@ async function waStart(instanceName) {
         // reiniciar a conexão imediatamente para concluir o pareamento. Esperar 4s
         // aqui fazia o celular desistir com "Não foi possível conectar o dispositivo".
         const restartNow = code === _baileys.DisconnectReason.restartRequired;
-        const waitMs = restartNow ? 300 : 4000;
+        let waitMs;
+        if (restartNow) {
+          waitMs = 300;
+          _waReconnDelay[instanceName] = 4000;
+        } else {
+          // Espera PROGRESSIVA: 4s → 8s → 16s… até 5 min. Se o WhatsApp ficar fora
+          // por horas (celular desligado), o servidor não gasta CPU tentando a cada 4s.
+          waitMs = _waReconnDelay[instanceName] || 4000;
+          _waReconnDelay[instanceName] = Math.min(waitMs * 2, 5 * 60000);
+        }
         console.log(`↩️ ${instanceName}: reconectando em ${waitMs}ms (código ${code || '?'}${restartNow ? ' — pós-pareamento' : ''})`);
         setTimeout(() => waStart(instanceName).catch(e => console.error('WA reconnect:', e.message)), waitMs);
       }
