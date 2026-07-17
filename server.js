@@ -307,7 +307,8 @@ app.post("/webhook", async (req, res) => {
         }
 
         // Foto de perfil via motor QR (serve também para contatos da API oficial)
-        const avatarInst = anyOpenWaInstance();
+        // Prefere uma instância QR do MESMO dono (privacidade da foto)
+        const avatarInst = (await anyOpenWaInstanceForOwner(ownerEmail).catch(() => null)) || anyOpenWaInstance();
         if (avatarInst) waFetchAvatar(avatarInst, from, ownerEmail).catch(() => {});
 
         // Incrementa contador de não lidas e marca hora da 1ª mensagem não lida
@@ -3246,6 +3247,24 @@ function anyOpenWaInstance() {
   return null;
 }
 
+// Instância QR conectada DO MESMO DONO — importante para fotos de perfil:
+// por privacidade, a foto de muitos contatos só é visível para o número que
+// conversa com eles. Usar a instância de outra conta volta sem foto.
+const _instOwnerCache = { ts: 0, map: {} };
+async function anyOpenWaInstanceForOwner(owner) {
+  if (!owner || !supabase) return null;
+  try {
+    if (Date.now() - _instOwnerCache.ts > 5 * 60000) {
+      const { data } = await supabase.from('accounts').select('evolution_instance, owner').not('evolution_instance', 'is', null);
+      _instOwnerCache.map = {};
+      (data || []).forEach(a => { if (a.evolution_instance) _instOwnerCache.map[a.evolution_instance] = a.owner || null; });
+      _instOwnerCache.ts = Date.now();
+    }
+  } catch (_) {}
+  for (const k in _waSocks) if (_waState[k] === 'open' && _instOwnerCache.map[k] === owner) return k;
+  return null;
+}
+
 // Busca a foto de perfil do cliente (1x por contato) e guarda no cofre de mídias
 async function waFetchAvatar(instanceName, phone, owner) {
   try {
@@ -3291,25 +3310,39 @@ async function initEmbeddedWa() {
     }
   } catch (e) { console.error('initEmbeddedWa:', e.message); }
 
-  // Varredura de fotos: espera alguma instância QR abrir (re-tenta por ~3 min)
+  // Varredura de fotos: espera alguma instância QR abrir (re-tenta por ~3 min).
+  // Cada contato usa o "fotógrafo" CERTO: a instância da própria conta/dono —
+  // por privacidade, a foto pode ser visível só para o número que fala com ele.
   let _sweepTries = 0;
   const _avatarSweep = async () => {
     try {
-      const inst = anyOpenWaInstance();
-      if (!inst) {
+      if (!anyOpenWaInstance()) {
         if (++_sweepTries < 10) setTimeout(_avatarSweep, 20000);
         return;
       }
       const { data: rows } = await supabase.from('contacts')
-        .select('phone, owner').is('avatar', null)
+        .select('phone, owner, account_id').is('avatar', null)
         .not('last_message_at', 'is', null)
         .order('last_message_at', { ascending: false }).limit(40);
+      // Mapa: conta → instância aberta / dono → instância aberta
+      const { data: accs } = await supabase.from('accounts').select('id, owner, evolution_instance');
+      const instByAcct = {}, instByOwner = {};
+      (accs || []).forEach(a => {
+        if (a.evolution_instance && _waState[a.evolution_instance] === 'open') {
+          instByAcct[a.id] = a.evolution_instance;
+          if (!instByOwner[a.owner || ' ']) instByOwner[a.owner || ' '] = a.evolution_instance;
+        }
+      });
       for (const r of rows || []) {
+        const inst = instByAcct[r.account_id] || instByOwner[r.owner || ' '] || anyOpenWaInstance();
+        if (!inst) continue;
         await waFetchAvatar(inst, r.phone, r.owner);
         await new Promise(rs => setTimeout(rs, 400)); // ritmo suave, sem parecer robô
       }
       console.log(`🖼️ Varredura de fotos concluída (${(rows || []).length} contatos verificados)`);
     } catch (e) { console.error('Varredura de fotos:', e.message); }
+    // Repete a cada 6 horas — pega fotos de contatos novos gastando o mínimo
+    setTimeout(_avatarSweep, 6 * 3600000);
   };
   setTimeout(_avatarSweep, 20000);
 }
