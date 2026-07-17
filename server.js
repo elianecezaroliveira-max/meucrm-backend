@@ -3228,6 +3228,18 @@ async function waStart(instanceName) {
         const chatDigits = (String(m.key?.remoteJidAlt || '') || rjSelf).split('@')[0].replace(/\D/g, '');
         if (own && chatDigits && chatDigits === own) continue;
       } catch (_) {}
+      // Mensagem EDITADA (pelo CRM ou pelo celular) → atualiza o texto da bolha
+      // original, em vez de criar uma bolha nova "[Mensagem enviada]"
+      const _pm = m.message.protocolMessage;
+      if (_pm && _pm.editedMessage && _pm.key?.id) {
+        const novoTxt = _pm.editedMessage.conversation || _pm.editedMessage.extendedTextMessage?.text || null;
+        if (novoTxt && supabase) {
+          try { await supabase.from('messages').update({ content: novoTxt }).eq('wamid', _pm.key.id); } catch (_) {}
+        }
+        continue;
+      }
+      // Outras mensagens de protocolo (controle interno do WhatsApp) não viram bolha
+      if (_pm) continue;
       // Reação (emoji sobre uma mensagem) → atualiza a mensagem alvo, não cria nova
       if (m.message.reactionMessage) {
         const r = m.message.reactionMessage;
