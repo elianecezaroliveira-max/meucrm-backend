@@ -1647,6 +1647,43 @@ app.put("/contacts/bulk-stage", async (req, res) => {
   res.json({ success: true });
 });
 
+// ── Indicador "digitando…"/"gravando áudio…" para o cliente (igual ao WhatsApp) ──
+// QR Code: presença nativa da Baileys (digitando E gravando). API oficial: indicador
+// de digitação da Meta (dura até 25s e marca a última recebida como lida).
+app.post('/typing', async (req, res) => {
+  try {
+    const { to, account_id, state } = req.body || {};
+    if (!to || !supabase) return res.json({ success: false });
+    const st = ['composing', 'recording', 'paused'].includes(state) ? state : 'composing';
+    let acct = null;
+    if (account_id) {
+      const { data } = await supabase.from('accounts').select('evolution_instance, phone_number_id, token').eq('id', account_id).maybeSingle();
+      acct = data;
+    }
+    // QR Code (Baileys)
+    if (acct?.evolution_instance && _waSocks[acct.evolution_instance] && _waState[acct.evolution_instance] === 'open') {
+      const sock = _waSocks[acct.evolution_instance];
+      const jid = await waResolveJid(sock, to);
+      await sock.sendPresenceUpdate(st, jid);
+      return res.json({ success: true, via: 'qr' });
+    }
+    // API oficial (Meta) — só "digitando"; precisa do id da última mensagem recebida
+    if (acct?.phone_number_id && acct?.token && st !== 'paused') {
+      const { data: lastIn } = await supabase.from('messages').select('wamid')
+        .eq('phone', to).eq('direction', 'inbound').eq('account_id', account_id)
+        .not('wamid', 'is', null).order('timestamp', { ascending: false }).limit(1).maybeSingle();
+      if (lastIn?.wamid) {
+        await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`, {
+          messaging_product: 'whatsapp', status: 'read', message_id: lastIn.wamid,
+          typing_indicator: { type: 'text' }
+        }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } }).catch(() => {});
+        return res.json({ success: true, via: 'cloud' });
+      }
+    }
+    res.json({ success: false });
+  } catch (_) { res.json({ success: false }); }
+});
+
 // Apaga SÓ as mensagens da conversa — o lead continua no CRM e no Pipeline
 // (etapa, etiquetas, anotações e tarefas são preservados)
 app.delete("/contacts/:phone/messages", async (req, res) => {
@@ -3636,10 +3673,17 @@ app.post('/evolution-webhook', async (req, res) => {
         const contactData = { phone, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
         if (ownerEmail) contactData.owner = ownerEmail;
         // Estado atual do contato (para decidir NOME e NÚMERO sem sobrescrever indevidamente)
-        const { data: existC } = await supabase.from('contacts').select('id, account_id').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
-        // NOME: recebida → nome do lead (pushName). Enviada (fromMe) → é o SEU nome, não mexe (só fallback p/ novo).
-        if (!fromMe) contactData.name = name;
-        else if (!existC) contactData.name = isLid ? 'Contato (número oculto)' : phone;
+        const { data: existC } = await supabase.from('contacts').select('id, account_id, name').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
+        // NOME: só define na CRIAÇÃO do contato — depois RESPEITA o nome editado no CRM.
+        // Exceção: se o nome atual é só o número/id (nunca foi personalizado), adota o
+        // nome público do WhatsApp (pushName) quando a pessoa escreve.
+        if (!existC) {
+          contactData.name = !fromMe ? name : (isLid ? 'Contato (número oculto)' : phone);
+        } else if (!fromMe && data.pushName) {
+          const atual = String(existC.name || '');
+          const nuncaPersonalizado = !atual || atual === phone || atual === 'Contato (número oculto)' || /^\d+$/.test(atual.replace(/\D/g, '') === atual.replace(/\s/g, '') ? atual.replace(/\D/g, '') : 'x');
+          if (!atual || atual === phone || atual === 'Contato (número oculto)') contactData.name = name;
+        }
         // NÚMERO da conversa: seu envio (fromMe) fixa no número usado; recebida só define se ainda não houver.
         if (accountId && (fromMe || !existC || existC.account_id == null)) contactData.account_id = accountId;
         // Você respondeu pelo CELULAR/WhatsApp Web → a conversa deixa de ser "não lida"
