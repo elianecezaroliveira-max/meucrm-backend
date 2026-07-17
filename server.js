@@ -505,8 +505,38 @@ app.get("/accounts", async (req, res) => {
     .eq("owner", req.owner || ' ')
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  // Status de conexão: QR = tempo real (estado do motor embutido); API = checagem com cache
+  const out = await Promise.all((data || []).map(async acc => {
+    let status = 'unknown';
+    if (acc.evolution_instance) {
+      const st = _waState[acc.evolution_instance];
+      status = st === 'open' ? 'connected' : (st === 'connecting' ? 'connecting' : 'disconnected');
+    } else if (acc.phone_number_id) {
+      status = await cloudApiStatus(acc.id);
+    }
+    return { ...acc, status };
+  }));
+  res.json(out);
 });
+
+// Status da conta da API oficial (checa o token na Meta, com cache de 5 min
+// para não gastar recursos do Railway a cada carregamento)
+const _acctStatusCache = {};
+async function cloudApiStatus(accId) {
+  const c = _acctStatusCache[accId];
+  if (c && Date.now() - c.ts < 5 * 60000) return c.status;
+  let status = 'disconnected';
+  try {
+    const { data: a } = await supabase.from('accounts').select('phone_number_id, token').eq('id', accId).maybeSingle();
+    if (a?.phone_number_id && a?.token) {
+      const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}?fields=id`,
+        { params: { access_token: a.token }, timeout: 6000 });
+      if (r.data?.id) status = 'connected';
+    }
+  } catch (_) { status = 'disconnected'; }
+  _acctStatusCache[accId] = { status, ts: Date.now() };
+  return status;
+}
 
 // ── Adicionar conta manualmente ──
 app.post("/accounts", async (req, res) => {
