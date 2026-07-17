@@ -2926,7 +2926,19 @@ if (WA_EMBEDDED) {
 }
 
 const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
+const _waQrRetries = {}, _waCreatedAt = {}, _waRegistered = {}; // controle de instâncias que nunca parearam
 let _waVersion = null;
+
+// Encerra e limpa uma instância que nunca chegou a parear (evita "zumbis" que
+// ficam gerando QR para sempre — a Meta detecta o excesso e bloqueia o pareamento
+// com "não foi possível conectar, tente mais tarde")
+async function waCleanupInstance(inst) {
+  try { _waSocks[inst]?.end?.(undefined); } catch (_) {}
+  delete _waSocks[inst]; delete _waState[inst]; delete _waPhone[inst];
+  delete _waErr[inst]; delete qrCache[inst]; delete _waQrRetries[inst]; delete _waCreatedAt[inst]; delete _waRegistered[inst];
+  try { if (supabase) await supabase.from('wa_sessions').delete().eq('instance', inst); } catch (_) {}
+  console.log(`🧹 Instância não pareada encerrada: ${inst}`);
+}
 
 // Diagnóstico do motor embutido (para depurar sem acesso aos logs)
 app.get('/wa/debug', async (req, res) => {
@@ -3000,6 +3012,7 @@ async function waStart(instanceName) {
   if (!_baileys || !supabase) throw new Error('Motor de QR indisponível no servidor');
   if (_waSocks[instanceName]) { try { _waSocks[instanceName].end(undefined); } catch (_) {} delete _waSocks[instanceName]; }
   const { state, saveCreds } = await useSupabaseAuthState(instanceName);
+  _waRegistered[instanceName] = !!state?.creds?.registered; // já pareado antes? (protege da limpeza)
   const { version } = await _baileys.fetchLatestBaileysVersion().catch(e => {
     _waErr[instanceName] = 'fetchVersion: ' + e.message;
     return { version: undefined };
@@ -3044,6 +3057,8 @@ async function waStart(instanceName) {
     if (connection === 'open') {
       _waState[instanceName] = 'open';
       delete qrCache[instanceName];
+      _waQrRetries[instanceName] = 0; // pareou — zera o contador de tentativas
+      _waRegistered[instanceName] = true;
       _waPhone[instanceName] = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
       console.log(`✅ WhatsApp QR conectado: ${instanceName} (${_waPhone[instanceName]})`);
     }
@@ -3051,6 +3066,14 @@ async function waStart(instanceName) {
       _waState[instanceName] = 'close';
       const code = lastDisconnect?.error?.output?.statusCode;
       _waErr[instanceName] = `close ${code || '?'}: ${lastDisconnect?.error?.message || 'sem detalhe'}`;
+      // Instância que NUNCA pareou (usuário abandonou a tela do QR): não fica
+      // tentando para sempre — 3 ciclos de QR e para. Evita o bloqueio da Meta
+      // ("não foi possível conectar, tente mais tarde") por excesso de tentativas.
+      const nuncaPareou = !state?.creds?.registered;
+      if (nuncaPareou && code !== _baileys.DisconnectReason.restartRequired) {
+        _waQrRetries[instanceName] = (_waQrRetries[instanceName] || 0) + 1;
+        if (_waQrRetries[instanceName] > 3) { waCleanupInstance(instanceName); return; }
+      }
       if (code === _baileys.DisconnectReason.loggedOut) {
         console.log(`🔌 ${instanceName}: sessão encerrada (logout no celular)`);
         delete _waSocks[instanceName];
@@ -3240,6 +3263,16 @@ app.post('/evolution/connect', async (req, res) => {
   const instanceName = `meucrm_${Date.now()}`;
   if (WA_EMBEDDED) {
     try {
+      // Limpa instâncias antigas que nunca parearam (QRs abandonados) com mais de
+      // 5 min — menos tentativas simultâneas = menos chance de bloqueio da Meta
+      for (const k of Object.keys(_waSocks)) {
+        // NUNCA mexe em instância já pareada (conta real reconectando) — só limpa
+        // QRs abandonados (nunca pareados) com mais de 5 minutos
+        if (!_waRegistered[k] && _waState[k] !== 'open' && Date.now() - (_waCreatedAt[k] || 0) > 5 * 60000) {
+          await waCleanupInstance(k);
+        }
+      }
+      _waCreatedAt[instanceName] = Date.now();
       await waStart(instanceName);
       let qr = null;
       for (let i = 0; i < 16 && !qr; i++) { await new Promise(r => setTimeout(r, 500)); qr = qrCache[instanceName] || null; }
