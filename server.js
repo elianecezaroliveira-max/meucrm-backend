@@ -1646,6 +1646,19 @@ app.put("/contacts/bulk-stage", async (req, res) => {
   res.json({ success: true });
 });
 
+// Apaga SÓ as mensagens da conversa — o lead continua no CRM e no Pipeline
+// (etapa, etiquetas, anotações e tarefas são preservados)
+app.delete("/contacts/:phone/messages", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const phone = decodeURIComponent(req.params.phone);
+  await supabase.from("messages").delete().eq("phone", phone).eq("owner", req.owner || ' ');
+  const { error } = await supabase.from("contacts")
+    .update({ last_message_preview: null, last_message_direction: null, unread_count: 0, first_unread_at: null })
+    .eq("phone", phone).eq("owner", req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 app.delete("/contacts/bulk-delete", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phones } = req.body;
@@ -3143,6 +3156,14 @@ async function waStart(instanceName) {
     if (type !== 'notify' && type !== 'append') return;
     for (const m of messages || []) {
       if (!m.message) continue;
+      // Conversa "com você mesmo" (recados no próprio número conectado): ignora —
+      // sem isso, ao escanear o QR aparecia um chat com o próprio número no CRM
+      try {
+        const own = String(sock.user?.id || '').split(':')[0].split('@')[0].replace(/\D/g, '');
+        const rjSelf = String(m.key?.remoteJid || '');
+        const chatDigits = (String(m.key?.remoteJidAlt || '') || rjSelf).split('@')[0].replace(/\D/g, '');
+        if (own && chatDigits && chatDigits === own) continue;
+      } catch (_) {}
       // Reação (emoji sobre uma mensagem) → atualiza a mensagem alvo, não cria nova
       if (m.message.reactionMessage) {
         const r = m.message.reactionMessage;
