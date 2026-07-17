@@ -1647,6 +1647,32 @@ app.put("/contacts/bulk-stage", async (req, res) => {
   res.json({ success: true });
 });
 
+// ── Editar mensagem já enviada (igual ao WhatsApp — só QR Code; a API oficial
+// da Meta não suporta edição). Janela do WhatsApp: até 15 minutos após o envio. ──
+app.post('/edit-message', async (req, res) => {
+  const { to, wamid, text, account_id } = req.body || {};
+  if (!to || !wamid || !text) return res.status(400).json({ error: 'to, wamid e text obrigatórios' });
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  let acct = null;
+  if (account_id) {
+    const { data } = await supabase.from('accounts').select('type, evolution_instance').eq('id', account_id).maybeSingle();
+    acct = data;
+  }
+  if (!acct?.evolution_instance)
+    return res.status(400).json({ error: 'Editar mensagem só é possível em conversas do QR Code — a API oficial da Meta não permite edição.' });
+  const sock = _waSocks[acct.evolution_instance];
+  if (!sock || _waState[acct.evolution_instance] !== 'open')
+    return res.status(400).json({ error: 'WhatsApp desconectado — gere o QR novamente em Contas.' });
+  try {
+    const jid = await waResolveJid(sock, to);
+    await sock.sendMessage(jid, { text, edit: { remoteJid: jid, fromMe: true, id: wamid } });
+    await supabase.from('messages').update({ content: text }).eq('wamid', wamid).eq('phone', to);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Falha ao editar: ' + (e.message || 'erro desconhecido') });
+  }
+});
+
 // ── Indicador "digitando…"/"gravando áudio…" para o cliente (igual ao WhatsApp) ──
 // QR Code: presença nativa da Baileys (digitando E gravando). API oficial: indicador
 // de digitação da Meta (dura até 25s e marca a última recebida como lida).
