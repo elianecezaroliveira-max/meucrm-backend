@@ -3568,9 +3568,13 @@ app.post('/evolution-webhook', async (req, res) => {
       }
 
       if (supabase) {
-        // Dedup: evita duplicar mensagens já salvas (ex.: enviadas pelo próprio CRM)
+        // Dedup: evita duplicar mensagens já salvas (ex.: o eco das enviadas pelo próprio CRM).
+        // IMPORTANTE: filtra também pelo telefone da conversa — quando DOIS números
+        // conectados no VETRA conversam entre si, a mensagem chega com o MESMO wamid
+        // nos dois lados; sem o filtro, o lado que recebia era descartado como "eco"
+        // e a mensagem nunca aparecia para quem recebeu.
         if (wamid) {
-          const { data: exists } = await supabase.from('messages').select('id').eq('wamid', wamid).maybeSingle();
+          const { data: exists } = await supabase.from('messages').select('id').eq('wamid', wamid).eq('phone', phone).maybeSingle();
           if (exists) return;
         }
 
