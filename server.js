@@ -1822,6 +1822,24 @@ async function sendBotMsg(phone, accountId, text, owner) {
   const acct = await botGetAcct(accountId, owner);
   const phoneNumberId = acct.phone_number_id, token = acct.token;
   const usedAcctId = acct.id || accountId || null;
+  // Conta QR Code: envia pelo PRÓPRIO número QR (igual ao envio manual)
+  if (acct.evolution_instance) {
+    try {
+      const r = await waSendText(acct.evolution_instance, phone, text);
+      const wamid = r?.key?.id || null;
+      if (supabase) {
+        const ts = new Date().toISOString();
+        await supabase.from('messages').insert({ phone, content: text, type: 'text', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid, owner: owner || null });
+        const prev = text.length > 80 ? text.substring(0, 80) + '…' : text;
+        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
+      }
+      return wamid || true;
+    } catch (e) {
+      console.error('❌ Bot sendMsg (QR):', e.message);
+      await _recordBotFail(phone, text, 'Falha no envio pelo QR Code: ' + (e.message || 'WhatsApp desconectado'), usedAcctId, owner, 'text');
+      return null;
+    }
+  }
   if (!phoneNumberId || !token) {
     await _recordBotFail(phone, text, 'Este número não tem credenciais da API oficial (Phone Number ID/Token). Mensagem do bot não pode ser enviada por ele.', usedAcctId, owner, 'text');
     return null;
@@ -1848,7 +1866,10 @@ async function sendBotMsg(phone, accountId, text, owner) {
 
 async function botGetAcct(accountId, owner) {
   if (supabase && accountId) {
-    const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id').eq('id', accountId).maybeSingle();
+    const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance').eq('id', accountId).maybeSingle();
+    // Conta QR Code escolhida → respeita a escolha (o bot envia pelo próprio QR,
+    // sem desviar para a conta da API oficial)
+    if (data && data.evolution_instance) return data;
     if (data && data.phone_number_id && data.token) return data;
   }
   // Conta não encontrada (ex.: foi EXCLUÍDA) ou sem API oficial (ex.: QR Code) —
