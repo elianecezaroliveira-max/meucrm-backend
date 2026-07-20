@@ -102,10 +102,29 @@ function metaErrorText(er) {
   return txt;
 }
 
+// Escada de status: nunca REBAIXAR (os webhooks da Meta podem chegar fora de
+// ordem — um "sent" atrasado não pode apagar o ✓✓ de um "delivered" já aplicado)
+const _ST_RANK = { pending: 0, sent: 1, delivered: 2, read: 3 };
+async function updateMsgStatus(wamid, upd) {
+  if (!supabase || !wamid || !upd?.status) return;
+  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid); return; }
+  const rank = _ST_RANK[upd.status];
+  if (rank === undefined) return;
+  const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
+  await supabase.from('messages').update(upd).eq('wamid', wamid)
+    .or('status.is.null,status.in.(' + lower.join(',') + ')');
+}
+
 // Buffer de status que chegam ANTES da mensagem ser salva (corrige ✓ que não vira ✓✓)
 const _pendingStatuses = {}; // wamid -> { status, error_info, ts }
 function _cachePendingStatus(wamid, upd) {
   if (!wamid) return;
+  const prev = _pendingStatuses[wamid];
+  // Mantém o status mais avançado já guardado (não rebaixa)
+  if (prev && upd.status !== 'failed' && (_ST_RANK[prev.status] ?? -1) > (_ST_RANK[upd.status] ?? -1)) {
+    prev.ts = Date.now();
+    return;
+  }
   _pendingStatuses[wamid] = { ...upd, ts: Date.now() };
   // limpa entradas com mais de 10 min
   const cutoff = Date.now() - 600000;
@@ -117,7 +136,7 @@ async function applyPendingStatus(wamid) {
   if (!p) return;
   const u = { status: p.status };
   if (p.error_info) u.error_info = p.error_info;
-  await supabase.from('messages').update(u).eq('wamid', wamid);
+  await updateMsgStatus(wamid, u);
 }
 
 // ── Normalização de telefone BR (nono dígito) ──
@@ -176,7 +195,7 @@ app.post("/webhook", async (req, res) => {
               console.error('❌ Entrega falhou:', wamid, upd.error_info);
             }
             _cachePendingStatus(wamid, upd); // guarda caso a msg ainda não esteja salva
-            await supabase.from("messages").update(upd).eq("wamid", wamid);
+            await updateMsgStatus(wamid, upd);
           }
         }
       }
@@ -2117,9 +2136,17 @@ async function handleBotReply(phone, text, owner) {
   let matched = null;
   for (const e of edges) {
     if (!e.label || e.label.startsWith('__')) continue;
-    if (tl === e.label.toLowerCase() || tl.includes(e.label.toLowerCase())) { matched = e; break; }
+    const lb = e.label.toLowerCase();
+    // PALAVRA INTEIRA: antes usava "contém", então "sim" casava com "simulação",
+    // "assim", etc. — e qualquer resposta aleatória disparava o ramo errado
+    const rx = new RegExp('(^|[^\\p{L}\\p{N}])' + lb.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^\\p{L}\\p{N}])', 'u');
+    if (tl === lb || rx.test(tl)) { matched = e; break; }
   }
-  if (!matched) matched = edges.find(e=>e.label==='__other__') || edges.find(e=>!e.label||e.label===''||e.label==='default') || edges[0];
+  // Sem correspondência: usa a saída "outros"/padrão SE existir; senão ENCERRA a
+  // espera — a 1ª RESPOSTA do cliente é a que vale. Se depois ele clicar num
+  // botão antigo, o bot NÃO segue (a conversa já passou para o atendimento).
+  if (!matched) matched = edges.find(e=>e.label==='__other__') || edges.find(e=>!e.label||e.label===''||e.label==='default') || null;
+  if (!matched) { await stopRun(run.id, 'stopped'); return true; }
   if (matched?.to_node_id) {
     const upd = { current_node_id:matched.to_node_id, status:'running', pause_until:null, updated_at:new Date().toISOString() };
     await supabase.from('bot_runs').update(upd).eq('id',run.id);
@@ -3159,7 +3186,7 @@ async function waStart(instanceName) {
       const st = u.update?.status, id = u.key?.id;
       if (!st || !id) continue;
       const mapped = st === 4 || st === 'READ' ? 'read' : (st === 3 || st === 'DELIVERY_ACK' ? 'delivered' : null);
-      if (mapped) { try { await supabase.from('messages').update({ status: mapped }).eq('wamid', id); } catch (_) {} }
+      if (mapped) { try { await updateMsgStatus(id, { status: mapped }); } catch (_) {} }
     }
   });
 
