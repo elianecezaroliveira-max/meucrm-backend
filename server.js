@@ -2900,6 +2900,59 @@ app.get('/bot-runs/contact/:phone', async (req,res) => {
 });
 
 // ═══════════════════════════════════════
+// LEMBRETE DE TAREFAS EM ABERTO
+// Push a cada 20 min se houver tarefa aberta — com liga/desliga e janela
+// de dias/horários POR DIA da semana (horário de Brasília, UTC-3)
+// ═══════════════════════════════════════
+function _remKey(owner) { return 'task_reminder::' + (owner || ' '); }
+
+app.get('/task-reminder', async (req, res) => {
+  if (!supabase) return res.json({ value: null });
+  const { data } = await supabase.from('settings').select('value').eq('key', _remKey(req.owner)).maybeSingle();
+  let v = null;
+  try { v = data?.value ? (typeof data.value === 'string' ? JSON.parse(data.value) : data.value) : null; } catch (_) {}
+  res.json({ value: v });
+});
+
+app.put('/task-reminder', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const v = JSON.stringify(req.body?.value || {});
+  const { error } = await supabase.from('settings').upsert({ key: _remKey(req.owner), value: v, updated_at: new Date().toISOString() });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// Verificação a cada 20 minutos (leve: 1 consulta de settings + 1 contagem por dono ativo)
+setInterval(async () => {
+  if (!supabase || !webpush) return;
+  try {
+    const { data: rows } = await supabase.from('settings').select('key, value').like('key', 'task_reminder::%');
+    for (const row of rows || []) {
+      let cfg;
+      try { cfg = typeof row.value === 'string' ? JSON.parse(row.value) : row.value; } catch (_) { continue; }
+      if (!cfg || !cfg.enabled) continue;
+      // Janela do DIA atual (Brasília): 0=Dom … 6=Sáb
+      const brt = new Date(Date.now() - 3 * 3600000);
+      const d = cfg.days?.[String(brt.getUTCDay())];
+      if (!d || !d.on) continue;
+      const hm = String(brt.getUTCHours()).padStart(2, '0') + ':' + String(brt.getUTCMinutes()).padStart(2, '0');
+      if (hm < (d.start || '09:00') || hm >= (d.end || '18:00')) continue;
+      const owner = row.key.slice('task_reminder::'.length);
+      const ownerVal = owner === ' ' ? null : owner;
+      let tq = supabase.from('tasks').select('id', { count: 'exact', head: true }).eq('done', false);
+      tq = ownerVal ? tq.eq('owner', ownerVal) : tq.is('owner', null);
+      const { count } = await tq;
+      if (!count) continue;
+      await sendPushToOwner(ownerVal, {
+        title: '✅ Tarefas em aberto',
+        body: `Você tem ${count} tarefa${count > 1 ? 's' : ''} em aberto no VETRA`,
+        tag: 'task-reminder'
+      });
+    }
+  } catch (e) { console.error('Lembrete de tarefas:', e.message); }
+}, 20 * 60 * 1000);
+
+// ═══════════════════════════════════════
 // SETTINGS + INTEGRAÇÃO N8N
 // ═══════════════════════════════════════
 
