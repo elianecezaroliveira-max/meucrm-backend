@@ -1640,15 +1640,17 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { account_id, with_messages } = req.query;
-  let query = supabase
-    .from("contacts").select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite, avatar, created_at")
-    .eq("owner", req.owner || ' ')
-    .order("last_message_at", { ascending: false });
-  if (account_id) query = query.eq("account_id", account_id); // filtra pela conta quando informada
-  // Lista de CONVERSAS: só contatos que já tiveram mensagem real (preview só é preenchido por mensagem,
-  // nunca por importação — diferente de last_message_direction, que tem padrão 'inbound' no banco)
-  if (with_messages) query = query.not("last_message_preview", "is", null);
-  const { data, error } = await query;
+  // Tenta incluir created_at; se a coluna ainda não existir no banco, cai para a
+  // seleção sem ela (não quebra o carregamento dos leads/conversas)
+  const COLS_BASE = "phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite, avatar";
+  const build = (cols) => {
+    let q = supabase.from("contacts").select(cols).eq("owner", req.owner || ' ').order("last_message_at", { ascending: false });
+    if (account_id) q = q.eq("account_id", account_id);
+    if (with_messages) q = q.not("last_message_preview", "is", null);
+    return q;
+  };
+  let { data, error } = await build(COLS_BASE + ", created_at");
+  if (error) { ({ data, error } = await build(COLS_BASE)); } // fallback sem created_at
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
 });
