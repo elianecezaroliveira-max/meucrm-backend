@@ -2112,8 +2112,29 @@ async function processNode(run, depth=0) {
 
   } else if (node.type === 'pause') {
     const ms = ((cfg.days||0)*24+(cfg.hours||0))*3600000 + (cfg.minutes||0)*60000 + (cfg.seconds||0)*1000;
-    const pauseUntil = new Date(Date.now()+Math.max(ms,1000)).toISOString();
+    const waitMs = Math.max(ms, 1000);
+    const pauseUntil = new Date(Date.now()+waitMs).toISOString();
     await supabase.from('bot_runs').update({ status:'paused', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
+    // Espera CURTA (até 2 min): cronômetro EXATO na memória — retoma na hora certa.
+    // O ciclo de 30s fica só para esperas longas e como segurança pós-reinício.
+    if (waitMs <= 120000) {
+      setTimeout(async () => {
+        try {
+          // Atômico: só retoma se AINDA estiver pausada (evita corrida com o ciclo de 30s)
+          const { data: took } = await supabase.from('bot_runs')
+            .update({ status:'running', pause_until:null, updated_at:new Date().toISOString() })
+            .eq('id', runId).eq('status', 'paused').select('id');
+          if (!took || !took.length) return;
+          const nxt = await getNextNodeId(nodeId, null);
+          if (nxt) {
+            await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId);
+            await processNode({ ...run, current_node_id:nxt, status:'running' });
+          } else {
+            await stopRun(runId,'completed');
+          }
+        } catch (e) { console.error('Retomada de pausa curta:', e.message); }
+      }, waitMs);
+    }
 
   } else if (node.type === 'business_hours') {
     const st = businessHoursState(Date.now(), cfg);
