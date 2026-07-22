@@ -46,7 +46,24 @@ async function resolveOwner(req) {
     return email;
   } catch (e) { return null; }
 }
-app.use(async (req, res, next) => { try { req.owner = await resolveOwner(req); } catch (_) { req.owner = null; } next(); });
+app.use(async (req, res, next) => {
+  try { req.owner = await resolveOwner(req); } catch (_) { req.owner = null; }
+  // Integração externa: token de LONGA DURAÇÃO no cabeçalho X-Api-Token
+  // identifica o dono (para n8n, Zapier, planilhas e outras ferramentas)
+  if (!req.owner) {
+    const t = req.headers['x-api-token'];
+    if (t) {
+      for (const k in _settings) {
+        if (k.startsWith('api_token::') && _settings[k] === t) {
+          const ow = k.slice('api_token::'.length);
+          req.owner = ow === ' ' ? null : ow;
+          break;
+        }
+      }
+    }
+  }
+  next();
+});
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 
@@ -2897,6 +2914,32 @@ app.get('/bot-runs/contact/:phone', async (req,res) => {
   if (!supabase) return res.json([]);
   const { data } = await supabase.from('bot_runs').select('*, bots(name)').eq('contact_phone',req.params.phone).eq('owner', req.owner || ' ').in('status',['running','waiting_reply','paused']).order('created_at',{ascending:false});
   res.json(data||[]);
+});
+
+// ═══════════════════════════════════════
+// CONFIGURAÇÕES: INTEGRAÇÃO (token) + FATURAMENTO
+// ═══════════════════════════════════════
+app.get('/integration/token', async (req, res) => {
+  if (!supabase) return res.json({ token: null });
+  const { data } = await supabase.from('settings').select('value').eq('key', 'api_token::' + (req.owner || ' ')).maybeSingle();
+  res.json({ token: data?.value || null });
+});
+app.post('/integration/token', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const token = 'vetra_' + require('crypto').randomBytes(24).toString('hex');
+  const key = 'api_token::' + (req.owner || ' ');
+  const { error } = await supabase.from('settings').upsert({ key, value: token, updated_at: new Date().toISOString() });
+  if (error) return res.status(500).json({ error: error.message });
+  _settings[key] = token; // vale imediatamente, sem esperar o recarregamento
+  res.json({ token });
+});
+// Faturamento (exibição): plano e validade ficam em settings (chave billing::<dono>)
+app.get('/billing', async (req, res) => {
+  if (!supabase) return res.json({ value: null });
+  const { data } = await supabase.from('settings').select('value').eq('key', 'billing::' + (req.owner || ' ')).maybeSingle();
+  let v = null;
+  try { v = data?.value ? (typeof data.value === 'string' ? JSON.parse(data.value) : data.value) : null; } catch (_) {}
+  res.json({ value: v });
 });
 
 // ═══════════════════════════════════════
