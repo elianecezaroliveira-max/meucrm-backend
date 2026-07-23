@@ -1881,11 +1881,22 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
   } catch(e) { console.error('recordBotFail:', e.message); }
 }
 
-async function sendBotMsg(phone, accountId, text, owner) {
-  // Resolve a conta com fallback inteligente (conta excluída → conta oficial ativa do dono)
-  const acct = await botGetAcct(accountId, owner);
+async function sendBotMsg(phone, accountId, text, owner, nodeAccountId) {
+  let acct, usedAcctId;
+  if (nodeAccountId) {
+    // Nó com número CONFIGURADO: obedece exatamente — sem troca automática
+    acct = await botGetAcctStrict(nodeAccountId);
+    usedAcctId = nodeAccountId;
+    if (!acct) {
+      await _recordBotFail(phone, text, 'O número configurado neste passo do bot não existe mais. Edite o nó "Enviar mensagem" e escolha outro número.', usedAcctId, owner, 'text');
+      return null;
+    }
+  } else {
+    // Sem número no nó (fluxos antigos): resolve pela conta da execução
+    acct = await botGetAcct(accountId, owner);
+    usedAcctId = acct.id || accountId || null;
+  }
   const phoneNumberId = acct.phone_number_id, token = acct.token;
-  const usedAcctId = acct.id || accountId || null;
   // Conta QR Code: envia pelo PRÓPRIO número QR (igual ao envio manual)
   if (acct.evolution_instance) {
     try {
@@ -1926,6 +1937,14 @@ async function sendBotMsg(phone, accountId, text, owner) {
     await _recordBotFail(phone, text, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio'), usedAcctId, owner, 'text');
     return null;
   }
+}
+
+// ESTRITO: devolve EXATAMENTE a conta pedida (ou null) — sem nenhum fallback.
+// Usado quando o nó do bot tem um número configurado: ou envia por ele, ou falha.
+async function botGetAcctStrict(accountId) {
+  if (!supabase || !accountId) return null;
+  const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance').eq('id', accountId).maybeSingle();
+  return data || null;
 }
 
 async function botGetAcct(accountId, owner) {
@@ -1982,11 +2001,27 @@ function renderTemplateBody(bodyText, vars) {
 
 // Envia um MODELO aprovado pelo bot (com variáveis no corpo)
 async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
-  const acct = await botGetAcct(accountId, owner);
-  const usedAcctId = acct.id || accountId || null;
-  if (!acct.phone_number_id || !acct.token) {
-    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Este número não é da API oficial (sem Phone Number ID/Token). Modelos só podem ser enviados por número da API oficial — não por número de QR Code.', usedAcctId, owner, 'template');
-    return null;
+  let acct, usedAcctId;
+  if (cfg.account_id) {
+    // Nó com número CONFIGURADO: obedece exatamente — ou envia por ele, ou FALHA.
+    // Nunca troca de número sozinho.
+    acct = await botGetAcctStrict(cfg.account_id);
+    usedAcctId = cfg.account_id;
+    if (!acct) {
+      await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'O número configurado neste passo do bot não existe mais. Edite o nó "Enviar mensagem" e escolha outro número.', usedAcctId, owner, 'template');
+      return null;
+    }
+    if (!acct.phone_number_id || !acct.token) {
+      await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'O número configurado neste passo é de QR Code — modelos só saem pela API oficial. Edite o nó e escolha um número da API.', usedAcctId, owner, 'template');
+      return null;
+    }
+  } else {
+    acct = await botGetAcct(accountId, owner);
+    usedAcctId = acct.id || accountId || null;
+    if (!acct.phone_number_id || !acct.token) {
+      await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Este número não é da API oficial (sem Phone Number ID/Token). Modelos só podem ser enviados por número da API oficial — não por número de QR Code.', usedAcctId, owner, 'template');
+      return null;
+    }
   }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
   let bodyText = null;
@@ -2082,7 +2117,8 @@ async function processNode(run, depth=0) {
       sendOk = await sendBotTemplate(phone, acctId, cfg, name, notes, botOwner);
     } else {
       const text = applyVars(cfg.text || '', name, phone, notes);
-      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner) : true; // sem texto = nada a enviar (não é falha)
+      // cfg.account_id = número escolhido NO NÓ (obedecido à risca, sem troca)
+      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner, cfg.account_id || null) : true; // sem texto = nada a enviar (não é falha)
     }
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
     const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
