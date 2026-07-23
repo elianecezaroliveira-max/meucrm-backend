@@ -3815,12 +3815,38 @@ app.get('/evolution/status/:instance', async (req, res) => {
   }
 });
 
+// POST /accounts/:id/reconnect-qr — RECONECTA uma conta QR desconectada:
+// gera um QR novo para a MESMA conta (mantém id, leads, bots e nome)
+app.post('/accounts/:id/reconnect-qr', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!WA_EMBEDDED) return res.status(400).json({ error: 'Motor QR embutido não está ativo neste servidor.' });
+  const { data: acc } = await supabase.from('accounts')
+    .select('id, evolution_instance').eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!acc || !acc.evolution_instance) return res.status(400).json({ error: 'Esta conta não é de QR Code.' });
+  const inst = acc.evolution_instance;
+  try {
+    // Encerra o socket atual e limpa a sessão morta — força a emissão de um QR novo
+    try { _waSocks[inst]?.end?.(undefined); } catch (_) {}
+    delete _waSocks[inst]; delete qrCache[inst];
+    _waQrRetries[inst] = 0; _waRegistered[inst] = false; _waState[inst] = 'connecting';
+    _waCreatedAt[inst] = Date.now();
+    await supabase.from('wa_sessions').delete().eq('instance', inst);
+    await waStart(inst);
+    let qr = null;
+    for (let i = 0; i < 16 && !qr; i++) { await new Promise(r => setTimeout(r, 500)); qr = qrCache[inst] || null; }
+    console.log(`🔄 Reconexão de QR iniciada para ${inst} — QR: ${qr ? 'SIM' : 'via polling'}`);
+    res.json({ success: true, instance: inst, qr });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /evolution/save-account — salva conta Evolution no Supabase após conexão
 app.post('/evolution/save-account', async (req, res) => {
   const { instance, phone } = req.body;
   if (!instance) return res.status(400).json({ error: 'instance obrigatório' });
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
-  const name = phone ? `WhatsApp ${phone}` : `WhatsApp QR (${instance})`;
+  // Se a conta já existe (reconexão), PRESERVA o nome personalizado
+  const { data: exist } = await supabase.from('accounts').select('name').eq('phone_number_id', instance).maybeSingle();
+  const name = exist?.name || (phone ? `WhatsApp ${phone}` : `WhatsApp QR (${instance})`);
   const { data, error } = await supabase.from('accounts')
     .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '', owner: req.owner || null }, { onConflict: 'phone_number_id' })
     .select().single();
