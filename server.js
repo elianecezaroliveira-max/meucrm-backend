@@ -546,14 +546,51 @@ app.get("/accounts", async (req, res) => {
   const out = await Promise.all((data || []).map(async acc => {
     let status = 'unknown';
     if (acc.evolution_instance) {
-      const st = _waState[acc.evolution_instance];
-      status = st === 'open' ? 'connected' : (st === 'connecting' ? 'connecting' : 'disconnected');
+      // Sem meio-termo: ou está conectada, ou está DESCONECTADA (o "conectando"
+      // eterno das re-tentativas confundia — melhor avisar que caiu)
+      status = _waState[acc.evolution_instance] === 'open' ? 'connected' : 'disconnected';
     } else if (acc.phone_number_id) {
       status = await cloudApiStatus(acc.id);
     }
     return { ...acc, status };
   }));
   res.json(out);
+});
+
+// ── CENTRAL DE AVISOS: registra eventos importantes (ex.: número desconectado)
+// e manda push. Guardado em settings (notices::<dono>), últimos 50, sem repetir
+// o mesmo aviso em menos de 1 hora.
+async function addNotice(owner, text, dedupeKey) {
+  if (!supabase) return;
+  try {
+    const K = 'notices::' + (owner || ' ');
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    let list = [];
+    try { list = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+    const now = Date.now();
+    if (dedupeKey && list.some(n => n.k === dedupeKey && now - n.ts < 3600000)) return;
+    list.unshift({ text, ts: now, k: dedupeKey || null, read: false });
+    list = list.slice(0, 50);
+    await supabase.from('settings').upsert({ key: K, value: JSON.stringify(list), updated_at: new Date().toISOString() });
+    sendPushToOwner(owner || null, { title: '⚠️ VETRA — Aviso', body: text, tag: 'notice' }).catch(() => {});
+  } catch (e) { console.error('addNotice:', e.message); }
+}
+app.get('/notices', async (req, res) => {
+  if (!supabase) return res.json({ value: [] });
+  const { data } = await supabase.from('settings').select('value').eq('key', 'notices::' + (req.owner || ' ')).maybeSingle();
+  let v = [];
+  try { v = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  res.json({ value: v });
+});
+app.put('/notices/read', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const K = 'notices::' + (req.owner || ' ');
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  let v = [];
+  try { v = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  v.forEach(n => n.read = true);
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(v), updated_at: new Date().toISOString() });
+  res.json({ success: true });
 });
 
 // Status da conta da API oficial (checa o token na Meta, com cache de 5 min
@@ -571,6 +608,14 @@ async function cloudApiStatus(accId) {
       if (r.data?.id) status = 'connected';
     }
   } catch (_) { status = 'disconnected'; }
+  // Estava conectada e caiu → avisa a dona (token inválido/expirado)
+  const prev = _acctStatusCache[accId]?.status;
+  if (prev === 'connected' && status === 'disconnected') {
+    try {
+      const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
+      if (a) addNotice(a.owner, `🔌 A conta da API oficial "${a.name}" está DESCONECTADA (token inválido ou expirado). Verifique em Contas.`, 'disc:' + accId);
+    } catch (_) {}
+  }
   _acctStatusCache[accId] = { status, ts: Date.now() };
   return status;
 }
@@ -3422,6 +3467,11 @@ async function waStart(instanceName) {
         console.log(`🔌 ${instanceName}: sessão encerrada (logout no celular)`);
         delete _waSocks[instanceName];
         supabase.from('wa_sessions').delete().eq('instance', instanceName).then(() => {}, () => {});
+        // Avisa a dona: número QR desconectado de vez
+        (async () => { try {
+          const { data: a } = await supabase.from('accounts').select('name, owner').eq('evolution_instance', instanceName).maybeSingle();
+          if (a) addNotice(a.owner, `🔌 O número QR "${a.name}" foi DESCONECTADO (sessão encerrada no celular). Use o botão Reconectar em Contas.`, 'disc:' + instanceName);
+        } catch (_) {} })();
       } else if (_waSocks[instanceName] === sock) {
         // 515 (restartRequired) chega LOGO APÓS escanear o QR: o WhatsApp exige
         // reiniciar a conexão imediatamente para concluir o pareamento. Esperar 4s
@@ -3436,6 +3486,13 @@ async function waStart(instanceName) {
           // por horas (celular desligado), o servidor não gasta CPU tentando a cada 4s.
           waitMs = _waReconnDelay[instanceName] || 4000;
           _waReconnDelay[instanceName] = Math.min(waitMs * 2, 5 * 60000);
+          // Várias tentativas falharam numa conta pareada → avisa que ela caiu
+          if (_waRegistered[instanceName] && waitMs >= 64000) {
+            (async () => { try {
+              const { data: a } = await supabase.from('accounts').select('name, owner').eq('evolution_instance', instanceName).maybeSingle();
+              if (a) addNotice(a.owner, `🔌 O número QR "${a.name}" está DESCONECTADO (sem conseguir reconectar). Verifique o celular ou use Reconectar em Contas.`, 'disc:' + instanceName);
+            } catch (_) {} })();
+          }
         }
         console.log(`↩️ ${instanceName}: reconectando em ${waitMs}ms (código ${code || '?'}${restartNow ? ' — pós-pareamento' : ''})`);
         setTimeout(() => waStart(instanceName).catch(e => console.error('WA reconnect:', e.message)), waitMs);
