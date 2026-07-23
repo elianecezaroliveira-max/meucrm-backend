@@ -1892,9 +1892,9 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId) {
       return null;
     }
   } else {
-    // Sem número no nó (fluxos antigos): resolve pela conta da execução
-    acct = await botGetAcct(accountId, owner);
-    usedAcctId = acct.id || accountId || null;
+    // SEM número configurado no nó = NÃO ENVIA (bloqueio total, por segurança)
+    await _recordBotFail(phone, text, '⛔ Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "📱 Enviar pelo número".', accountId || null, owner, 'text');
+    return null;
   }
   const phoneNumberId = acct.phone_number_id, token = acct.token;
   // Conta QR Code: envia pelo PRÓPRIO número QR (igual ao envio manual)
@@ -2016,12 +2016,10 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       return null;
     }
   } else {
-    acct = await botGetAcct(accountId, owner);
-    usedAcctId = acct.id || accountId || null;
-    if (!acct.phone_number_id || !acct.token) {
-      await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Este número não é da API oficial (sem Phone Number ID/Token). Modelos só podem ser enviados por número da API oficial — não por número de QR Code.', usedAcctId, owner, 'template');
-      return null;
-    }
+    // SEM número configurado no nó = NÃO ENVIA (bloqueio total, por segurança).
+    // Edite o nó "Enviar mensagem" e escolha o número.
+    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, '⛔ Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "📱 Enviar pelo número".', accountId || null, owner, 'template');
+    return null;
   }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
   let bodyText = null;
