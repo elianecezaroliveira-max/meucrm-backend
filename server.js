@@ -2216,9 +2216,70 @@ async function handleBotReply(phone, text, owner) {
   return true;
 }
 
+// ── AÇÕES DE ETAPA (Automação do funil): executadas quando o lead ENTRA na etapa.
+// Tipos: task (criar tarefa), complete_task (concluir), tags (editar), move_stage
+// (mudar etapa, com proteção contra loop), create_lead (criar lead fixo).
+// NENHUMA delas envia mensagem ao cliente.
+async function runStageActions(phone, stageId, owner, depth = 0) {
+  if (!supabase || depth > 3) return; // proteção contra correntes infinitas de "mudar etapa"
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'stage_actions::' + (owner || ' ')).maybeSingle();
+    if (!data || !data.value) return;
+    let cfg; try { cfg = typeof data.value === 'string' ? JSON.parse(data.value) : data.value; } catch (_) { return; }
+    const actions = (cfg && cfg[stageId]) || [];
+    const OW = owner || ' ';
+    for (const a of actions) {
+      try {
+        if (a.type === 'task' && a.title) {
+          const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
+          const title = applyVars(a.title, ct?.name || phone, phone);
+          const due = a.due_hours ? new Date(Date.now() + Number(a.due_hours) * 3600000).toISOString() : null;
+          await supabase.from('tasks').insert({ phone, title, due_at: due, owner: owner || null });
+        } else if (a.type === 'complete_task') {
+          let q = supabase.from('tasks').update({ done: true }).eq('phone', phone).eq('done', false).eq('owner', OW);
+          if (a.title_filter) q = q.ilike('title', '%' + a.title_filter + '%');
+          await q;
+        } else if (a.type === 'tags') {
+          const { data: ct } = await supabase.from('contacts').select('tags').eq('phone', phone).eq('owner', OW).maybeSingle();
+          let tags = Array.isArray(ct?.tags) ? ct.tags.slice() : [];
+          (a.add || []).forEach(t => { if (t && !tags.includes(t)) tags.push(t); });
+          if (a.remove && a.remove.length) tags = tags.filter(t => !a.remove.includes(t));
+          await supabase.from('contacts').update({ tags }).eq('phone', phone).eq('owner', OW);
+        } else if (a.type === 'move_stage' && a.stage_id && a.stage_id !== stageId) {
+          await supabase.from('contacts').update({ stage_id: a.stage_id }).eq('phone', phone).eq('owner', OW);
+          await fireStageBots(phone, a.stage_id, owner, depth + 1); // encadeia com limite
+        } else if (a.type === 'create_lead' && a.phone) {
+          const np = String(a.phone).replace(/\D/g, '');
+          if (np) await supabase.from('contacts').upsert(
+            { phone: np, name: a.name || np, stage_id: a.lead_stage_id || null, owner: owner || null },
+            { onConflict: 'owner,phone' });
+        }
+      } catch (e) { console.error('Ação de etapa falhou:', a.type, e.message); }
+    }
+  } catch (e) { console.error('runStageActions:', e.message); }
+}
+
+// Configuração das ações de etapa (Automação do funil)
+app.get('/stage-actions', async (req, res) => {
+  if (!supabase) return res.json({ value: {} });
+  const { data } = await supabase.from('settings').select('value').eq('key', 'stage_actions::' + (req.owner || ' ')).maybeSingle();
+  let v = {};
+  try { v = data?.value ? (typeof data.value === 'string' ? JSON.parse(data.value) : data.value) : {}; } catch (_) {}
+  res.json({ value: v });
+});
+app.put('/stage-actions', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const v = JSON.stringify(req.body?.value || {});
+  const { error } = await supabase.from('settings').upsert({ key: 'stage_actions::' + (req.owner || ' '), value: v, updated_at: new Date().toISOString() });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // Dispara todos os bots com gatilho "entrou na etapa" para um lead (do dono certo)
-async function fireStageBots(phone, stageId, owner) {
+async function fireStageBots(phone, stageId, owner, depth = 0) {
   if (!supabase || !stageId || !phone) return;
+  // Ações de etapa (tarefas, tags, mover, criar lead) — antes dos bots
+  await runStageActions(phone, stageId, owner, depth);
   try {
     let bq = supabase.from('bots').select('*').eq('trigger_type','stage_enter').eq('trigger_stage_id',stageId).eq('active',true);
     if (owner) bq = bq.eq('owner', owner); // só os bots do dono do lead
