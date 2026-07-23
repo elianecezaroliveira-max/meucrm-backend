@@ -2111,12 +2111,19 @@ async function processNode(run, depth=0) {
     const name = ct?.name || phone;
     const notes = ct?.notes || '';
     let sendOk;
+    // Número deste passo: o configurado NO NÓ ou o HERDADO da execução
+    // (definido por um passo anterior com número ou pelo Round Robin).
+    // Só se pergunta uma vez — os passos seguintes herdam automaticamente.
+    const nodeAcct = cfg.account_id || run.account_id || null;
+    if (cfg.account_id && run.account_id !== cfg.account_id) {
+      try { await supabase.from('bot_runs').update({ account_id: cfg.account_id, updated_at: new Date().toISOString() }).eq('id', runId); } catch (_) {}
+      run.account_id = cfg.account_id; // os próximos passos herdam este número
+    }
     if (cfg.mode === 'template' && cfg.template_name) {
-      sendOk = await sendBotTemplate(phone, acctId, cfg, name, notes, botOwner);
+      sendOk = await sendBotTemplate(phone, acctId, { ...cfg, account_id: nodeAcct }, name, notes, botOwner);
     } else {
       const text = applyVars(cfg.text || '', name, phone, notes);
-      // cfg.account_id = número escolhido NO NÓ (obedecido à risca, sem troca)
-      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner, cfg.account_id || null) : true; // sem texto = nada a enviar (não é falha)
+      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct) : true; // sem texto = nada a enviar (não é falha)
     }
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
     const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
@@ -2386,7 +2393,9 @@ async function startBot(botId, phone, accountId, owner) {
   const startNode = startNodes && startNodes[0];
   if (!startNode) { console.error('❌ Bot sem nó start:', botId); return null; }
   const { data:run, error } = await supabase.from('bot_runs').insert({
-    bot_id:botId, contact_phone:phone, account_id:accountId||null,
+    // account_id começa VAZIO de propósito: o número usado nos envios vem SÓ dos
+    // nós configurados ou do Round Robin — nunca de uma conta implícita do lead.
+    bot_id:botId, contact_phone:phone, account_id:null,
     current_node_id:startNode.id, status:'running', owner:ownerEmail||null,
     created_at:new Date().toISOString(), updated_at:new Date().toISOString()
   }).select().single();
