@@ -122,14 +122,30 @@ function metaErrorText(er) {
 // Escada de status: nunca REBAIXAR (os webhooks da Meta podem chegar fora de
 // ordem — um "sent" atrasado não pode apagar o ✓✓ de um "delivered" já aplicado)
 const _ST_RANK = { pending: 0, sent: 1, delivered: 2, read: 3 };
+// Espelha o status na PRÉVIA da conversa (tiques na lista) — só se for a última mensagem
+async function _mirrorContactStatus(wamid, status) {
+  try {
+    const { data: rows } = await supabase.from('messages').select('phone, owner, timestamp').eq('wamid', wamid).limit(3);
+    const lower = _ST_RANK[status] !== undefined ? Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < _ST_RANK[status]) : null;
+    for (const r of (rows || [])) {
+      let q = supabase.from('contacts').update({ last_message_status: status })
+        .eq('phone', r.phone).eq('last_message_direction', 'outbound')
+        .lte('last_message_at', r.timestamp);
+      q = r.owner ? q.eq('owner', r.owner) : q.is('owner', null);
+      if (lower) q = q.or('last_message_status.is.null,last_message_status.in.(' + lower.join(',') + ')');
+      await q; // se a coluna ainda não existir no banco, só retorna erro silencioso
+    }
+  } catch (_) {}
+}
 async function updateMsgStatus(wamid, upd) {
   if (!supabase || !wamid || !upd?.status) return;
-  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid); return; }
+  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid); _mirrorContactStatus(wamid, 'failed'); return; }
   const rank = _ST_RANK[upd.status];
   if (rank === undefined) return;
   const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
   await supabase.from('messages').update(upd).eq('wamid', wamid)
     .or('status.is.null,status.in.(' + lower.join(',') + ')');
+  _mirrorContactStatus(wamid, upd.status);
 }
 
 // Buffer de status que chegam ANTES da mensagem ser salva (corrige ✓ que não vira ✓✓)
@@ -1694,7 +1710,8 @@ app.get("/contacts", async (req, res) => {
     if (with_messages) q = q.not("last_message_preview", "is", null);
     return q;
   };
-  let { data, error } = await build(COLS_BASE + ", created_at");
+  let { data, error } = await build(COLS_BASE + ", created_at, last_message_status");
+  if (error) { ({ data, error } = await build(COLS_BASE + ", created_at")); } // fallback sem last_message_status
   if (error) { ({ data, error } = await build(COLS_BASE)); } // fallback sem created_at
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -2427,7 +2444,7 @@ async function fireStageBots(phone, stageId, owner, depth = 0) {
   } catch(e) { console.error('fireStageBots error:', e.message); }
 }
 
-async function startBot(botId, phone, accountId, owner) {
+async function startBot(botId, phone, accountId, owner, seedAccount) {
   if (!supabase) return null;
   let ownerEmail = owner;
   if (!ownerEmail) { const { data:b } = await supabase.from('bots').select('owner').eq('id',botId).maybeSingle(); ownerEmail = b?.owner || null; }
@@ -2438,7 +2455,9 @@ async function startBot(botId, phone, accountId, owner) {
   const { data:run, error } = await supabase.from('bot_runs').insert({
     // account_id começa VAZIO de propósito: o número usado nos envios vem SÓ dos
     // nós configurados ou do Round Robin — nunca de uma conta implícita do lead.
-    bot_id:botId, contact_phone:phone, account_id:null,
+    // EXCEÇÃO (seedAccount): disparo MANUAL de dentro do chat — usa o número da
+    // própria conversa (o "Enviar de" que está na tela), escolha explícita da usuária.
+    bot_id:botId, contact_phone:phone, account_id:(seedAccount && accountId) ? accountId : null,
     current_node_id:startNode.id, status:'running', owner:ownerEmail||null,
     created_at:new Date().toISOString(), updated_at:new Date().toISOString()
   }).select().single();
@@ -3025,7 +3044,7 @@ app.post('/bots/:id/start', async (req,res) => {
   // confirma que o bot é do dono
   const { data: own } = await supabase.from('bots').select('id').eq('id',req.params.id).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
-  const run = await startBot(req.params.id, phone, account_id, req.owner);
+  const run = await startBot(req.params.id, phone, account_id, req.owner, true); // manual no chat: herda o número da conversa
   if (!run) return res.status(500).json({error:'Erro ao iniciar bot (verifique se o fluxo tem nó Início)'});
   res.json({success:true, run_id:run.id});
 });
