@@ -671,10 +671,24 @@ app.delete("/accounts/:id", async (req, res) => {
 });
 
 // ── Enviar mensagem ──
+// REGRA DE OURO: quando VOCÊ envia qualquer mensagem na conversa, o bot daquele
+// lead é ENCERRADO na hora — humano assumiu, robô sai de cena. Nunca mais um bot
+// se intromete numa conversa que você está tocando.
+async function stopBotRunsForPhone(phone, owner) {
+  try {
+    if (!supabase || !phone) return;
+    let q = supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() })
+      .eq('contact_phone', phone).in('status',['running','waiting_reply','paused']);
+    if (owner) q = q.eq('owner', owner);
+    await q;
+  } catch (_) {}
+}
+
 app.post("/send", async (req, res) => {
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
+  stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
 
   let phoneNumberId, token, evolutionInstance = null, accountType = 'cloudapi';
 
@@ -935,6 +949,7 @@ app.post("/send-media", async (req, res) => {
   if (!to || !fileBase64 || !fileName || !mimeType)
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
+  stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
 
   let phoneNumberId, token, accountType = 'cloudapi', evolutionInstance = null;
   if (supabase && account_id) {
@@ -1612,6 +1627,7 @@ app.post("/send-template", async (req, res) => {
   if (!to || !account_id || !template_name)
     return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
+  stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { data: account, error: accErr } = await supabase
     .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
@@ -2337,6 +2353,10 @@ async function handleBotReply(phone, text, owner) {
   if (owner) rq = rq.eq('owner', owner); // só a run do dono certo (telefone pode repetir entre donos)
   const { data:run } = await rq.maybeSingle();
   if (!run) return false;
+  // VALIDADE: execução parada há mais de 48h é FANTASMA — encerra em silêncio e
+  // NUNCA dispara nada na conversa (a resposta segue para o atendimento normal).
+  const ageMs = Date.now() - new Date(run.updated_at || run.created_at || 0).getTime();
+  if (ageMs > 48*3600000) { await stopRun(run.id, 'stopped'); return false; }
   const { data:edges } = await supabase.from('bot_edges').select('*').eq('from_node_id', run.current_node_id);
   if (!edges?.length) { await stopRun(run.id,'completed'); return true; }
   const tl = text.toLowerCase().trim();
@@ -2466,6 +2486,18 @@ async function startBot(botId, phone, accountId, owner, seedAccount) {
   return run;
 }
 
+// FAXINA na subida do servidor: execuções de bot paradas há mais de 48h são
+// fantasmas de disparos antigos — encerra TODAS em silêncio, nada acorda depois.
+(async () => {
+  try {
+    if (!supabase) return;
+    const cutoff = new Date(Date.now() - 48*3600000).toISOString();
+    await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() })
+      .in('status',['running','waiting_reply','paused']).lt('updated_at', cutoff);
+    console.log('🧹 Faxina de bots fantasmas concluída');
+  } catch (_) {}
+})();
+
 // Timer: retoma runs pausadas/expiradas do bot.
 // 30s (era 5s) — economiza CPU/banda no Railway; as esperas dos bots são de
 // minutos/horas, então até 30s de folga não muda nada na prática.
@@ -2474,6 +2506,9 @@ setInterval(async () => {
   const now = new Date().toISOString();
   const { data:paused } = await supabase.from('bot_runs').select('*').in('status',['paused','waiting_reply']).lte('pause_until',now).not('pause_until','is',null);
   for (const run of paused||[]) {
+    // EXPIRADA: se a hora de retomar passou há mais de 15 min (servidor reiniciou,
+    // execução esquecida), NÃO envia nada "do nada" — encerra em silêncio.
+    if (Date.now() - new Date(run.pause_until).getTime() > 15*60000) { await stopRun(run.id,'stopped'); continue; }
     // Se o nó atual é "Horário comercial", re-avalia o próprio nó (não avança)
     const { data:curNode } = await supabase.from('bot_nodes').select('type').eq('id', run.current_node_id).maybeSingle();
     if (curNode?.type === 'business_hours') {
