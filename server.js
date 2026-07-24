@@ -319,6 +319,12 @@ app.post("/webhook", async (req, res) => {
         mediaId = message.sticker?.id || null;
         mediaMimeType = message.sticker?.mime_type || "image/webp";
         content = "[Figurinha]";
+      } else if (type === "location") {
+        const la = message.location?.latitude, lo = message.location?.longitude;
+        content = `📍 ${message.location?.name || 'Localização'}` + (la != null ? `\nhttps://maps.google.com/?q=${la},${lo}` : '');
+      } else if (type === "contacts") {
+        const ct0 = (message.contacts || [])[0];
+        content = `👤 ${ct0?.name?.formatted_name || 'Contato'}` + (ct0?.phones?.[0]?.phone ? `\n${ct0.phones[0].phone}` : '');
       } else if (type === "button") {
         // Botão de resposta rápida de um template aprovado
         content = message.button?.text || "[Botão]";
@@ -1726,7 +1732,8 @@ app.get("/contacts", async (req, res) => {
     if (with_messages) q = q.not("last_message_preview", "is", null);
     return q;
   };
-  let { data, error } = await build(COLS_BASE + ", created_at, last_message_status");
+  let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned");
+  if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status")); } // fallback sem pinned
   if (error) { ({ data, error } = await build(COLS_BASE + ", created_at")); } // fallback sem last_message_status
   if (error) { ({ data, error } = await build(COLS_BASE)); } // fallback sem created_at
   if (error) return res.status(500).json({ error: error.message });
@@ -1856,6 +1863,125 @@ async function botTypingPulse(phone, accountId) {
   } catch (_) {}
   return null;
 }
+
+// Grava a mensagem enviada + atualiza a prévia da conversa (recursos especiais)
+async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
+  if (!supabase) return;
+  const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
+  await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', owner: req.owner || null }, { onConflict: 'owner,phone' });
+  await supabase.from('messages').insert({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, wamid: wamid || null, owner: req.owner || null });
+}
+
+// 📍 Enviar localização (QR e API oficial)
+app.post('/send-location', async (req, res) => {
+  try {
+    let { to, account_id, lat, lng, name } = req.body || {};
+    lat = parseFloat(lat); lng = parseFloat(lng);
+    if (!to || isNaN(lat) || isNaN(lng)) return res.status(400).json({ error: 'Informe to, lat e lng' });
+    to = await resolveExistingPhone(to, req.owner);
+    stopBotRunsForPhone(to, req.owner);
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').maybeSingle();
+    if (!acct) return res.status(400).json({ error: 'Conta não encontrada' });
+    const content = `📍 ${name || 'Localização'}\nhttps://maps.google.com/?q=${lat},${lng}`;
+    let wamid = null;
+    if (acct.evolution_instance) {
+      const r = await waSendRaw(acct.evolution_instance, to, { location: { degreesLatitude: lat, degreesLongitude: lng, name: name || undefined } });
+      wamid = r?.key?.id || null;
+    } else if (acct.phone_number_id && acct.token) {
+      const r = await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
+        { messaging_product: 'whatsapp', to, type: 'location', location: { latitude: lat, longitude: lng, name: name || undefined } },
+        { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
+      wamid = r.data?.messages?.[0]?.id || null;
+    } else return res.status(400).json({ error: 'Conta sem credenciais' });
+    await saveOutboundSpecial(req, to, account_id, 'location', content, wamid);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.response?.data?.error?.message || e.message }); }
+});
+
+// 👤 Enviar cartão de contato (QR e API oficial)
+app.post('/send-contact', async (req, res) => {
+  try {
+    let { to, account_id, cname, cphone } = req.body || {};
+    if (!to || !cname || !cphone) return res.status(400).json({ error: 'Informe to, cname e cphone' });
+    to = await resolveExistingPhone(to, req.owner);
+    stopBotRunsForPhone(to, req.owner);
+    const digits = String(cphone).replace(/\D/g, '');
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').maybeSingle();
+    if (!acct) return res.status(400).json({ error: 'Conta não encontrada' });
+    const content = `👤 ${cname}\n+${digits}`;
+    let wamid = null;
+    if (acct.evolution_instance) {
+      const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${cname}\nTEL;type=CELL;waid=${digits}:+${digits}\nEND:VCARD`;
+      const r = await waSendRaw(acct.evolution_instance, to, { contacts: { displayName: cname, contacts: [{ displayName: cname, vcard }] } });
+      wamid = r?.key?.id || null;
+    } else if (acct.phone_number_id && acct.token) {
+      const r = await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
+        { messaging_product: 'whatsapp', to, type: 'contacts', contacts: [{ name: { formatted_name: cname, first_name: cname }, phones: [{ phone: '+' + digits, wa_id: digits, type: 'CELL' }] }] },
+        { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
+      wamid = r.data?.messages?.[0]?.id || null;
+    } else return res.status(400).json({ error: 'Conta sem credenciais' });
+    await saveOutboundSpecial(req, to, account_id, 'contact', content, wamid);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.response?.data?.error?.message || e.message }); }
+});
+
+// 📊 Enviar enquete (SÓ números QR — a API oficial não tem enquete)
+app.post('/send-poll', async (req, res) => {
+  try {
+    let { to, account_id, question, options } = req.body || {};
+    if (!to || !question || !Array.isArray(options) || options.length < 2) return res.status(400).json({ error: 'Informe to, question e pelo menos 2 options' });
+    to = await resolveExistingPhone(to, req.owner);
+    stopBotRunsForPhone(to, req.owner);
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').maybeSingle();
+    if (!acct?.evolution_instance) return res.status(400).json({ error: 'Enquetes só funcionam em números QR Code' });
+    const r = await waSendRaw(acct.evolution_instance, to, { poll: { name: question, values: options.slice(0, 12), selectableCount: 1 } });
+    const content = `📊 ${question}\n` + options.slice(0, 12).map(o => '▫️ ' + o).join('\n');
+    await saveOutboundSpecial(req, to, account_id, 'poll', content, r?.key?.id || null);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🚫 Apagar mensagem PARA TODOS (SÓ QR — a API oficial não permite)
+app.post('/message-revoke', async (req, res) => {
+  try {
+    const { phone, account_id, wamid } = req.body || {};
+    if (!phone || !wamid) return res.status(400).json({ error: 'Informe phone e wamid' });
+    const { data: acct } = await supabase.from('accounts').select('evolution_instance').eq('id', account_id || '').maybeSingle();
+    const inst = acct?.evolution_instance;
+    if (!inst || !_waSocks[inst] || _waState[inst] !== 'open') return res.status(400).json({ error: 'Apagar para todos só funciona em números QR conectados' });
+    const sock = _waSocks[inst];
+    const jid = await waResolveJid(sock, phone);
+    await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: true, id: wamid } });
+    await supabase.from('messages').update({ content: '🚫 Mensagem apagada', type: 'text' }).eq('wamid', wamid).eq('phone', phone);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🟢 Online / visto por último do lead (SÓ QR)
+app.get('/presence', async (req, res) => {
+  try {
+    const { phone, account_id } = req.query;
+    if (!phone || !account_id || !supabase) return res.json({});
+    const { data: acct } = await supabase.from('accounts').select('evolution_instance').eq('id', account_id).maybeSingle();
+    const inst = acct?.evolution_instance;
+    if (!inst || !_waSocks[inst] || _waState[inst] !== 'open') return res.json({});
+    const sock = _waSocks[inst];
+    const jid = await waResolveJid(sock, phone);
+    try { await sock.presenceSubscribe(jid); } catch (_) {}
+    const pr = _waPresence[inst + '|' + jid];
+    if (!pr) return res.json({});
+    res.json({ state: pr.state, lastSeen: pr.lastSeen, at: pr.at });
+  } catch (_) { res.json({}); }
+});
+
+// 📌 Fixar/desafixar conversa no topo
+app.put('/contacts/:phone/pin', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { error } = await supabase.from('contacts').update({ pinned: !!req.body.pinned })
+    .eq('phone', decodeURIComponent(req.params.phone)).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
 
 // Apaga SÓ as mensagens da conversa — o lead continua no CRM e no Pipeline
 // (etapa, etiquetas, anotações e tarefas são preservados)
@@ -3454,6 +3580,7 @@ if (WA_EMBEDDED) {
 }
 
 const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
+const _waPresence = {}; // 'instancia|jid' -> { state, lastSeen, at } (online/visto por último)
 const _waQrRetries = {}, _waCreatedAt = {}, _waRegistered = {}; // controle de instâncias que nunca parearam
 const _waReconnDelay = {}; // espera progressiva entre reconexões (economia no Railway)
 let _waVerCache = { v: null, ts: 0 }; // cache da versão do Baileys (evita consulta na internet a cada reconexão)
@@ -3572,6 +3699,20 @@ async function waStart(instanceName) {
   _waState[instanceName] = 'connecting';
 
   sock.ev.on('creds.update', saveCreds);
+
+  // Presença do contato (online / visto por último / digitando)
+  sock.ev.on('presence.update', (pu) => {
+    try {
+      const entries = Object.entries(pu.presences || {});
+      if (!entries.length) return;
+      const [, pr] = entries[0];
+      _waPresence[instanceName + '|' + pu.id] = {
+        state: pr.lastKnownPresence || 'unavailable',
+        lastSeen: pr.lastSeen ? pr.lastSeen * 1000 : null,
+        at: Date.now()
+      };
+    } catch (_) {}
+  });
 
   // Tiques de entrega/leitura das mensagens enviadas por QR (✓✓ e ✓✓ azul)
   sock.ev.on('messages.update', async (updates) => {
@@ -3799,6 +3940,13 @@ async function waSendText(instanceName, to, text) {
   if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
   const jid = await waResolveJid(sock, to);
   return await sock.sendMessage(jid, { text });
+}
+// Envio de conteúdo especial pelo QR (localização, contato, enquete, revogação…)
+async function waSendRaw(instanceName, to, payload) {
+  const sock = _waSocks[instanceName];
+  if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
+  const jid = await waResolveJid(sock, to);
+  return await sock.sendMessage(jid, payload);
 }
 
 // Reconecta as contas QR já cadastradas quando o servidor sobe
@@ -4129,6 +4277,10 @@ app.post('/evolution-webhook', async (req, res) => {
       else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
       else if (msg.documentMessage)       { content = `[Documento: ${msg.documentMessage.fileName || 'arquivo'}]`; type = 'document'; }
       else if (msg.stickerMessage)        { content = '[Figurinha]'; type = 'sticker'; }
+      else if (msg.locationMessage)       { const l = msg.locationMessage; content = `📍 ${l.name || 'Localização'}\nhttps://maps.google.com/?q=${l.degreesLatitude},${l.degreesLongitude}`; type = 'location'; }
+      else if (msg.contactMessage)        { content = `👤 ${msg.contactMessage.displayName || 'Contato'}`; type = 'contact'; }
+      else if (msg.contactsArrayMessage)  { content = `👤 ${(msg.contactsArrayMessage.contacts || []).map(c => c.displayName).filter(Boolean).join(', ') || 'Contatos'}`; type = 'contact'; }
+      else if (msg.pollCreationMessage || msg.pollCreationMessageV3) { const pl = msg.pollCreationMessage || msg.pollCreationMessageV3; content = `📊 ${pl.name}\n` + (pl.options || []).map(o => '▫️ ' + o.optionName).join('\n'); type = 'poll'; }
 
       // Busca account_id + dono (owner) — sem o owner a mensagem não aparece no CRM
       let accountId = null;
