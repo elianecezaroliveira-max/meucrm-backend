@@ -1935,6 +1935,14 @@ app.post('/send-poll', async (req, res) => {
     const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').maybeSingle();
     if (!acct?.evolution_instance) return res.status(400).json({ error: 'Enquetes só funcionam em números QR Code' });
     const r = await waSendRaw(acct.evolution_instance, to, { poll: { name: question, values: options.slice(0, 12), selectableCount: 1 } });
+    try {
+      const sockP = _waSocks[acct.evolution_instance];
+      if (r?.key?.id) _waPolls[r.key.id] = {
+        options: options.slice(0, 12),
+        encKey: r?.message?.messageContextInfo?.messageSecret || null,
+        creatorJid: (_baileys.jidNormalizedUser && sockP?.user?.id) ? _baileys.jidNormalizedUser(sockP.user.id) : (sockP?.user?.id || null)
+      };
+    } catch (_) {}
     const content = `📊 ${question}\n` + options.slice(0, 12).map(o => '▫️ ' + o).join('\n');
     await saveOutboundSpecial(req, to, account_id, 'poll', content, r?.key?.id || null);
     res.json({ success: true });
@@ -3581,6 +3589,7 @@ if (WA_EMBEDDED) {
 
 const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
 const _waPresence = {}; // 'instancia|jid' -> { state, lastSeen, at } (online/visto por último)
+const _waPolls = {};    // wamid da enquete -> { options, encKey, creatorJid } (para decifrar votos)
 const _waQrRetries = {}, _waCreatedAt = {}, _waRegistered = {}; // controle de instâncias que nunca parearam
 const _waReconnDelay = {}; // espera progressiva entre reconexões (economia no Railway)
 let _waVerCache = { v: null, ts: 0 }; // cache da versão do Baileys (evita consulta na internet a cada reconexão)
@@ -4281,6 +4290,24 @@ app.post('/evolution-webhook', async (req, res) => {
       else if (msg.contactMessage)        { content = `👤 ${msg.contactMessage.displayName || 'Contato'}`; type = 'contact'; }
       else if (msg.contactsArrayMessage)  { content = `👤 ${(msg.contactsArrayMessage.contacts || []).map(c => c.displayName).filter(Boolean).join(', ') || 'Contatos'}`; type = 'contact'; }
       else if (msg.pollCreationMessage || msg.pollCreationMessageV3) { const pl = msg.pollCreationMessage || msg.pollCreationMessageV3; content = `📊 ${pl.name}\n` + (pl.options || []).map(o => '▫️ ' + o.optionName).join('\n'); type = 'poll'; }
+      else if (msg.pollUpdateMessage) {
+        // VOTO na enquete: decifra e mostra a opção escolhida
+        let escolha = '';
+        try {
+          const pu = msg.pollUpdateMessage;
+          const pid = pu.pollCreationMessageKey?.id;
+          const pinfo = _waPolls[pid];
+          if (pinfo && pinfo.encKey && _baileys.decryptPollVote) {
+            const voter = _baileys.jidNormalizedUser ? _baileys.jidNormalizedUser(data.key.remoteJid) : data.key.remoteJid;
+            const dec = _baileys.decryptPollVote(pu.vote, { pollCreatorJid: pinfo.creatorJid, pollMsgId: pid, pollEncKey: pinfo.encKey, voterJid: voter });
+            const _cr = require('crypto');
+            const hashes = (dec.selectedOptions || []).map(b => Buffer.from(b).toString('hex'));
+            escolha = pinfo.options.filter(o => hashes.includes(_cr.createHash('sha256').update(Buffer.from(o)).digest('hex'))).join(', ');
+          }
+        } catch (_) {}
+        content = escolha ? `🗳 Votou na enquete: ${escolha}` : '🗳 Votou na enquete (veja a opção no celular)';
+        type = 'text';
+      }
 
       // Busca account_id + dono (owner) — sem o owner a mensagem não aparece no CRM
       let accountId = null;
