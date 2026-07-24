@@ -143,8 +143,16 @@ async function updateMsgStatus(wamid, upd) {
   const rank = _ST_RANK[upd.status];
   if (rank === undefined) return;
   const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
-  await supabase.from('messages').update(upd).eq('wamid', wamid)
+  // Grava também O HORÁRIO da entrega/leitura (para o "Dados da mensagem")
+  const upd2 = { ...upd };
+  if (upd.status === 'delivered') upd2.delivered_at = new Date().toISOString();
+  if (upd.status === 'read') upd2.read_at = new Date().toISOString();
+  const { error: eCol } = await supabase.from('messages').update(upd2).eq('wamid', wamid)
     .or('status.is.null,status.in.(' + lower.join(',') + ')');
+  if (eCol) { // colunas de horário ainda não existem no banco: segue só com o status
+    await supabase.from('messages').update(upd).eq('wamid', wamid)
+      .or('status.is.null,status.in.(' + lower.join(',') + ')');
+  }
   _mirrorContactStatus(wamid, upd.status);
 }
 
@@ -1811,7 +1819,8 @@ app.post('/edit-message', async (req, res) => {
   try {
     const jid = await waResolveJid(sock, to);
     await sock.sendMessage(jid, { text, edit: { remoteJid: jid, fromMe: true, id: wamid } });
-    await supabase.from('messages').update({ content: text }).eq('wamid', wamid).eq('phone', to);
+    const { error: eEd } = await supabase.from('messages').update({ content: text, edited: true }).eq('wamid', wamid).eq('phone', to);
+    if (eEd) await supabase.from('messages').update({ content: text }).eq('wamid', wamid).eq('phone', to);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Falha ao editar: ' + (e.message || 'erro desconhecido') });
@@ -3959,7 +3968,10 @@ async function waStart(instanceName) {
       if (_pm && _pm.editedMessage && _pm.key?.id) {
         const novoTxt = _pm.editedMessage.conversation || _pm.editedMessage.extendedTextMessage?.text || null;
         if (novoTxt && supabase) {
-          try { await supabase.from('messages').update({ content: novoTxt }).eq('wamid', _pm.key.id); } catch (_) {}
+          try {
+            const { error: eEd2 } = await supabase.from('messages').update({ content: novoTxt, edited: true }).eq('wamid', _pm.key.id);
+            if (eEd2) await supabase.from('messages').update({ content: novoTxt }).eq('wamid', _pm.key.id);
+          } catch (_) {}
         }
         continue;
       }
