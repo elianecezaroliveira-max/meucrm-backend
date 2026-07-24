@@ -1938,6 +1938,7 @@ app.post('/send-poll', async (req, res) => {
     try {
       const sockP = _waSocks[acct.evolution_instance];
       if (r?.key?.id) _waPolls[r.key.id] = {
+        name: question,
         options: options.slice(0, 12),
         encKey: r?.message?.messageContextInfo?.messageSecret || null,
         creatorJid: (_baileys.jidNormalizedUser && sockP?.user?.id) ? _baileys.jidNormalizedUser(sockP.user.id) : (sockP?.user?.id || null)
@@ -3309,6 +3310,19 @@ app.get('/bot-runs/contact/:phone', async (req,res) => {
 // ═══════════════════════════════════════
 // CONFIGURAÇÕES: INTEGRAÇÃO (token) + FATURAMENTO
 // ═══════════════════════════════════════
+// ⚡ Respostas rápidas COMPARTILHADAS: mesma lista em todos os aparelhos e números da conta
+app.get('/quick-replies', async (req, res) => {
+  if (!supabase) return res.json([]);
+  const { data } = await supabase.from('settings').select('value').eq('key', 'quick_replies::' + (req.owner || ' ')).maybeSingle();
+  try { res.json(data?.value ? JSON.parse(data.value) : []); } catch (_) { res.json([]); }
+});
+app.put('/quick-replies', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const arr = Array.isArray(req.body) ? req.body : [];
+  await supabase.from('settings').upsert({ key: 'quick_replies::' + (req.owner || ' '), value: JSON.stringify(arr), updated_at: new Date().toISOString() });
+  res.json({ success: true });
+});
+
 app.get('/integration/token', async (req, res) => {
   if (!supabase) return res.json({ token: null });
   const { data } = await supabase.from('settings').select('value').eq('key', 'api_token::' + (req.owner || ' ')).maybeSingle();
@@ -4305,7 +4319,10 @@ app.post('/evolution-webhook', async (req, res) => {
             escolha = pinfo.options.filter(o => hashes.includes(_cr.createHash('sha256').update(Buffer.from(o)).digest('hex'))).join(', ');
           }
         } catch (_) {}
-        content = escolha ? `🗳 Votou na enquete: ${escolha}` : '🗳 Votou na enquete (veja a opção no celular)';
+        const pnome = (_waPolls[msg.pollUpdateMessage?.pollCreationMessageKey?.id] || {}).name || '';
+        if (escolha) content = pnome ? `🗳 Votou na enquete "${pnome}": ${escolha}` : `🗳 Votou na enquete: ${escolha}`;
+        else if (pnome) content = `🗳 Removeu o voto da enquete "${pnome}"`;
+        else content = '🗳 Votou na enquete (veja a opção no celular)';
         type = 'text';
       }
 
