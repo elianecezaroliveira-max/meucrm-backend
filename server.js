@@ -2010,12 +2010,19 @@ async function _subscribeRecentPresence(owner) {
 }
 
 // "digitando…"/"gravando áudio…" AGORA, para a lista de conversas (SÓ QR)
+// Devolve o telefone COM e SEM o nono dígito (o WhatsApp ora usa um, ora outro)
+function _brPhoneVariants(ph) {
+  const out = new Set([ph]);
+  if (/^55\d{10}$/.test(ph)) out.add(ph.slice(0, 4) + '9' + ph.slice(4));
+  if (/^55\d{11}$/.test(ph) && ph[4] === '9') out.add(ph.slice(0, 4) + ph.slice(5));
+  return Array.from(out);
+}
 app.get('/typing-list', (req, res) => {
   const out = {}; const now = Date.now();
   for (const [k, p] of Object.entries(_waPresence)) {
     if ((p.state === 'composing' || p.state === 'recording') && now - p.at < 12000) {
       const ph = (k.split('|')[1] || '').split('@')[0];
-      if (ph) out[ph] = p.state;
+      if (ph) _brPhoneVariants(ph).forEach(v => { out[v] = p.state; });
     }
   }
   res.json(out);
