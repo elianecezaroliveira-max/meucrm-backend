@@ -1793,6 +1793,32 @@ app.post('/typing', async (req, res) => {
   } catch (_) { res.json({ success: false }); }
 });
 
+// "digitando…" para o lead (usado pelo Cronômetro do bot antes de uma mensagem)
+async function botTypingPulse(phone, accountId) {
+  try {
+    if (!accountId || !supabase) return;
+    const { data: acct } = await supabase.from('accounts').select('evolution_instance, phone_number_id, token').eq('id', accountId).maybeSingle();
+    if (!acct) return;
+    if (acct.evolution_instance && _waSocks[acct.evolution_instance] && _waState[acct.evolution_instance] === 'open') {
+      const sock = _waSocks[acct.evolution_instance];
+      const jid = await waResolveJid(sock, phone);
+      await sock.sendPresenceUpdate('composing', jid);
+      return;
+    }
+    if (acct.phone_number_id && acct.token) {
+      const { data: lastIn } = await supabase.from('messages').select('wamid')
+        .eq('phone', phone).eq('direction', 'inbound').eq('account_id', accountId)
+        .not('wamid', 'is', null).order('timestamp', { ascending: false }).limit(1).maybeSingle();
+      if (lastIn?.wamid) {
+        await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`, {
+          messaging_product: 'whatsapp', status: 'read', message_id: lastIn.wamid,
+          typing_indicator: { type: 'text' }
+        }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } }).catch(() => {});
+      }
+    }
+  } catch (_) {}
+}
+
 // Apaga SÓ as mensagens da conversa — o lead continua no CRM e no Pipeline
 // (etapa, etiquetas, anotações e tarefas são preservados)
 app.delete("/contacts/:phone/messages", async (req, res) => {
@@ -2223,8 +2249,25 @@ async function processNode(run, depth=0) {
     // Espera CURTA (até 2 min): cronômetro EXATO na memória — retoma na hora certa.
     // O ciclo de 30s fica só para esperas longas e como segurança pós-reinício.
     if (waitMs <= 120000) {
+      // "digitando…" para o lead enquanto o cronômetro roda, se o PRÓXIMO passo é uma mensagem
+      let typingTimer = null;
+      try {
+        const nxtPeek = await getNextNodeId(nodeId, null);
+        if (nxtPeek) {
+          const { data: nxNode } = await supabase.from('bot_nodes').select('type, config').eq('id', nxtPeek).maybeSingle();
+          if (nxNode && nxNode.type === 'message') {
+            const typeAcct = (nxNode.config && nxNode.config.account_id) || run.account_id || null;
+            if (typeAcct) {
+              botTypingPulse(phone, typeAcct);
+              typingTimer = setInterval(() => botTypingPulse(phone, typeAcct), 8000);
+              setTimeout(() => { if (typingTimer) { clearInterval(typingTimer); typingTimer = null; } }, waitMs + 2000);
+            }
+          }
+        }
+      } catch (_) {}
       setTimeout(async () => {
         try {
+          if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
           // Atômico: só retoma se AINDA estiver pausada (evita corrida com o ciclo de 30s)
           const { data: took } = await supabase.from('bot_runs')
             .update({ status:'running', pause_until:null, updated_at:new Date().toISOString() })
