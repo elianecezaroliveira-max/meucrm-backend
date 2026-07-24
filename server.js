@@ -3865,6 +3865,17 @@ async function waStart(instanceName) {
     }
   });
 
+  // Canal RESERVA de recibos (alguns aparelhos entregam entrega/leitura por aqui)
+  sock.ev.on('message-receipt.update', async (events) => {
+    if (!supabase) return;
+    for (const ev of events || []) {
+      const id = ev.key?.id; const rc = ev.receipt || {};
+      if (!id) continue;
+      const mapped = rc.readTimestamp ? 'read' : (rc.receiptTimestamp ? 'delivered' : null);
+      if (mapped) { try { await updateMsgStatus(id, { status: mapped }); } catch (_) {} }
+    }
+  });
+
   sock.ev.on('connection.update', (u) => {
     const { connection, qr, lastDisconnect } = u;
     if (qr && _qrcode) {
