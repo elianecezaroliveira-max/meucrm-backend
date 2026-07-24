@@ -2028,6 +2028,35 @@ app.get('/typing-list', (req, res) => {
   res.json(out);
 });
 
+// 🔗 Prévia de link (título/descrição/imagem do site) — com cache em memória
+const _linkPrevCache = new Map();
+app.get('/link-preview', async (req, res) => {
+  try {
+    const url = String(req.query.url || '');
+    if (!/^https?:\/\//i.test(url)) return res.json({});
+    const hit = _linkPrevCache.get(url);
+    if (hit && Date.now() - hit.ts < 6 * 3600000) return res.json(hit.data);
+    const r = await axios.get(url, { timeout: 6000, maxContentLength: 512 * 1024, maxRedirects: 3,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VETRA-CRM/1.0)' }, responseType: 'text',
+      validateStatus: st => st >= 200 && st < 400 });
+    const html = String(r.data || '').slice(0, 300000);
+    const pick = (re) => { const m = html.match(re); return m ? m[1].trim() : null; };
+    const meta = (pr) => pick(new RegExp(`<meta[^>]+(?:property|name)=["']${pr}["'][^>]+content=["']([^"']+)["']`, 'i'))
+                    || pick(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${pr}["']`, 'i'));
+    let img = meta('og:image') || meta('twitter:image');
+    if (img && img.startsWith('/')) { try { const u = new URL(url); img = u.origin + img; } catch (_) {} }
+    const data = {
+      title: meta('og:title') || pick(/<title[^>]*>([^<]+)<\/title>/i) || null,
+      desc: (meta('og:description') || meta('description') || '').slice(0, 160) || null,
+      image: img || null,
+      site: (() => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })()
+    };
+    _linkPrevCache.set(url, { ts: Date.now(), data });
+    if (_linkPrevCache.size > 500) _linkPrevCache.delete(_linkPrevCache.keys().next().value);
+    res.json(data);
+  } catch (_) { res.json({}); }
+});
+
 // 🟢 Online / visto por último do lead (SÓ QR)
 app.get('/presence', async (req, res) => {
   try {
