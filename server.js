@@ -398,6 +398,8 @@ app.post("/webhook", async (req, res) => {
         }
 
         // Notificação push nos aparelhos do dono (não bloqueia o processamento)
+        // — a menos que a conversa esteja SILENCIADA (🔇)
+        if (await _isContactMuted(from, ownerEmail)) { /* silenciada: sem push */ } else
         sendPushToOwner(ownerEmail, {
           title: existing?.name || name || from,
           body: preview,
@@ -952,6 +954,7 @@ function convertVideoToMp4(buf) {
 // ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
 app.post("/send-media", async (req, res) => {
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
+  const mCaption = String(req.body.caption || '').trim();
   if (!to || !fileBase64 || !fileName || !mimeType)
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
@@ -995,16 +998,16 @@ app.post("/send-media", async (req, res) => {
           ? '🎤 Mensagem de voz' + (durSecs ? ` (${_fmtDur(durSecs)})` : '')
           : `[Áudio: ${fileName}]`;
       } else if (baseMime.startsWith('image/')) {
-        sent = await sock.sendMessage(jid, { image: fileBuf, mimetype: baseMime });
-        msgType = 'image'; content = `[Imagem: ${fileName}]`;
+        sent = await sock.sendMessage(jid, { image: fileBuf, mimetype: baseMime, ...(mCaption ? { caption: mCaption } : {}) });
+        msgType = 'image'; content = mCaption || `[Imagem: ${fileName}]`;
       } else if (baseMime.startsWith('video/')) {
         let vMime = 'video/mp4';
         if (baseMime !== 'video/mp4') {
           try { fileBuf = await convertVideoToMp4(fileBuf); }
           catch (ve) { console.error('⚠️ Conversão de vídeo falhou, enviando original:', ve.message); vMime = baseMime; }
         }
-        sent = await sock.sendMessage(jid, { video: fileBuf, mimetype: vMime });
-        msgType = 'video'; qrSentMime = vMime; content = `[Vídeo: ${fileName}]`;
+        sent = await sock.sendMessage(jid, { video: fileBuf, mimetype: vMime, ...(mCaption ? { caption: mCaption } : {}) });
+        msgType = 'video'; qrSentMime = vMime; content = mCaption || `[Vídeo: ${fileName}]`;
       } else {
         sent = await sock.sendMessage(jid, { document: fileBuf, mimetype: baseMime, fileName });
         msgType = 'document'; content = `[Documento: ${fileName}]`;
@@ -1088,6 +1091,7 @@ app.post("/send-media", async (req, res) => {
 
     const mediaObj = { id: mediaId };
     if (msgType === "document") mediaObj.filename = fileName;
+    if (mCaption && (msgType === "image" || msgType === "video")) mediaObj.caption = mCaption;
     // Mensagem de VOZ (foto de perfil + forma de onda no WhatsApp) — exige OGG/Opus
     if (msgType === "audio" && req.body.voice === true && sendMime === "audio/ogg") mediaObj.voice = true;
 
@@ -1106,7 +1110,7 @@ app.post("/send-media", async (req, res) => {
       const durSecs = Number(req.body.duration) || 0;
       const content = (msgType === "audio" && req.body.voice === true)
         ? "🎤 Mensagem de voz" + (durSecs ? ` (${_fmtDur(durSecs)})` : "")
-        : `[${label}: ${fileName}]`;
+        : ((mCaption && (msgType === "image" || msgType === "video")) ? mCaption : `[${label}: ${fileName}]`);
       await supabase.from("contacts").upsert(
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
           last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
@@ -1741,6 +1745,7 @@ app.get("/contacts", async (req, res) => {
   const { account_id, with_messages } = req.query;
   // Tenta incluir created_at; se a coluna ainda não existir no banco, cai para a
   // seleção sem ela (não quebra o carregamento dos leads/conversas)
+  _subscribeRecentPresence(req.owner); // presença dos recentes (não bloqueia a resposta)
   const COLS_BASE = "phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite, avatar";
   const build = (cols) => {
     let q = supabase.from("contacts").select(cols).eq("owner", req.owner || ' ').order("last_message_at", { ascending: false });
@@ -1748,7 +1753,8 @@ app.get("/contacts", async (req, res) => {
     if (with_messages) q = q.not("last_message_preview", "is", null);
     return q;
   };
-  let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned");
+  let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted");
+  if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned")); } // fallback sem muted
   if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status")); } // fallback sem pinned
   if (error) { ({ data, error } = await build(COLS_BASE + ", created_at")); } // fallback sem last_message_status
   if (error) { ({ data, error } = await build(COLS_BASE)); } // fallback sem created_at
@@ -1982,6 +1988,39 @@ app.post('/message-revoke', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Inscreve a presença dos contatos recentes (para o "digitando…" na LISTA)
+const _presSubTs = {};
+async function _subscribeRecentPresence(owner) {
+  try {
+    if (!supabase) return;
+    const { data: accs } = await supabase.from('accounts').select('id, evolution_instance').eq('owner', owner || ' ').not('evolution_instance', 'is', null);
+    for (const a of (accs || [])) {
+      const inst = a.evolution_instance;
+      const sock = _waSocks[inst];
+      if (!sock || _waState[inst] !== 'open') continue;
+      const { data: cts } = await supabase.from('contacts').select('phone').eq('owner', owner || ' ').eq('account_id', a.id).order('last_message_at', { ascending: false }).limit(30);
+      for (const c of (cts || [])) {
+        const k = inst + '|' + c.phone;
+        if (_presSubTs[k] && Date.now() - _presSubTs[k] < 300000) continue;
+        _presSubTs[k] = Date.now();
+        try { const jid = await waResolveJid(sock, c.phone); await sock.presenceSubscribe(jid); } catch (_) {}
+      }
+    }
+  } catch (_) {}
+}
+
+// "digitando…"/"gravando áudio…" AGORA, para a lista de conversas (SÓ QR)
+app.get('/typing-list', (req, res) => {
+  const out = {}; const now = Date.now();
+  for (const [k, p] of Object.entries(_waPresence)) {
+    if ((p.state === 'composing' || p.state === 'recording') && now - p.at < 12000) {
+      const ph = (k.split('|')[1] || '').split('@')[0];
+      if (ph) out[ph] = p.state;
+    }
+  }
+  res.json(out);
+});
+
 // 🟢 Online / visto por último do lead (SÓ QR)
 app.get('/presence', async (req, res) => {
   try {
@@ -1998,6 +2037,32 @@ app.get('/presence', async (req, res) => {
     res.json({ state: pr.state, lastSeen: pr.lastSeen, at: pr.at });
   } catch (_) { res.json({}); }
 });
+
+// 🔇 Silenciar/reativar notificações da conversa
+app.put('/contacts/:phone/mute', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { error } = await supabase.from('contacts').update({ muted: !!req.body.muted })
+    .eq('phone', decodeURIComponent(req.params.phone)).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// 🔵 Marcar conversa como NÃO lida (volta o badge)
+app.put('/contacts/:phone/unread', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { error } = await supabase.from('contacts').update({ unread_count: 1, first_unread_at: new Date().toISOString() })
+    .eq('phone', decodeURIComponent(req.params.phone)).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// Conversa silenciada? (consulta protegida — funciona mesmo sem a coluna no banco)
+async function _isContactMuted(phone, owner) {
+  try {
+    const { data } = await supabase.from('contacts').select('muted').eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+    return !!(data && data.muted);
+  } catch (_) { return false; }
+}
 
 // 📌 Fixar/desafixar conversa no topo
 app.put('/contacts/:phone/pin', async (req, res) => {
@@ -4420,8 +4485,8 @@ app.post('/evolution-webhook', async (req, res) => {
         const { error: mErr } = await supabase.from('messages').insert(msgData);
         if (mErr) console.error('❌ Evolution: erro ao salvar mensagem:', mErr.message);
 
-        // Notificação push só para mensagens RECEBIDAS
-        if (!fromMe) sendPushToOwner(ownerEmail, { title: name || phone, body: preview, phone, tag: 'chat-' + phone }).catch(() => {});
+        // Notificação push só para mensagens RECEBIDAS (e não silenciadas 🔇)
+        if (!fromMe && !(await _isContactMuted(phone, ownerEmail))) sendPushToOwner(ownerEmail, { title: name || phone, body: preview, phone, tag: 'chat-' + phone }).catch(() => {});
 
         // Bot e n8n só para mensagens RECEBIDAS
         if (!fromMe && type === 'text' && content) {
