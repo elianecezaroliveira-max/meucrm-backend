@@ -1826,17 +1826,20 @@ app.post('/typing', async (req, res) => {
   } catch (_) { res.json({ success: false }); }
 });
 
-// "digitando…" para o lead (usado pelo Cronômetro do bot antes de uma mensagem)
+// "digitando…" para o lead (usado pelo Cronômetro do bot antes de uma mensagem).
+// Devolve 'qr' | 'cloud' | null — o ritmo de renovação é diferente em cada motor:
+// QR renova à vontade (8s); API oficial mostra ~25s por pedido e repetir cedo
+// demais com a mesma referência CANCELA o indicador (por isso 22s lá).
 async function botTypingPulse(phone, accountId) {
   try {
-    if (!accountId || !supabase) return;
+    if (!accountId || !supabase) return null;
     const { data: acct } = await supabase.from('accounts').select('evolution_instance, phone_number_id, token').eq('id', accountId).maybeSingle();
-    if (!acct) return;
+    if (!acct) return null;
     if (acct.evolution_instance && _waSocks[acct.evolution_instance] && _waState[acct.evolution_instance] === 'open') {
       const sock = _waSocks[acct.evolution_instance];
       const jid = await waResolveJid(sock, phone);
       await sock.sendPresenceUpdate('composing', jid);
-      return;
+      return 'qr';
     }
     if (acct.phone_number_id && acct.token) {
       const { data: lastIn } = await supabase.from('messages').select('wamid')
@@ -1847,9 +1850,11 @@ async function botTypingPulse(phone, accountId) {
           messaging_product: 'whatsapp', status: 'read', message_id: lastIn.wamid,
           typing_indicator: { type: 'text' }
         }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } }).catch(() => {});
+        return 'cloud';
       }
     }
   } catch (_) {}
+  return null;
 }
 
 // Apaga SÓ as mensagens da conversa — o lead continua no CRM e no Pipeline
@@ -2291,9 +2296,12 @@ async function processNode(run, depth=0) {
           if (nxNode && nxNode.type === 'message') {
             const typeAcct = (nxNode.config && nxNode.config.account_id) || run.account_id || null;
             if (typeAcct) {
-              botTypingPulse(phone, typeAcct);
-              typingTimer = setInterval(() => botTypingPulse(phone, typeAcct), 8000);
-              setTimeout(() => { if (typingTimer) { clearInterval(typingTimer); typingTimer = null; } }, waitMs + 2000);
+              botTypingPulse(phone, typeAcct).then(via => {
+                if (!via) return;
+                const ritmo = via === 'qr' ? 8000 : 22000; // API: renovar cedo demais cancela o indicador
+                typingTimer = setInterval(() => botTypingPulse(phone, typeAcct), ritmo);
+                setTimeout(() => { if (typingTimer) { clearInterval(typingTimer); typingTimer = null; } }, waitMs + 2000);
+              }).catch(()=>{});
             }
           }
         }
