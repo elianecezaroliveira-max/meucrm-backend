@@ -1556,6 +1556,22 @@ app.get("/messages/:phone", async (req, res) => {
   res.json(data);
 });
 
+// ⭐/📌 Favoritar e fixar MENSAGEM (como no WhatsApp)
+app.put('/messages/:id/star', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { error } = await supabase.from('messages').update({ starred: !!req.body.starred })
+    .eq('id', req.params.id).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+app.put('/messages/:id/pin', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { error } = await supabase.from('messages').update({ pinned: !!req.body.pinned })
+    .eq('id', req.params.id).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── Listar templates ──
 app.get("/templates", async (req, res) => {
   const { account_id } = req.query;
