@@ -404,6 +404,11 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.log("✅ Mensagem salva:", content.substring(0, 50));
         }
+        // Etiqueta "Encaminhada" (opcional — ignora se a coluna não existir)
+        try {
+          if (message.context && (message.context.forwarded || message.context.frequently_forwarded) && message.id)
+            await supabase.from('messages').update({ forwarded: true }).eq('wamid', message.id);
+        } catch (_) {}
 
         // Notificação push nos aparelhos do dono (não bloqueia o processamento)
         // — a menos que a conversa esteja SILENCIADA (🔇)
@@ -996,6 +1001,7 @@ app.post("/send-media", async (req, res) => {
         }
         // Envelope de volume (os "pauzinhos" da mensagem de voz)
         const wf = req.body.voice === true ? await computeWaveform(fileBuf) : null;
+        req._wfOut = wf; // usado depois para gravar a onda no banco
         sent = await sock.sendMessage(jid, {
           audio: fileBuf, mimetype: 'audio/ogg; codecs=opus',
           ptt: req.body.voice === true, seconds: durSecs || undefined,
@@ -1041,6 +1047,11 @@ app.post("/send-media", async (req, res) => {
           timestamp: new Date().toISOString(), account_id: account_id || null,
           status: 'sent', wamid, owner: req.owner || null,
           media_id: mediaPathOut, media_mime_type: mediaPathOut ? outMime : null });
+        // Onda REAL da mensagem de voz (opcional — ignora se a coluna não existir)
+        try {
+          if (req._wfOut && req._wfOut.length && wamid)
+            await supabase.from('messages').update({ waveform: JSON.stringify(Array.from(req._wfOut)) }).eq('wamid', wamid).eq('phone', to);
+        } catch (_) {}
       }
       console.log(`📤 Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
       return res.json({ success: true, via: 'qr' });
@@ -4506,6 +4517,7 @@ app.post('/evolution-webhook', async (req, res) => {
         const secsEv = (msg.audioMessage?.seconds || msg.pttMessage?.seconds) || 0;
         content = '🎤 Mensagem de voz' + (secsEv ? ` (${_fmtDur(secsEv)})` : '');
         type = 'audio';
+        try { const wfB = msg.audioMessage?.waveform; if (wfB && wfB.length) data._wfJson = JSON.stringify(Array.from(wfB)); } catch (_) {}
       }
       else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
       else if (msg.documentMessage)       { content = `[Documento: ${msg.documentMessage.fileName || 'arquivo'}]`; type = 'document'; }
@@ -4613,6 +4625,13 @@ app.post('/evolution-webhook', async (req, res) => {
         if (data.mediaPath) { msgData.media_id = data.mediaPath; msgData.media_mime_type = data.mediaMime || null; }
         const { error: mErr } = await supabase.from('messages').insert(msgData);
         if (mErr) console.error('❌ Evolution: erro ao salvar mensagem:', mErr.message);
+        // Extras opcionais (não quebram se as colunas não existirem no banco)
+        try {
+          if (data._wfJson && wamid) await supabase.from('messages').update({ waveform: data._wfJson }).eq('wamid', wamid).eq('phone', phone);
+          const _ctxI = (Object.values(msg).find(v => v && v.contextInfo) || {}).contextInfo;
+          if (_ctxI && (_ctxI.isForwarded || _ctxI.forwardingScore) && wamid)
+            await supabase.from('messages').update({ forwarded: true }).eq('wamid', wamid).eq('phone', phone);
+        } catch (_) {}
 
         // Notificação push só para mensagens RECEBIDAS (e não silenciadas 🔇)
         if (!fromMe && !(await _isContactMuted(phone, ownerEmail))) sendPushToOwner(ownerEmail, { title: name || phone, body: preview, phone, tag: 'chat-' + phone }).catch(() => {});
