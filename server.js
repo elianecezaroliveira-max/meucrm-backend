@@ -2037,6 +2037,76 @@ app.get('/typing-list', (req, res) => {
   res.json(out);
 });
 
+// 👤 PERFIL do número de WhatsApp (foto, recado, descrição…) — QR e API oficial
+app.get('/wa-profile', async (req, res) => {
+  try {
+    const { account_id } = req.query;
+    if (!supabase || !account_id) return res.json({});
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id).maybeSingle();
+    if (!acct) return res.json({});
+    if (acct.evolution_instance) return res.json({ type: 'qr' }); // QR não expõe leitura fácil
+    if (acct.phone_number_id && acct.token) {
+      const r = await axios.get(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/whatsapp_business_profile`, {
+        params: { fields: 'about,address,description,email,profile_picture_url,websites' },
+        headers: { Authorization: `Bearer ${acct.token}` }, timeout: 10000
+      });
+      const d = (r.data?.data || [])[0] || {};
+      return res.json({ type: 'api', about: d.about || '', address: d.address || '', description: d.description || '', email: d.email || '', photo: d.profile_picture_url || null, website: (d.websites || [])[0] || '' });
+    }
+    res.json({});
+  } catch (e) { res.json({ error: e.response?.data?.error?.message || e.message }); }
+});
+
+app.post('/wa-profile', async (req, res) => {
+  try {
+    const { account_id, name, about, description, email, address, website, photoBase64 } = req.body || {};
+    if (!supabase || !account_id) return res.status(400).json({ error: 'account_id obrigatório' });
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id).maybeSingle();
+    if (!acct) return res.status(404).json({ error: 'Conta não encontrada' });
+
+    // ── Número QR (Baileys) ──
+    if (acct.evolution_instance) {
+      const sock = _waSocks[acct.evolution_instance];
+      if (!sock || _waState[acct.evolution_instance] !== 'open') return res.status(400).json({ error: 'WhatsApp QR desconectado' });
+      const jid = sock.user?.id;
+      if (name) await sock.updateProfileName(name).catch(e => { throw new Error('nome: ' + e.message); });
+      if (about) await sock.updateProfileStatus(about).catch(e => { throw new Error('recado: ' + e.message); });
+      if (photoBase64 && jid) await sock.updateProfilePicture(jid, Buffer.from(photoBase64, 'base64')).catch(e => { throw new Error('foto: ' + e.message); });
+      return res.json({ success: true, via: 'qr' });
+    }
+
+    // ── API oficial (Meta) ──
+    if (!acct.phone_number_id || !acct.token) return res.status(400).json({ error: 'Conta sem credenciais' });
+    const hdr = { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' };
+    const body = { messaging_product: 'whatsapp' };
+    if (about !== undefined && about !== null) body.about = String(about);
+    if (description !== undefined && description !== null) body.description = String(description);
+    if (email !== undefined && email !== null) body.email = String(email);
+    if (address !== undefined && address !== null) body.address = String(address);
+    if (website) body.websites = [String(website)];
+
+    // Foto: upload retomável no app da Meta → handle → aplica no perfil
+    if (photoBase64) {
+      if (!APP_ID) return res.status(400).json({ error: 'APP_ID não configurado no servidor (necessário para a foto)' });
+      const buf = Buffer.from(photoBase64, 'base64');
+      const up = await axios.post(`https://graph.facebook.com/v23.0/${APP_ID}/uploads`, null, {
+        params: { file_length: buf.length, file_type: 'image/jpeg', access_token: acct.token }, timeout: 15000
+      });
+      const sessId = up.data?.id; // formato "upload:XXX"
+      const fin = await axios.post(`https://graph.facebook.com/v23.0/${sessId}`, buf, {
+        headers: { Authorization: `OAuth ${acct.token}`, file_offset: '0', 'Content-Type': 'application/octet-stream' }, timeout: 30000,
+        maxContentLength: Infinity, maxBodyLength: Infinity
+      });
+      if (fin.data?.h) body.profile_picture_handle = fin.data.h;
+    }
+
+    await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/whatsapp_business_profile`, body, { headers: hdr, timeout: 15000 });
+    res.json({ success: true, via: 'api' });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
 // 🔗 Prévia de link (título/descrição/imagem do site) — com cache em memória
 const _linkPrevCache = new Map();
 app.get('/link-preview', async (req, res) => {
