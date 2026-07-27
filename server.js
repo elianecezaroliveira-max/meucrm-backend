@@ -722,10 +722,38 @@ async function stopBotRunsForPhone(phone, owner) {
   } catch (_) {}
 }
 
+// 🚫 TRAVA ANTI-AUTOENVIO: nenhuma conta pode enviar mensagem para o PRÓPRIO
+// número (acontecia quando um disparo em massa incluía o contato de teste com
+// o número da própria conta). Compara com e sem o nono dígito.
+function _sameBrPhone(a, b) {
+  a = String(a || '').replace(/\D/g, ''); b = String(b || '').replace(/\D/g, '');
+  if (!a || !b) return false;
+  const vars = p => {
+    const out = new Set([p]);
+    if (/^55\d{10}$/.test(p)) out.add(p.slice(0, 4) + '9' + p.slice(4));
+    if (/^55\d{11}$/.test(p) && p[4] === '9') out.add(p.slice(0, 4) + p.slice(5));
+    return out;
+  };
+  const va = vars(a);
+  for (const x of vars(b)) if (va.has(x)) return true;
+  return false;
+}
+async function _isSelfSend(to, account_id) {
+  try {
+    if (!supabase || !account_id || !to) return false;
+    const { data: a } = await supabase.from('accounts').select('phone_display, evolution_instance').eq('id', account_id).maybeSingle();
+    if (!a) return false;
+    let own = a.phone_display || '';
+    if (a.evolution_instance && _waPhone[a.evolution_instance]) own = _waPhone[a.evolution_instance];
+    return _sameBrPhone(to, own);
+  } catch (_) { return false; }
+}
+
 app.post("/send", async (req, res) => {
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
+  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta — envio para si mesmo não é permitido.' });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
 
   let phoneNumberId, token, evolutionInstance = null, accountType = 'cloudapi';
@@ -988,6 +1016,7 @@ app.post("/send-media", async (req, res) => {
   if (!to || !fileBase64 || !fileName || !mimeType)
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
+  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta.' });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
 
   let phoneNumberId, token, accountType = 'cloudapi', evolutionInstance = null;
@@ -1706,6 +1735,7 @@ app.post("/send-template", async (req, res) => {
   if (!to || !account_id || !template_name)
     return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
+  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta.' });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { data: account, error: accErr } = await supabase
@@ -2336,6 +2366,11 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId) {
     await _recordBotFail(phone, text, '⛔ Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "📱 Enviar pelo número".', accountId || null, owner, 'text');
     return null;
   }
+  // 🚫 TRAVA ANTI-AUTOENVIO: bot nunca envia para o número da própria conta
+  if (await _isSelfSend(phone, usedAcctId)) {
+    await _recordBotFail(phone, text, '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta (contato de teste no meio do disparo?).', usedAcctId, owner, 'text');
+    return null;
+  }
   const phoneNumberId = acct.phone_number_id, token = acct.token;
   // Conta QR Code: envia pelo PRÓPRIO número QR (igual ao envio manual)
   if (acct.evolution_instance) {
@@ -2459,6 +2494,11 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
     // SEM número configurado no nó = NÃO ENVIA (bloqueio total, por segurança).
     // Edite o nó "Enviar mensagem" e escolha o número.
     await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, '⛔ Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "📱 Enviar pelo número".', accountId || null, owner, 'template');
+    return null;
+  }
+  // 🚫 TRAVA ANTI-AUTOENVIO: bot nunca envia modelo para o número da própria conta
+  if (await _isSelfSend(phone, usedAcctId)) {
+    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta (contato de teste no meio do disparo?).', usedAcctId, owner, 'template');
     return null;
   }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
