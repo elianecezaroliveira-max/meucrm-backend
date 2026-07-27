@@ -355,6 +355,8 @@ app.post("/webhook", async (req, res) => {
         // Botões/listas interativas
         const it = message.interactive;
         content = it?.button_reply?.title || it?.list_reply?.title || it?.nfm_reply?.name || "[Resposta interativa]";
+      } else if (type === 'unsupported') {
+        content = '⚠️ Mensagem não suportada pela API — veja no aplicativo do WhatsApp';
       } else {
         content = `[Mensagem do tipo: ${type}]`;
       }
@@ -1592,6 +1594,23 @@ app.get("/messages/:phone", async (req, res) => {
     .order("timestamp", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+  // CURA RETROATIVA da divergência prévia × conversa: se a prévia do contato diz
+  // "lida"/"entregue", as mensagens enviadas até aquele momento recebem o mesmo
+  // status (o WhatsApp muitas vezes só confirma a última — as antigas ficavam cinza)
+  (async () => {
+    try {
+      const { data: c } = await supabase.from('contacts')
+        .select('last_message_status, last_message_at, last_message_direction')
+        .eq('phone', req.params.phone).eq('owner', req.owner || ' ').maybeSingle();
+      if (c && c.last_message_direction === 'outbound' && (c.last_message_status === 'read' || c.last_message_status === 'delivered')) {
+        const abaixo = c.last_message_status === 'read' ? 'pending,sent,delivered' : 'pending,sent';
+        await supabase.from('messages').update({ status: c.last_message_status })
+          .eq('phone', req.params.phone).eq('owner', req.owner || ' ').eq('direction', 'outbound')
+          .lte('timestamp', c.last_message_at)
+          .or('status.is.null,status.in.(' + abaixo + ')');
+      }
+    } catch (_) {}
+  })();
 });
 
 // ⭐/📌 Favoritar e fixar MENSAGEM (como no WhatsApp)
@@ -4525,6 +4544,9 @@ app.post('/evolution-webhook', async (req, res) => {
       // Extrai conteúdo
       let content = fromMe ? '[Mensagem enviada]' : '[Mensagem recebida]', type = 'text';
       const msg = data.message || {};
+      // Sinal INTERNO do WhatsApp (sem conteúdo de verdade)? Ignora — não vira bolha
+      const _reais = Object.keys(msg).filter(k => k !== 'messageContextInfo' && k !== 'senderKeyDistributionMessage' && k !== 'deviceSentMessage');
+      if (!_reais.length) return;
       if      (msg.conversation)          { content = msg.conversation; type = 'text'; }
       else if (msg.extendedTextMessage)   { content = msg.extendedTextMessage.text || ''; type = 'text'; }
       else if (msg.imageMessage)          { content = msg.imageMessage.caption || '[Imagem]'; type = 'image'; }
