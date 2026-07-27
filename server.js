@@ -134,6 +134,21 @@ async function _mirrorContactStatus(wamid, status) {
       q = r.owner ? q.eq('owner', r.owner) : q.is('owner', null);
       if (lower) q = q.or('last_message_status.is.null,last_message_status.in.(' + lower.join(',') + ')');
       await q; // se a coluna ainda não existir no banco, só retorna erro silencioso
+
+      // Semântica do WhatsApp: LEU uma mensagem = leu TODAS as anteriores
+      // (o recibo muitas vezes vem só para a última — as bolhas antigas ficavam
+      //  cinza enquanto a prévia ficava azul; isto elimina a divergência)
+      if (status === 'read' || status === 'delivered') {
+        try {
+          const abaixo = status === 'read' ? 'pending,sent,delivered' : 'pending,sent';
+          let q2 = supabase.from('messages').update({ status })
+            .eq('phone', r.phone).eq('direction', 'outbound')
+            .lte('timestamp', r.timestamp)
+            .or('status.is.null,status.in.(' + abaixo + ')');
+          q2 = r.owner ? q2.eq('owner', r.owner) : q2.is('owner', null);
+          await q2;
+        } catch (_) {}
+      }
     }
   } catch (_) {}
 }
