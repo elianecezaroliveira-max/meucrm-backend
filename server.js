@@ -143,7 +143,7 @@ async function _mirrorContactStatus(wamid, status) {
           const abaixo = status === 'read' ? 'pending,sent,delivered' : 'pending,sent';
           let q2 = supabase.from('messages').update({ status })
             .eq('phone', r.phone).eq('direction', 'outbound')
-            .lte('timestamp', r.timestamp)
+            .lt('timestamp', r.timestamp)
             .or('status.is.null,status.in.(' + abaixo + ')');
           q2 = r.owner ? q2.eq('owner', r.owner) : q2.is('owner', null);
           await q2;
@@ -789,7 +789,7 @@ app.post("/send", async (req, res) => {
         const safeAccountId = account_id || null;
         const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
         // Inclui owner — sem ele a mensagem não aparece no CRM (o GET /messages filtra por owner)
-        await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', owner: req.owner || null }, { onConflict: 'owner,phone' });
+        await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
         await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
       }
       return res.json({ success: true, via: 'evolution' });
@@ -816,7 +816,7 @@ app.post("/send", async (req, res) => {
         {
           phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
           last_message_preview: preview,
-          last_message_direction: 'outbound',
+          last_message_direction: 'outbound', last_message_status: null,
           owner: req.owner || null,
         },
         { onConflict: "owner,phone" }
@@ -1086,7 +1086,7 @@ app.post("/send-media", async (req, res) => {
         } catch (_) { mediaPathOut = null; }
         await supabase.from('contacts').upsert(
           { phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null,
-            last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
+            last_message_preview: content, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
           { onConflict: 'owner,phone' });
         await supabase.from('messages').insert({
           phone: to, content, type: msgType, direction: 'outbound',
@@ -1178,7 +1178,7 @@ app.post("/send-media", async (req, res) => {
         : ((mCaption && (msgType === "image" || msgType === "video")) ? mCaption : `[${label}: ${fileName}]`);
       await supabase.from("contacts").upsert(
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
-          last_message_preview: content, last_message_direction: 'outbound', owner: req.owner || null },
+          last_message_preview: content, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
         { onConflict: "owner,phone" }
       );
       await supabase.from("messages").insert({
@@ -1635,7 +1635,7 @@ app.get("/messages/:phone", async (req, res) => {
         const abaixo = c.last_message_status === 'read' ? 'pending,sent,delivered' : 'pending,sent';
         await supabase.from('messages').update({ status: c.last_message_status })
           .eq('phone', req.params.phone).eq('owner', req.owner || ' ').eq('direction', 'outbound')
-          .lte('timestamp', c.last_message_at)
+          .lt('timestamp', c.last_message_at)
           .or('status.is.null,status.in.(' + abaixo + ')');
       }
     } catch (_) {}
@@ -1757,7 +1757,7 @@ app.post("/send-template", async (req, res) => {
     const preview = shownText.length > 80 ? shownText.substring(0, 80) + '…' : shownText;
     await supabase.from("contacts").upsert(
       { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
-        last_message_preview: preview, last_message_direction: 'outbound', owner: req.owner || null },
+        last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
       { onConflict: "owner,phone" }
     );
     const tplWamid = response.data?.messages?.[0]?.id || null;
@@ -1974,7 +1974,7 @@ async function botTypingPulse(phone, accountId) {
 async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
   if (!supabase) return;
   const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
-  await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', owner: req.owner || null }, { onConflict: 'owner,phone' });
+  await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
   await supabase.from('messages').insert({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, wamid: wamid || null, owner: req.owner || null });
 }
 
@@ -2347,7 +2347,7 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
       account_id: accountId || null, status: 'failed', error_info: fullErr, owner: owner || null
     });
     const prev = ('⚠️ ' + content).slice(0, 80);
-    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound' }).eq('phone', phone).eq('owner', owner || ' ');
+    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
   } catch(e) { console.error('recordBotFail:', e.message); }
 }
 
@@ -2381,7 +2381,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId) {
         const ts = new Date().toISOString();
         await supabase.from('messages').insert({ phone, content: text, type: 'text', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid, owner: owner || null });
         const prev = text.length > 80 ? text.substring(0, 80) + '…' : text;
-        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
+        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
       }
       return wamid || true;
     } catch (e) {
@@ -2525,7 +2525,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       const tWamid = r.data?.messages?.[0]?.id || null;
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
-      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
     }
     return true;
   } catch(e) {
