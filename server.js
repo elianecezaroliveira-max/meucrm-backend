@@ -1383,7 +1383,7 @@ app.post("/tasks", async (req, res) => {
   const { phone, account_id, title, due_at, notes } = req.body;
   if (!title) return res.status(400).json({ error: "Título obrigatório" });
   const { data, error } = await supabase.from("tasks")
-    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null, notes: notes || null, owner: req.owner || null })
+    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null, notes: notes || null, owner: req.owner || null, created_at: new Date().toISOString() })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
@@ -2641,7 +2641,7 @@ async function processNode(run, depth=0) {
     const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).eq('owner',OW).maybeSingle();
     const title = applyVars(cfg.title || 'Tarefa', ct?.name || phone, phone);
     const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours)*3600000).toISOString() : null;
-    await supabase.from('tasks').insert({ phone, account_id:acctId||null, title, due_at:due, owner:botOwner||null });
+    await supabase.from('tasks').insert({ phone, account_id:acctId||null, title, due_at:due, owner:botOwner||null, created_at:new Date().toISOString() });
     const nxt = await getNextNodeId(nodeId, null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
     else await stopRun(runId,'completed');
@@ -2824,7 +2824,7 @@ async function runStageActions(phone, stageId, owner, depth = 0) {
           const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
           const title = applyVars(a.title, ct?.name || phone, phone);
           const due = a.due_hours ? new Date(Date.now() + Number(a.due_hours) * 3600000).toISOString() : null;
-          await supabase.from('tasks').insert({ phone, title, due_at: due, owner: owner || null });
+          await supabase.from('tasks').insert({ phone, title, due_at: due, owner: owner || null, created_at: new Date().toISOString() });
         } else if (a.type === 'complete_task') {
           let q = supabase.from('tasks').update({ done: true }).eq('phone', phone).eq('done', false).eq('owner', OW);
           if (a.title_filter) q = q.ilike('title', '%' + a.title_filter + '%');
