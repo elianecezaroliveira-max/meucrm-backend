@@ -4657,7 +4657,11 @@ app.post('/evolution-webhook', async (req, res) => {
         // nos dois lados; sem o filtro, o lado que recebia era descartado como "eco"
         // e a mensagem nunca aparecia para quem recebeu.
         if (wamid) {
-          const { data: exists } = await supabase.from('messages').select('id').eq('wamid', wamid).eq('phone', phone).maybeSingle();
+          // Compara COM e SEM o nono dígito: o eco da mensagem enviada pelo CRM
+          // volta às vezes no outro formato e escapava da checagem (duplicava).
+          const _vars = _brPhoneVariants(String(phone).replace(/\D/g, ''));
+          const { data: exists } = await supabase.from('messages').select('id')
+            .eq('wamid', wamid).in('phone', _vars.length ? _vars : [phone]).limit(1).maybeSingle();
           if (exists) return;
         }
 
