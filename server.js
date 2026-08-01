@@ -679,11 +679,31 @@ async function addNotice(owner, text, dedupeKey) {
     try { list = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
     const now = Date.now();
     if (dedupeKey && list.some(n => n.k === dedupeKey && now - n.ts < 3600000)) return;
+    // Aviso de DESCONEXÃO não se repete enquanto a conta não voltar (nem após
+    // reinício do servidor): só avisa de novo se a conta reconectou entre um e outro
+    if (dedupeKey && dedupeKey.startsWith('disc:')) {
+      const idAlvo = dedupeKey.slice(5);
+      const ultDisc = list.find(n => n.k === dedupeKey);
+      const ultReconn = list.find(n => n.k === 'reconn:' + idAlvo);
+      if (ultDisc && (!ultReconn || ultDisc.ts > ultReconn.ts)) return;
+    }
     list.unshift({ text, ts: now, k: dedupeKey || null, read: false });
     list = list.slice(0, 50);
     await supabase.from('settings').upsert({ key: K, value: JSON.stringify(list), updated_at: new Date().toISOString() });
     sendPushToOwner(owner || null, { title: '⚠️ VETRA — Aviso', body: text, tag: 'notice' }).catch(() => {});
   } catch (e) { console.error('addNotice:', e.message); }
+}
+// Conta voltou → neutraliza o marcador de "desconectada" (permite avisar numa próxima queda)
+async function clearNoticeDisc(owner, key) {
+  if (!supabase) return;
+  try {
+    const K = 'notices::' + (owner || ' ');
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    let list = []; try { list = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+    let mudou = false;
+    list = list.map(n => { if (n.k === key) { mudou = true; return { ...n, k: key + ':ok' }; } return n; });
+    if (mudou) await supabase.from('settings').upsert({ key: K, value: JSON.stringify(list), updated_at: new Date().toISOString() });
+  } catch (_) {}
 }
 app.get('/notices', async (req, res) => {
   if (!supabase) return res.json({ value: [] });
@@ -758,6 +778,13 @@ async function cloudApiStatus(accId) {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
       if (a) addNotice(a.owner, `✅ A conta da API oficial "${a.name}" foi RESTABELECIDA e está conectada novamente!`, 'reconn:' + accId);
+    } catch (_) {}
+  }
+  // Conectada (por qualquer caminho) → libera novo aviso para uma queda futura
+  if (status === 'connected') {
+    try {
+      const { data: a2 } = await supabase.from('accounts').select('owner').eq('id', accId).maybeSingle();
+      if (a2) clearNoticeDisc(a2.owner, 'disc:' + accId);
     } catch (_) {}
   }
   _acctStatusCache[accId] = { status, ts: Date.now(), motivo };
@@ -1178,10 +1205,10 @@ app.post("/send-media", async (req, res) => {
         sent = await sock.sendMessage(jid, { document: fileBuf, mimetype: baseMime, fileName });
         msgType = 'document'; content = `[Documento: ${fileName}]`;
       }
+      let mediaPathOut = null; // visível na resposta final (fora do bloco do supabase)
       if (supabase) {
         const wamid = sent?.key?.id || null;
         // Guarda a mídia enviada para poder reproduzi-la no CRM
-        let mediaPathOut = null;
         const outMime = qrSentMime;
         try {
           const extOut = (outMime.split('/')[1] || 'bin').split('+')[0];
@@ -4187,6 +4214,11 @@ async function waStart(instanceName) {
       _waQrRetries[instanceName] = 0; // pareou — zera o contador de tentativas
       if (!_waRegistered[instanceName]) _waPairedAt[instanceName] = Date.now(); // 1ª conexão do processo
       _waRegistered[instanceName] = true;
+      // Número QR voltou → libera um novo aviso caso desconecte de novo no futuro
+      (async () => { try {
+        const { data: aQ } = await supabase.from('accounts').select('owner').eq('evolution_instance', instanceName).maybeSingle();
+        if (aQ) clearNoticeDisc(aQ.owner, 'disc:' + instanceName);
+      } catch (_) {} })();
       _waReconnDelay[instanceName] = 4000; // conexão ok — volta à espera mínima
       _waPhone[instanceName] = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
       console.log(`✅ WhatsApp QR conectado: ${instanceName} (${_waPhone[instanceName]})`);
