@@ -605,6 +605,8 @@ app.get("/accounts", async (req, res) => {
       status = _waState[acc.evolution_instance] === 'open' ? 'connected' : 'disconnected';
     } else if (acc.phone_number_id) {
       status = await cloudApiStatus(acc.id);
+      const mot = _acctStatusCache[acc.id]?.motivo;
+      if (status === 'disconnected' && mot) return { ...acc, status, status_motivo: mot };
     }
     return { ...acc, status };
   }));
@@ -653,26 +655,61 @@ const _acctStatusCache = {};
 async function cloudApiStatus(accId) {
   const c = _acctStatusCache[accId];
   if (c && Date.now() - c.ts < 5 * 60000) return c.status;
-  let status = 'disconnected';
+  let status = 'disconnected', motivo = 'token inválido ou expirado';
   try {
     const { data: a } = await supabase.from('accounts').select('phone_number_id, token').eq('id', accId).maybeSingle();
     if (a?.phone_number_id && a?.token) {
-      const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}?fields=id`,
-        { params: { access_token: a.token }, timeout: 6000 });
-      if (r.data?.id) status = 'connected';
-    }
-  } catch (_) { status = 'disconnected'; }
-  // Estava conectada e caiu → avisa a dona (token inválido/expirado)
+      // Pergunta o ESTADO REAL do número (não só se o token responde): a Meta pode
+      // ter DESATIVADO/RESTRINGIDO o número mesmo com o token funcionando.
+      const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}`,
+        { params: { access_token: a.token, fields: 'id,status,quality_rating,name_status,code_verification_status' }, timeout: 8000 });
+      const st = String(r.data?.status || '').toUpperCase();
+      if (r.data?.id && (st === 'CONNECTED' || st === '')) status = 'connected';
+      else if (r.data?.id) {
+        status = 'disconnected';
+        const mapa = {
+          DISCONNECTED: 'número desconectado na Meta',
+          RESTRICTED: 'número RESTRITO pela Meta (limite de envio)',
+          FLAGGED: 'número SINALIZADO pela Meta (qualidade baixa)',
+          BANNED: 'número BANIDO pela Meta',
+          PENDING: 'número pendente de aprovação',
+          MIGRATED: 'número migrado para outra conta',
+          UNVERIFIED: 'número não verificado',
+          RATE_LIMITED: 'número temporariamente limitado'
+        };
+        motivo = mapa[st] || ('estado na Meta: ' + st);
+      }
+    } else motivo = 'faltam credenciais (Phone Number ID/Token) no CRM';
+  } catch (e) {
+    status = 'disconnected';
+    const m = e.response?.data?.error?.message;
+    if (m) motivo = m;
+  }
+  // Mudou para DESCONECTADA (inclusive na primeira checagem após reiniciar) → avisa
   const prev = _acctStatusCache[accId]?.status;
-  if (prev === 'connected' && status === 'disconnected') {
+  if (status === 'disconnected' && prev !== 'disconnected') {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
-      if (a) addNotice(a.owner, `🔌 A conta da API oficial "${a.name}" está DESCONECTADA (token inválido ou expirado). Verifique em Contas.`, 'disc:' + accId);
+      if (a) addNotice(a.owner, `🔌 A conta da API oficial "${a.name}" está DESCONECTADA — ${motivo}. Verifique em Contas.`, 'disc:' + accId);
     } catch (_) {}
   }
-  _acctStatusCache[accId] = { status, ts: Date.now() };
+  _acctStatusCache[accId] = { status, ts: Date.now(), motivo };
   return status;
 }
+
+// Vigia as contas da API oficial a cada 15 min — o aviso chega mesmo sem você
+// abrir a tela de Contas (antes, o problema só era detectado ao abrir a tela).
+setInterval(async () => {
+  try {
+    if (!supabase) return;
+    const { data: accs } = await supabase.from('accounts').select('id').not('phone_number_id', 'is', null);
+    for (const a of (accs || [])) {
+      const c = _acctStatusCache[a.id];
+      if (c) c.ts = 0; // força nova checagem, preservando o status anterior (detecta a virada)
+      await cloudApiStatus(a.id);
+    }
+  } catch (_) {}
+}, 15 * 60000);
 
 // ── Adicionar conta manualmente ──
 app.post("/accounts", async (req, res) => {
