@@ -312,6 +312,20 @@ app.post("/webhook", async (req, res) => {
         const targetWamid = message.reaction?.message_id;
         if (supabase && targetWamid) {
           await supabase.from('messages').update({ reaction: emoji, reaction_by: 'contact' }).eq('wamid', targetWamid);
+          // Prévia da lista IGUAL ao WhatsApp: "Reagiu com ❤️ a: …" (e sobe a conversa)
+          if (emoji) { try {
+            const { data: alvo } = await supabase.from('messages').select('content, phone, owner').eq('wamid', targetWamid).maybeSingle();
+            if (alvo) {
+              const trecho = String(alvo.content || 'sua mensagem').replace(/\s+/g, ' ').slice(0, 40);
+              let q = supabase.from('contacts').update({
+                last_message_preview: `Reagiu com ${emoji} a: ${trecho}`,
+                last_message_at: new Date().toISOString(),
+                last_message_direction: 'inbound', last_message_status: null
+              }).eq('phone', alvo.phone);
+              if (alvo.owner) q = q.eq('owner', alvo.owner);
+              await q;
+            }
+          } catch (_) {} }
           console.log(`😀 Reação ${emoji||'(removida)'} em ${targetWamid}`);
         }
         continue;
@@ -1192,7 +1206,8 @@ app.post("/send-media", async (req, res) => {
         } catch (_) {}
       }
       console.log(`📤 Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
-      return res.json({ success: true, via: 'qr' });
+      // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
+      return res.json({ success: true, via: 'qr', media_id: mediaPathOut || null });
     } catch (e) {
       console.error('❌ Mídia via QR:', e.message);
       return res.status(500).json({ error: 'Falha ao enviar pelo WhatsApp QR: ' + e.message });
@@ -1282,7 +1297,8 @@ app.post("/send-media", async (req, res) => {
       });
       await applyPendingStatus(mediaWamid);
     }
-    res.json({ success: true });
+    // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
+    res.json({ success: true, media_id: (typeof mediaId !== 'undefined' && mediaId) || null });
   } catch (err) {
     console.error("❌ Erro ao enviar mídia:", err.response?.data || err.message);
     res.status(500).json({ error: "Falha ao enviar mídia", detail: err.response?.data });
@@ -4265,6 +4281,20 @@ async function waStart(instanceName) {
             await supabase.from('messages')
               .update({ reaction: r.text || null, reaction_by: m.key?.fromMe ? 'me' : 'contact' })
               .eq('wamid', r.key.id);
+            // Lead reagiu → prévia da lista IGUAL ao WhatsApp: "Reagiu com ❤️ a: …"
+            if (r.text && !m.key?.fromMe) {
+              const { data: alvo } = await supabase.from('messages').select('content, phone, owner').eq('wamid', r.key.id).maybeSingle();
+              if (alvo) {
+                const trecho = String(alvo.content || 'sua mensagem').replace(/\s+/g, ' ').slice(0, 40);
+                let q = supabase.from('contacts').update({
+                  last_message_preview: `Reagiu com ${r.text} a: ${trecho}`,
+                  last_message_at: new Date().toISOString(),
+                  last_message_direction: 'inbound', last_message_status: null
+                }).eq('phone', alvo.phone);
+                if (alvo.owner) q = q.eq('owner', alvo.owner);
+                await q;
+              }
+            }
           } catch (_) {}
         }
         continue;
