@@ -697,7 +697,13 @@ async function cloudApiStatus(accId) {
   if (c && Date.now() - c.ts < 5 * 60000) return c.status;
   let status = 'disconnected', motivo = 'token inválido ou expirado';
   try {
-    const { data: a } = await supabase.from('accounts').select('phone_number_id, token').eq('id', accId).maybeSingle();
+    const { data: a } = await supabase.from('accounts').select('phone_number_id, token, evolution_instance').eq('id', accId).maybeSingle();
+    // BLINDAGEM: conta QR nunca é avaliada como API (mesmo com credencial de resquício)
+    if (a?.evolution_instance) {
+      const stQr = _waState[a.evolution_instance] === 'open' ? 'connected' : 'disconnected';
+      _acctStatusCache[accId] = { status: stQr, ts: Date.now() };
+      return stQr;
+    }
     if (a?.phone_number_id && a?.token) {
       // Pergunta o ESTADO REAL do número (não só se o token responde): a Meta pode
       // ter DESATIVADO/RESTRINGIDO o número mesmo com o token funcionando.
@@ -749,7 +755,9 @@ async function cloudApiStatus(accId) {
 setInterval(async () => {
   try {
     if (!supabase) return;
-    const { data: accs } = await supabase.from('accounts').select('id').not('phone_number_id', 'is', null);
+    const { data: accs } = await supabase.from('accounts').select('id')
+      .not('phone_number_id', 'is', null)
+      .is('evolution_instance', null); // SÓ contas da API oficial — QR tem vigia próprio
     for (const a of (accs || [])) {
       const c = _acctStatusCache[a.id];
       if (c) c.ts = 0; // força nova checagem, preservando o status anterior (detecta a virada)
@@ -3880,12 +3888,12 @@ app.post('/push/test', async (req, res) => {
 async function sendPushToOwner(owner, payload) {
   if (!webpush || !_vapid || !supabase) return;
   try {
-    // Total de conversas não lidas → número (badge) no ícone do app
+    // Total de MENSAGENS não lidas (soma de todas as conversas) → número no ícone do app
     try {
       let bq = supabase.from('contacts').select('unread_count').gt('unread_count', 0);
       bq = owner ? bq.eq('owner', owner) : bq.is('owner', null);
       const { data: rows } = await bq;
-      payload.badge = (rows || []).length;
+      payload.badge = (rows || []).reduce((s, r) => s + (r.unread_count || 0), 0);
     } catch (_) {}
 
     let q = supabase.from('push_subscriptions').select('endpoint, subscription');
