@@ -1337,7 +1337,8 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
         res.setHeader('Content-Length', total);
         return res.status(200).end(buf);
       }
-      res.setHeader('Cache-Control', 'public, max-age=600');
+      // A mídia de um media_id NUNCA muda → cache forte (foto não pisca ao re-renderizar)
+      res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
       const range = req.headers.range;
       if (range) {
         const m = /bytes=(\d*)-(\d*)/.exec(range);
@@ -1388,7 +1389,8 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
       const safeFilename = (filename ? decodeURIComponent(filename) : `midia_${mediaId.substring(0, 8)}`).replace(/["\r\n]/g, "");
       res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
     } else {
-      res.setHeader("Cache-Control", "public, max-age=600");
+      // A mídia de um media_id NUNCA muda → cache forte (foto não pisca ao re-renderizar)
+      res.setHeader("Cache-Control", "public, max-age=604800, immutable");
     }
 
     up.data.pipe(res);
