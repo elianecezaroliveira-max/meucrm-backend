@@ -4180,16 +4180,27 @@ async function waStart(instanceName) {
   });
 
   // Presença do contato (online / visto por último / digitando)
-  sock.ev.on('presence.update', (pu) => {
+  sock.ev.on('presence.update', async (pu) => {
     try {
       const entries = Object.entries(pu.presences || {});
       if (!entries.length) return;
       const [, pr] = entries[0];
-      _waPresence[instanceName + '|' + pu.id] = {
+      const dado = {
         state: pr.lastKnownPresence || 'unavailable',
         lastSeen: pr.lastSeen ? pr.lastSeen * 1000 : null,
         at: Date.now()
       };
+      _waPresence[instanceName + '|' + pu.id] = dado;
+      // WhatsApp novo pode identificar o contato por LID (código interno, não o
+      // telefone) → traduz e guarda TAMBÉM sob o número real, senão o app nunca acha
+      if (String(pu.id).endsWith('@lid')) {
+        try {
+          const map = sock.signalRepository && sock.signalRepository.lidMapping;
+          let pn = (map && map.getPNForLID) ? map.getPNForLID(pu.id) : null;
+          if (pn && pn.then) pn = await pn;
+          if (pn) _waPresence[instanceName + '|' + pn] = dado;
+        } catch (_) {}
+      }
     } catch (_) {}
   });
 
