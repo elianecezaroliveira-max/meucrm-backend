@@ -240,6 +240,46 @@ app.post("/webhook", async (req, res) => {
     for (const change of changes) {
       const value = change.value;
 
+      // 🏛️ Vereditos e eventos da CONTA na Meta (análise aprovada/rejeitada,
+      // banimento, restrição, qualidade) → viram AVISO + push na hora
+      if (['account_review_update', 'account_update', 'phone_number_quality_update'].includes(change.field)) {
+        try {
+          const wabaId = String((body.entry || [])[0]?.id || '');
+          let ownerN = null, nomeN = '';
+          if (supabase) {
+            let { data: accW } = wabaId ? await supabase.from('accounts').select('name, owner').eq('waba_id', wabaId).limit(1).maybeSingle() : { data: null };
+            if (!accW) ({ data: accW } = await supabase.from('accounts').select('name, owner').not('owner', 'is', null).limit(1).maybeSingle());
+            if (accW) { ownerN = accW.owner; nomeN = accW.name; }
+          }
+          const sufixo = nomeN ? ` (conta "${nomeN}")` : '';
+          let txt = null;
+          if (change.field === 'account_review_update') {
+            const d = String(value?.decision || '').toUpperCase();
+            txt = d === 'APPROVED'
+              ? `✅ ANÁLISE DA META APROVADA${sufixo} — a conta foi liberada!`
+              : d === 'REJECTED'
+                ? `❌ ANÁLISE DA META REJEITADA${sufixo} — o recurso foi negado.`
+                : `ℹ️ Atualização da análise da Meta${sufixo}: ${d || 'sem detalhes'}`;
+          } else if (change.field === 'account_update') {
+            const ev = String(value?.event || '').toUpperCase();
+            const mapaEv = {
+              DISABLED_UPDATE: '🚫 Conta DESATIVADA pela Meta',
+              ACCOUNT_RESTRICTION: '⚠️ Conta RESTRINGIDA pela Meta',
+              ACCOUNT_VIOLATION: '⚠️ Violação de política registrada pela Meta',
+              ACCOUNT_DELETED: '🗑 Conta EXCLUÍDA na Meta',
+              VERIFIED_ACCOUNT: '✅ Conta VERIFICADA pela Meta'
+            };
+            const extra = value?.ban_info?.waba_ban_state ? ` — estado: ${value.ban_info.waba_ban_state}` : '';
+            txt = (mapaEv[ev] || ('ℹ️ Atualização da conta na Meta: ' + (ev || 'evento'))) + sufixo + extra;
+          } else {
+            const ev = String(value?.event || '');
+            txt = `📶 Qualidade do número atualizada${sufixo}: ${ev}${value?.current_limit ? ` — limite de envio: ${value.current_limit}` : ''}`;
+          }
+          if (txt) addNotice(ownerN, txt, 'meta:' + change.field + ':' + wabaId + ':' + (value?.decision || value?.event || ''));
+        } catch (e) { console.error('Evento de conta Meta:', e.message); }
+        continue;
+      }
+
       // Handle status updates (read receipts)
       if (value?.statuses?.length && supabase) {
         for (const st of value.statuses) {
@@ -691,6 +731,13 @@ async function cloudApiStatus(accId) {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
       if (a) addNotice(a.owner, `🔌 A conta da API oficial "${a.name}" está DESCONECTADA — ${motivo}. Verifique em Contas.`, 'disc:' + accId);
+    } catch (_) {}
+  }
+  // Estava DESCONECTADA e VOLTOU → avisa a boa notícia também
+  if (status === 'connected' && prev === 'disconnected') {
+    try {
+      const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
+      if (a) addNotice(a.owner, `✅ A conta da API oficial "${a.name}" foi RESTABELECIDA e está conectada novamente!`, 'reconn:' + accId);
     } catch (_) {}
   }
   _acctStatusCache[accId] = { status, ts: Date.now(), motivo };
