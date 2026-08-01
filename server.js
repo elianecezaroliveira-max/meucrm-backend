@@ -2359,7 +2359,21 @@ app.get('/presence', async (req, res) => {
     const sock = _waSocks[inst];
     const jid = await waResolveJid(sock, phone);
     try { await sock.presenceSubscribe(jid); } catch (_) {}
-    const pr = _waPresence[inst + '|' + jid];
+    // Assina TAMBÉM as variantes com/sem o nono dígito (o WhatsApp alterna entre elas)
+    const _limpo = String(phone).replace(/\D/g, '');
+    for (const v of _brPhoneVariants(_limpo)) {
+      try { if (v + '@s.whatsapp.net' !== jid) await sock.presenceSubscribe(v + '@s.whatsapp.net'); } catch (_) {}
+    }
+    let pr = _waPresence[inst + '|' + jid];
+    if (!pr) {
+      // A atualização pode chegar com o número na OUTRA variante → procura por telefone
+      const vars = _brPhoneVariants(_limpo);
+      for (const [k, p] of Object.entries(_waPresence)) {
+        if (!k.startsWith(inst + '|')) continue;
+        const ph = (k.split('|')[1] || '').split('@')[0];
+        if (vars.includes(ph)) { pr = p; break; }
+      }
+    }
     if (!pr) return res.json({});
     res.json({ state: pr.state, lastSeen: pr.lastSeen, at: pr.at });
   } catch (_) { res.json({}); }
