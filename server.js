@@ -3975,6 +3975,22 @@ if (WA_EMBEDDED) {
 }
 
 const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
+const _waPairing = {}; // QR já LIDO no celular, conexão subindo → o front avisa na hora
+const _waPairedAt = {}; // quando pareou NESTE processo → janela de reconexão rápida (10 min)
+// Cache das mensagens recentes (recebidas E enviadas): quando o aparelho do lead
+// pede "retry" na renegociação de chaves pós-pareamento, o motor REENTREGA na hora.
+// Sem isso, mensagens e recibos ficavam atrasados nos primeiros minutos/horas.
+const _waMsgCache = new Map();
+function _waMsgCacheSet(id, msg) {
+  if (!id || !msg) return;
+  _waMsgCache.set(String(id), msg);
+  if (_waMsgCache.size > 800) { for (const k of _waMsgCache.keys()) { _waMsgCache.delete(k); if (_waMsgCache.size <= 600) break; } }
+}
+// Contador de tentativas de redecodificação (formato de cache que o Baileys espera)
+const _waRetryCounter = (() => { const m = new Map(); return {
+  get: k => m.get(k), set: (k, v) => { m.set(k, v); return true; },
+  del: k => m.delete(k), flushAll: () => m.clear()
+}; })();
 const _waPresence = {}; // 'instancia|jid' -> { state, lastSeen, at } (online/visto por último)
 const _waPolls = {};    // wamid da enquete -> { options, encKey, creatorJid } (para decifrar votos)
 const _waQrRetries = {}, _waCreatedAt = {}, _waRegistered = {}; // controle de instâncias que nunca parearam
@@ -3988,7 +4004,7 @@ let _waVersion = null;
 async function waCleanupInstance(inst) {
   try { _waSocks[inst]?.end?.(undefined); } catch (_) {}
   delete _waSocks[inst]; delete _waState[inst]; delete _waPhone[inst];
-  delete _waErr[inst]; delete qrCache[inst]; delete _waQrRetries[inst]; delete _waCreatedAt[inst]; delete _waRegistered[inst];
+  delete _waErr[inst]; delete qrCache[inst]; delete _waQrRetries[inst]; delete _waCreatedAt[inst]; delete _waRegistered[inst]; delete _waPairing[inst];
   try { if (supabase) await supabase.from('wa_sessions').delete().eq('instance', inst); } catch (_) {}
   console.log(`🧹 Instância não pareada encerrada: ${inst}`);
 }
@@ -4090,11 +4106,19 @@ async function waStart(instanceName) {
     syncFullHistory: false,
     // "online" = o WhatsApp entrega as mensagens na hora (offline ele segura/atrasa)
     markOnlineOnConnect: true,
+    // Reentrega quando o aparelho do lead pede "retry" (chaves novas pós-pareamento)
+    getMessage: async (key) => _waMsgCache.get(String(key?.id || '')) || undefined,
+    msgRetryCounterCache: _waRetryCounter,
   });
   _waSocks[instanceName] = sock;
   _waState[instanceName] = 'connecting';
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', () => {
+    // Credenciais registradas = o QR FOI LIDO no celular; a conexão ainda vai
+    // reiniciar até ficar "open" — este marcador faz o app avisar na hora
+    if (state?.creds?.registered && !_waRegistered[instanceName] && _waState[instanceName] !== 'open') _waPairing[instanceName] = true;
+    return saveCreds();
+  });
 
   // Presença do contato (online / visto por último / digitando)
   sock.ev.on('presence.update', (pu) => {
@@ -4140,8 +4164,10 @@ async function waStart(instanceName) {
     }
     if (connection === 'open') {
       _waState[instanceName] = 'open';
+      delete _waPairing[instanceName];
       delete qrCache[instanceName];
       _waQrRetries[instanceName] = 0; // pareou — zera o contador de tentativas
+      if (!_waRegistered[instanceName]) _waPairedAt[instanceName] = Date.now(); // 1ª conexão do processo
       _waRegistered[instanceName] = true;
       _waReconnDelay[instanceName] = 4000; // conexão ok — volta à espera mínima
       _waPhone[instanceName] = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
@@ -4182,6 +4208,9 @@ async function waStart(instanceName) {
           // por horas (celular desligado), o servidor não gasta CPU tentando a cada 4s.
           waitMs = _waReconnDelay[instanceName] || 4000;
           _waReconnDelay[instanceName] = Math.min(waitMs * 2, 5 * 60000);
+          // Janela PÓS-PAREAMENTO (10 min): o WhatsApp oscila bastante logo depois
+          // de conectar — reconecta rápido para não atrasar mensagens nem recibos
+          if (Date.now() - (_waPairedAt[instanceName] || 0) < 10 * 60000) waitMs = Math.min(waitMs, 8000);
           // Várias tentativas falharam numa conta pareada → avisa que ela caiu
           if (_waRegistered[instanceName] && waitMs >= 64000) {
             (async () => { try {
@@ -4201,6 +4230,8 @@ async function waStart(instanceName) {
     if (type !== 'notify' && type !== 'append') return;
     for (const m of messages || []) {
       if (!m.message) continue;
+      // Guarda para reentrega (o aparelho do lead pode pedir "retry" pós-pareamento)
+      try { _waMsgCacheSet(m.key?.id, m.message); } catch (_) {}
       // Conversa "com você mesmo" (recados no próprio número conectado): ignora —
       // sem isso, ao escanear o QR aparecia um chat com o próprio número no CRM
       try {
@@ -4556,7 +4587,9 @@ app.get('/evolution/debug', async (req, res) => {
 // GET /evolution/status/:instance — verifica estado (Evolution API v2)
 app.get('/evolution/status/:instance', async (req, res) => {
   if (WA_EMBEDDED) {
-    return res.json({ state: _waState[req.params.instance] || 'close', phone: _waPhone[req.params.instance] || null });
+    const _st = _waState[req.params.instance] || 'close';
+    // "pairing" = QR já lido, conexão terminando de subir (o front mostra o aviso)
+    return res.json({ state: _st !== 'open' && _waPairing[req.params.instance] ? 'pairing' : _st, phone: _waPhone[req.params.instance] || null });
   }
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/connectionState/${req.params.instance}`, { headers: evoHdr(), timeout: 10000 });
