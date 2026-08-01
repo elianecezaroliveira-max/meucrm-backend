@@ -66,6 +66,13 @@ app.use(async (req, res, next) => {
 });
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
+// Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
+const SERVER_VER = 140;
+app.get('/versao', (req, res) => {
+  let presCount = 0, presKeys = [];
+  try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
+  res.json({ server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3) });
+});
 
 // ── Verificação do Webhook ──
 app.get("/webhook", (req, res) => {
