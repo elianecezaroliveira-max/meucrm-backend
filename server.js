@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 140;
+const SERVER_VER = 142;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2249,7 +2249,7 @@ app.get('/typing-list', (req, res) => {
   const out = {}; const now = Date.now();
   for (const [k, p] of Object.entries(_waPresence)) {
     if ((p.state === 'composing' || p.state === 'recording') && now - p.at < 12000) {
-      const ph = (k.split('|')[1] || '').split('@')[0];
+      const ph = (k.split('|')[1] || '').split('@')[0].split(':')[0];
       if (ph) _brPhoneVariants(ph).forEach(v => { out[v] = p.state; });
     }
   }
@@ -2377,7 +2377,8 @@ app.get('/presence', async (req, res) => {
       const vars = _brPhoneVariants(_limpo);
       for (const [k, p] of Object.entries(_waPresence)) {
         if (!k.startsWith(inst + '|')) continue;
-        const ph = (k.split('|')[1] || '').split('@')[0];
+        // tira o sufixo do aparelho (":0") antes de comparar o telefone
+        const ph = (k.split('|')[1] || '').split('@')[0].split(':')[0];
         if (vars.includes(ph)) { pr = p; break; }
       }
     }
@@ -4198,6 +4199,10 @@ async function waStart(instanceName) {
         at: Date.now()
       };
       _waPresence[instanceName + '|' + pu.id] = dado;
+      // O WhatsApp costuma anexar o sufixo do aparelho (":0") ao número —
+      // guarda TAMBÉM a versão limpa, senão a busca nunca encontra
+      const idLimpo = String(pu.id).replace(/:\d+(?=@)/, '');
+      if (idLimpo !== pu.id) _waPresence[instanceName + '|' + idLimpo] = dado;
       // WhatsApp novo pode identificar o contato por LID (código interno, não o
       // telefone) → traduz e guarda TAMBÉM sob o número real, senão o app nunca acha
       if (String(pu.id).endsWith('@lid')) {
