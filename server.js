@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 156;
+const SERVER_VER = 157;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -824,7 +824,10 @@ app.post("/accounts", async (req, res) => {
     return res.status(400).json({ error: "Informe name, phone_number_id e token" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
 
-  let phone_display = null, waba_id = null;
+  let phone_display = null;
+  // WABA informada no formulário tem prioridade (tokens de usuário do sistema
+  // não expõem a lista granular no debug_token — a descoberta automática falha)
+  let waba_id = String(req.body.waba_id || '').trim() || null;
   // 1. Número visível (ex.: +55 15 98164-7190) — também valida o token
   try {
     const r = await axios.get(`https://graph.facebook.com/v23.0/${phone_number_id}`,
@@ -835,7 +838,7 @@ app.post("/accounts", async (req, res) => {
   }
   // 2. Descobre a WABA deste número (necessária para MODELOS e webhook)
   try {
-    if (APP_ID && APP_SECRET) {
+    if (!waba_id && APP_ID && APP_SECRET) {
       const dbg = await axios.get('https://graph.facebook.com/v23.0/debug_token',
         { params: { input_token: token, access_token: `${APP_ID}|${APP_SECRET}` }, timeout: 10000 });
       const esc = (dbg.data.data?.granular_scopes || []).find(s => s.scope === 'whatsapp_business_management');
