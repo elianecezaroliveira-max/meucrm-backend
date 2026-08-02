@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 142;
+const SERVER_VER = 156;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -815,15 +815,60 @@ setInterval(async () => {
 }, 15 * 60000);
 
 // ── Adicionar conta manualmente ──
+// Faz o MESMO ritual do fluxo do Facebook: número visível, WABA (modelos!),
+// registro na Cloud API e inscrição da WABA no webhook — sem isso a conta
+// ficava "capada": sem número na tela, sem modelos e sem receber mensagens
 app.post("/accounts", async (req, res) => {
   const { name, phone_number_id, token } = req.body;
   if (!name || !phone_number_id || !token)
     return res.status(400).json({ error: "Informe name, phone_number_id e token" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+
+  let phone_display = null, waba_id = null;
+  // 1. Número visível (ex.: +55 15 98164-7190) — também valida o token
+  try {
+    const r = await axios.get(`https://graph.facebook.com/v23.0/${phone_number_id}`,
+      { params: { access_token: token, fields: 'display_phone_number,verified_name' }, timeout: 10000 });
+    phone_display = r.data?.display_phone_number || null;
+  } catch (e) {
+    return res.status(400).json({ error: 'O token não enxerga este número: ' + (e.response?.data?.error?.message || e.message) });
+  }
+  // 2. Descobre a WABA deste número (necessária para MODELOS e webhook)
+  try {
+    if (APP_ID && APP_SECRET) {
+      const dbg = await axios.get('https://graph.facebook.com/v23.0/debug_token',
+        { params: { input_token: token, access_token: `${APP_ID}|${APP_SECRET}` }, timeout: 10000 });
+      const esc = (dbg.data.data?.granular_scopes || []).find(s => s.scope === 'whatsapp_business_management');
+      for (const wid of (esc?.target_ids || [])) {
+        try {
+          const ph = await axios.get(`https://graph.facebook.com/v23.0/${wid}/phone_numbers`,
+            { params: { access_token: token, fields: 'id' }, timeout: 10000 });
+          if ((ph.data.data || []).some(p => String(p.id) === String(phone_number_id))) { waba_id = wid; break; }
+        } catch (_) {}
+      }
+    }
+  } catch (e) { console.log('⚠️ WABA não descoberta:', e.response?.data?.error?.message || e.message); }
+  // 3. Registra o número na Cloud API (ativa se pendente; inofensivo se já ativo)
+  try {
+    await axios.post(`https://graph.facebook.com/v23.0/${phone_number_id}/register`,
+      { messaging_product: 'whatsapp', pin: process.env.WHATSAPP_PIN || '123456' },
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+    console.log('✅ Número registrado na Cloud API (manual):', phone_display || phone_number_id);
+  } catch (e) { console.log('⚠️ Registro (pode já estar ativo):', e.response?.data?.error?.message); }
+  // 4. Inscreve a WABA no webhook do app (SEM isso as mensagens recebidas não chegam)
+  if (waba_id) {
+    try {
+      await axios.post(`https://graph.facebook.com/v23.0/${waba_id}/subscribed_apps`, {}, { params: { access_token: token } });
+      console.log('✅ WABA inscrita no webhook (manual):', waba_id);
+    } catch (e) { console.log('⚠️ Webhook subscribe:', e.response?.data?.error?.message); }
+  }
+
   const { data, error } = await supabase
-    .from("accounts").insert({ name, phone_number_id, token, owner: req.owner || null }).select().single();
+    .from("accounts")
+    .upsert({ name, phone_number_id, phone_display, waba_id, token, owner: req.owner || null }, { onConflict: 'phone_number_id' })
+    .select().single();
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true, data });
+  res.json({ success: true, data, aviso: waba_id ? null : 'WABA não localizada — os modelos podem não aparecer' });
 });
 
 // ── Renomear conta (API oficial ou QR Code) ──
