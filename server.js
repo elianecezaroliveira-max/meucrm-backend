@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 157;
+const SERVER_VER = 158;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1650,8 +1650,12 @@ app.post("/contacts", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const cleanPhone = phone.replace(/\D/g, '');
   if (cleanPhone.length < 8) return res.status(400).json({ error: "Número de celular inválido" });
+  // UNIFICAÇÃO: se o número JÁ existe (com OU sem o nono dígito), reaproveita o
+  // registro existente — o nome vira o último informado e o chat continua UM só
+  let phoneFinal = cleanPhone;
+  try { phoneFinal = (await resolveExistingPhone(cleanPhone, req.owner)) || cleanPhone; } catch (_) {}
   const { data, error } = await supabase.from("contacts")
-    .upsert({ phone: cleanPhone, name, account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() }, { onConflict: "owner,phone" })
+    .upsert({ phone: phoneFinal, name, account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() }, { onConflict: "owner,phone" })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
