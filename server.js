@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 158;
+const SERVER_VER = 159;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -797,6 +797,39 @@ async function cloudApiStatus(accId) {
   _acctStatusCache[accId] = { status, ts: Date.now(), motivo };
   return status;
 }
+
+// 🧹 LIMPEZA AUTOMÁTICA: mídias de mensagens QR com mais de 6 MESES saem do
+// Storage (senão o balde cresce para sempre e estoura o plano). Fotos de
+// perfil (qr/avatars) são PRESERVADAS. Roda 10 min após subir e 1x por dia.
+async function _limpaMidiasAntigas() {
+  if (!supabase) return;
+  const limite = Date.now() - 183 * 24 * 3600000; // ~6 meses
+  try {
+    const { data: pastas } = await supabase.storage.from('wa-media').list('qr', { limit: 1000 });
+    for (const p of (pastas || [])) {
+      if (!p || !p.name || p.name === 'avatars') continue; // avatares ficam
+      let removidas = 0, offset = 0;
+      while (true) {
+        const { data: arqs } = await supabase.storage.from('wa-media').list('qr/' + p.name, { limit: 1000, offset });
+        if (!arqs || !arqs.length) break;
+        const velhos = arqs
+          .filter(a => a && a.name && a.created_at && new Date(a.created_at).getTime() < limite)
+          .map(a => 'qr/' + p.name + '/' + a.name);
+        for (let i = 0; i < velhos.length; i += 100) {
+          const lote = velhos.slice(i, i + 100);
+          const { error: remErr } = await supabase.storage.from('wa-media').remove(lote);
+          if (!remErr) removidas += lote.length;
+        }
+        if (arqs.length < 1000) break;
+        offset += 1000 - Math.min(1000, velhos.length); // compensa os removidos na paginação
+        if (offset < 0) offset = 0;
+      }
+      if (removidas) console.log(`🧹 Limpeza: ${removidas} mídia(s) com +6 meses removida(s) de qr/${p.name}`);
+    }
+  } catch (e) { console.error('Limpeza de mídias:', e.message); }
+}
+setTimeout(() => _limpaMidiasAntigas().catch(() => {}), 10 * 60000);
+setInterval(() => _limpaMidiasAntigas().catch(() => {}), 24 * 3600000);
 
 // Vigia as contas da API oficial a cada 15 min — o aviso chega mesmo sem você
 // abrir a tela de Contas (antes, o problema só era detectado ao abrir a tela).
@@ -1680,6 +1713,16 @@ app.post("/contacts/import", async (req, res) => {
   res.json({ success: true, count: toInsert.length });
 });
 
+// 🔐 As rotas do n8n agora EXIGEM o token de integração (Configurações →
+// Integração no CRM): envie como ?token=SEU_TOKEN na URL ou no header
+// Authorization: Bearer SEU_TOKEN — sem ele, a porta fica trancada.
+function _n8nAuthOk(req, owner) {
+  const tok = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim() || String(req.query.token || '').trim();
+  const esperado = _settings['api_token::' + (owner || ' ')];
+  return !!esperado && !!tok && tok === esperado;
+}
+const _n8nAuthErro = { error: 'Token de integração ausente ou inválido. Gere/copie o token no CRM (Configurações → Integração) e envie como ?token=SEU_TOKEN na URL ou no header Authorization: Bearer SEU_TOKEN.' };
+
 // ── Importar lead via n8n / planilha (mapeia ID da etapa → stage_id) ──
 // Aceita 1 lead OU um array de leads. Campos flexíveis:
 //   name | title | "Lead Titulo"   →  nome
@@ -1691,6 +1734,7 @@ app.post("/import/lead", async (req, res) => {
   const items = Array.isArray(req.body) ? req.body
               : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
   const n8nOwner = (String(req.query.owner||'').trim()) || (!Array.isArray(req.body) && req.body.owner) || 'elianecezaroliveira@gmail.com';
+  if (!_n8nAuthOk(req, n8nOwner)) return res.status(401).json(_n8nAuthErro);
   const stageCache = {};
   let imported = 0;
   const errors = [];
@@ -1733,6 +1777,7 @@ app.post("/update/lead", async (req, res) => {
               : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
   const clean = v => String(v || "").replace(/^=+\s*/, "").trim();
   const n8nOwner = (String(req.query.owner||'').trim()) || (!Array.isArray(req.body) && req.body.owner) || 'elianecezaroliveira@gmail.com';
+  if (!_n8nAuthOk(req, n8nOwner)) return res.status(401).json(_n8nAuthErro);
   const stageCache = {};
   let updated = 0;
   const errors = [];
@@ -1784,6 +1829,7 @@ app.get("/leads", async (req, res) => {
   const stageName = clean(req.query.stage || req.query.etapa);
   let stage_id    = clean(req.query.stage_id) || null;
   const n8nOwner  = clean(req.query.owner) || 'elianecezaroliveira@gmail.com';
+  if (!_n8nAuthOk(req, n8nOwner)) return res.status(401).json(_n8nAuthErro);
 
   if (!stage_id && (extId || stageName)) {
     let q = supabase.from("pipeline_stages").select("id").eq("owner", n8nOwner);
