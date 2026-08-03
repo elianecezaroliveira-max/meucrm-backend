@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 159;
+const SERVER_VER = 160;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1858,10 +1858,13 @@ app.delete("/messages/id/:id", async (req, res) => {
 });
 
 // ── Mensagens de um contato ──
+// Busca pelas DUAS variantes do número (com e sem o nono dígito): mensagens
+// enviadas por canais diferentes (QR × API) podem ter sido gravadas na outra
+// variante — o chat mostra TUDO num lugar só, como deve ser
 app.get("/messages/:phone", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("messages").select("*").eq("phone", req.params.phone).eq("owner", req.owner || ' ')
+    .from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
     .order("timestamp", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
