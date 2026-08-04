@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 160;
+const SERVER_VER = 169;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2034,24 +2034,53 @@ app.get("/pipeline/stages", async (req, res) => {
   res.json(data || []);
 });
 
-// Criar estágio
+// Criar estágio — TODA etapa nasce com um ID EXTERNO próprio (pronto para o n8n)
 app.post("/pipeline/stages", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { name, position } = req.body;
   if (!name) return res.status(400).json({ error: "Nome obrigatório" });
+  const external_id = String(req.body.external_id || '').trim() || String(Math.floor(10000000 + Math.random() * 90000000));
   const { data, error } = await supabase
-    .from("pipeline_stages").insert({ name, position: position || 0, owner: req.owner || null }).select().single();
+    .from("pipeline_stages").insert({ name, position: position || 0, owner: req.owner || null, external_id }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-// Renomear / reordenar estágio
+// Etapas ANTIGAS sem ID externo ganham um automaticamente (uma vez, ao subir).
+// IMPORTANTE: etapas que JÁ TÊM ID (as usadas no n8n da Eliane) NÃO são tocadas.
+setTimeout(async () => {
+  try {
+    if (!supabase) return;
+    // Ajuste pontual (roda UMA única vez): SIAPE3 do vendetta = 104721840 (ID da planilha dele)
+    try {
+      const K = 'fix_siape3_vendetta';
+      const { data: feito } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+      if (!feito) {
+        await supabase.from('pipeline_stages').update({ external_id: '104721840' })
+          .eq('owner', 'vendetta.freedon@gmail.com')
+          .or('name.ilike.SIAPE3,name.ilike.SIAPE 3');
+        await supabase.from('settings').upsert({ key: K, value: 'ok', updated_at: new Date().toISOString() });
+        console.log('🆔 SIAPE3 (vendetta) → 104721840');
+      }
+    } catch (_) {}
+    const { data: st } = await supabase.from('pipeline_stages').select('id').is('external_id', null);
+    for (const s of (st || [])) {
+      await supabase.from('pipeline_stages')
+        .update({ external_id: String(Math.floor(10000000 + Math.random() * 90000000)) })
+        .eq('id', s.id).is('external_id', null);
+    }
+    if (st && st.length) console.log(`🆔 ${st.length} etapa(s) ganharam ID externo automático`);
+  } catch (_) {}
+}, 20000);
+
+// Renomear / reordenar / trocar ID externo do estágio
 app.put("/pipeline/stages/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { name, position } = req.body;
   const updates = {};
   if (name !== undefined) updates.name = name;
   if (position !== undefined) updates.position = position;
+  if (req.body.external_id !== undefined) updates.external_id = String(req.body.external_id).trim() || null;
   const { error } = await supabase
     .from("pipeline_stages").update(updates).eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
