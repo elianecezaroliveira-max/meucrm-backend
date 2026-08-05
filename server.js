@@ -1606,9 +1606,10 @@ app.get("/tasks", async (req, res) => {
 app.post("/tasks", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phone, account_id, title, due_at, notes } = req.body;
-  if (!title) return res.status(400).json({ error: "Título obrigatório" });
+  // Nome NÃO é obrigatório: sem texto, a tarefa nasce como "Tarefa"
+  const titleFinal = String(title || '').trim() || 'Tarefa';
   const { data, error } = await supabase.from("tasks")
-    .insert({ phone: phone || null, account_id: account_id || null, title, due_at: due_at || null, notes: notes || null, owner: req.owner || null, created_at: new Date().toISOString() })
+    .insert({ phone: phone || null, account_id: account_id || null, title: titleFinal, due_at: due_at || null, notes: notes || null, owner: req.owner || null, created_at: new Date().toISOString() })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
