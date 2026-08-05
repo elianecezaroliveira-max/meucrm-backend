@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 169;
+const SERVER_VER = 171;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -508,8 +508,8 @@ app.post("/webhook", async (req, res) => {
             if (!wp) await handleFaqAutoReply(from, content, ownerEmail, accountId);
           } catch(fe) { console.error('IA auto-reply error:', fe.message); }
         }
-        // Encaminha para N8N se configurado
-        const n8nUrl = _settings['n8n_webhook_url'];
+        // Encaminha para o N8N configurado PELA DONA desta conta (separado por conta)
+        const n8nUrl = _cfg('n8n_webhook_url', ownerEmail);
         if (n8nUrl) {
           try {
             await axios.post(n8nUrl, {
@@ -1544,7 +1544,7 @@ app.get("/tags", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   const set = new Set();
   (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) set.add(t); }));
-  _tagCatalog().forEach(t => set.add(t)); // inclui tags criadas no gerenciador (catálogo)
+  _tagCatalog(req.owner).forEach(t => set.add(t)); // inclui tags criadas no gerenciador (catálogo DA CONTA)
   res.json(Array.from(set).sort((a, b) => a.localeCompare(b)));
 });
 
@@ -3329,11 +3329,11 @@ async function matchFaq(text, owner) {
 // Executa a auto-resposta: valida interruptor, casa a pergunta, respeita "1x por cliente" e envia
 async function handleFaqAutoReply(phone, text, owner, accountId) {
   if (!supabase) return false;
-  if ((_settings['faq_enabled'] || 'off') !== 'on') return false; // interruptor GERAL
+  if ((_cfg('faq_enabled', owner) || 'off') !== 'on') return false; // interruptor DA CONTA
 
   // Filtro por conta de WhatsApp: se 'faq_accounts' foi configurado (lista JSON de IDs),
   // a IA só responde nas contas dessa lista. Se nunca foi configurado, vale para TODAS.
-  const accSetting = _settings['faq_accounts'];
+  const accSetting = _cfg('faq_accounts', owner);
   if (accSetting !== undefined && accSetting !== null && accSetting !== '') {
     try {
       const list = JSON.parse(accSetting);
@@ -3343,7 +3343,7 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
 
   // Modo IA (Groq): entende o contexto da conversa. Se falhar, cai no texto grátis.
   let m = null;
-  if (_faqAiOn()) {
+  if (_faqAiOn(owner)) {
     try { m = await matchFaqLLM(phone, text, owner); }
     catch (e) { console.error('🤖 IA classificador falhou, usando texto:', e.response?.data?.error?.message || e.message); m = await matchFaq(text, owner); }
   } else {
@@ -3372,7 +3372,7 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
   if (resErr) { console.log(`🤖 FAQ #${m.faq.id} já respondido a ${phone} — ignorado`); return false; }
 
   // Atraso humanizado antes de enviar. Padrão 25s; ajustável via settings 'faq_delay_seconds'.
-  const delaySec = parseInt(_settings['faq_delay_seconds'], 10);
+  const delaySec = parseInt(_cfg('faq_delay_seconds', owner), 10);
   const delayMs = Math.max(0, (Number.isFinite(delaySec) ? delaySec : 25) * 1000);
   setTimeout(async () => {
     try {
@@ -3455,7 +3455,7 @@ app.post('/faqs/test', async (req, res) => {
 // perguntas cadastradas encaixa (ou nenhuma). A resposta enviada é a sua, pronta.
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_DEFAULT_MODEL = 'openai/gpt-oss-20b'; // barato e ativo (jul/2026); trocável via settings
-const _faqAiOn = () => _settings['faq_mode'] === 'ai' && !!process.env.GROQ_API_KEY;
+const _faqAiOn = (owner) => _cfg('faq_mode', owner) === 'ai' && !!process.env.GROQ_API_KEY;
 
 // Últimas mensagens da conversa (contexto), mais antigas primeiro
 async function getRecentConversation(phone, owner, limit) {
@@ -3489,7 +3489,7 @@ async function matchFaqLLM(phone, text, owner) {
     + 'Se nenhuma corresponder, responda {"id": 0}. Não escreva mais nada.';
   const usr = `PERGUNTAS:\n${list}\n\nCONVERSA:\n${convoTxt}`;
 
-  const model = _settings['faq_ai_model'] || GROQ_DEFAULT_MODEL;
+  const model = _cfg('faq_ai_model', owner) || GROQ_DEFAULT_MODEL;
   const body = {
     model,
     messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
@@ -3516,9 +3516,9 @@ async function matchFaqLLM(phone, text, owner) {
 // GET /faqs/ai-status — modo atual, se a chave está no servidor, e o modelo
 app.get('/faqs/ai-status', (req, res) => {
   res.json({
-    mode: _settings['faq_mode'] || 'text',
+    mode: _cfg('faq_mode', req.owner) || 'text',
     keyConfigured: !!process.env.GROQ_API_KEY,
-    model: _settings['faq_ai_model'] || GROQ_DEFAULT_MODEL
+    model: _cfg('faq_ai_model', req.owner) || GROQ_DEFAULT_MODEL
   });
 });
 
@@ -3551,8 +3551,8 @@ const WRONGPERSON_DEFAULT_ANSWER = 'Desculpe o incômodo, vou retirar seu contat
 const WRONGPERSON_DEFAULT_TAG = 'REMOVER';
 const WRONGPERSON_FAQ_ID = -1; // sentinela no controle de "1x por contato" (tabela faq_replies)
 
-function matchWrongPerson(text) {
-  const raw = _settings['wrongperson_triggers'] || WRONGPERSON_DEFAULT_TRIGGERS;
+function matchWrongPerson(text, owner) {
+  const raw = _cfg('wrongperson_triggers', owner) || WRONGPERSON_DEFAULT_TRIGGERS;
   const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
   const msgNorm = _faqNorm(text);
   const msgTokens = _faqTokens(msgNorm);
@@ -3579,10 +3579,10 @@ async function addTagToContact(phone, owner, tag) {
 // Retorna true se assumiu a resposta (para o FAQ não responder também)
 async function handleWrongPerson(phone, text, owner, accountId) {
   if (!supabase) return false;
-  if ((_settings['wrongperson_enabled'] || 'off') !== 'on') return false;
+  if ((_cfg('wrongperson_enabled', owner) || 'off') !== 'on') return false;
 
   // mesmo filtro de contas do FAQ
-  const accSetting = _settings['faq_accounts'];
+  const accSetting = _cfg('faq_accounts', owner);
   if (accSetting !== undefined && accSetting !== null && accSetting !== '') {
     try {
       const list = JSON.parse(accSetting);
@@ -3590,7 +3590,7 @@ async function handleWrongPerson(phone, text, owner, accountId) {
     } catch (_) {}
   }
 
-  if (!matchWrongPerson(text)) return false;
+  if (!matchWrongPerson(text, owner)) return false;
 
   // 1x por contato (reserva antes do atraso; índice único evita duplicidade)
   const { error: resErr } = await supabase.from('faq_replies')
@@ -3605,9 +3605,9 @@ async function handleWrongPerson(phone, text, owner, accountId) {
     acct = ct?.account_id || null;
   }
 
-  const answer = _settings['wrongperson_answer'] || WRONGPERSON_DEFAULT_ANSWER;
-  const tag = _settings['wrongperson_tag'] || WRONGPERSON_DEFAULT_TAG;
-  const delaySec = parseInt(_settings['faq_delay_seconds'], 10);
+  const answer = _cfg('wrongperson_answer', owner) || WRONGPERSON_DEFAULT_ANSWER;
+  const tag = _cfg('wrongperson_tag', owner) || WRONGPERSON_DEFAULT_TAG;
+  const delaySec = parseInt(_cfg('faq_delay_seconds', owner), 10);
   const delayMs = Math.max(0, (Number.isFinite(delaySec) ? delaySec : 25) * 1000);
 
   setTimeout(async () => {
@@ -3635,14 +3635,15 @@ async function handleWrongPerson(phone, text, owner, accountId) {
 
 // ═══════════════════════ Gerenciador de Tags ═══════════════════════
 // Catálogo de tags "criadas" (mesmo sem lead) em settings 'tag_catalog' (array JSON)
-function _tagCatalog() {
-  try { const a = JSON.parse(_settings['tag_catalog'] || '[]'); return Array.isArray(a) ? a : []; }
+function _tagCatalog(owner) {
+  try { const a = JSON.parse(_cfg('tag_catalog', owner) || '[]'); return Array.isArray(a) ? a : []; }
   catch (_) { return []; }
 }
-async function _saveTagCatalog(arr) {
+async function _saveTagCatalog(arr, owner) {
   const uniq = Array.from(new Set(arr.filter(Boolean)));
-  await supabase.from('settings').upsert({ key: 'tag_catalog', value: JSON.stringify(uniq), updated_at: new Date().toISOString() });
-  _settings['tag_catalog'] = JSON.stringify(uniq);
+  const k = 'tag_catalog::' + (owner || ' '); // catálogo POR CONTA
+  await supabase.from('settings').upsert({ key: k, value: JSON.stringify(uniq), updated_at: new Date().toISOString() });
+  _settings[k] = JSON.stringify(uniq);
 }
 
 // Lista tags com contagem de leads (inclui as do catálogo com contagem 0)
@@ -3652,7 +3653,7 @@ app.get('/tags/manage', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   const counts = {};
   (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) counts[t] = (counts[t] || 0) + 1; }));
-  _tagCatalog().forEach(t => { if (!(t in counts)) counts[t] = 0; });
+  _tagCatalog(req.owner).forEach(t => { if (!(t in counts)) counts[t] = 0; });
   const out = Object.keys(counts).sort((a, b) => a.localeCompare(b)).map(name => ({ name, count: counts[name] }));
   res.json(out);
 });
@@ -3662,7 +3663,7 @@ app.post('/tags/manage', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   const name = ((req.body && req.body.name) || '').toString().trim();
   if (!name) return res.status(400).json({ error: 'nome obrigatório' });
-  await _saveTagCatalog([..._tagCatalog(), name]);
+  await _saveTagCatalog([..._tagCatalog(req.owner), name], req.owner);
   res.json({ ok: true, name });
 });
 
@@ -3678,7 +3679,7 @@ app.delete('/tags/manage', async (req, res) => {
       await supabase.from('contacts').update({ tags }).eq('phone', c.phone).eq('owner', req.owner || ' ');
     }
   }
-  await _saveTagCatalog(_tagCatalog().filter(t => t !== name));
+  await _saveTagCatalog(_tagCatalog(req.owner).filter(t => t !== name), req.owner);
   res.json({ ok: true });
 });
 
@@ -3986,18 +3987,40 @@ async function loadSettings() {
 loadSettings();
 setInterval(loadSettings, 5 * 60 * 1000); // recarrega settings (ex.: novos membros da equipe) sem precisar de redeploy
 
+// 🔒 SEPARAÇÃO POR CONTA: estas chaves eram GLOBAIS (a configuração de uma conta
+// valia para a outra). Agora cada dona tem a sua (chave::email). Os valores
+// antigos (sem ::) pertencem à dona ORIGINAL e valem como herança SÓ para ela —
+// nada muda para quem já configurou; as outras contas começam do zero.
+const OWNER_LEGADO = 'elianecezaroliveira@gmail.com';
+const CHAVES_POR_CONTA = new Set([
+  'tag_catalog', 'n8n_webhook_url',
+  'faq_enabled', 'faq_mode', 'faq_accounts', 'faq_delay_seconds', 'faq_ai_model',
+  'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer'
+]);
+function _cfg(key, owner) {
+  const own = owner || ' ';
+  const v = _settings[key + '::' + own];
+  if (v !== undefined && v !== null) return v;
+  return own === OWNER_LEGADO ? _settings[key] : undefined;
+}
+
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
-  const { data } = await supabase.from('settings').select('value').eq('key', req.params.key).maybeSingle();
+  const k = req.params.key;
+  if (CHAVES_POR_CONTA.has(k)) { const v = _cfg(k, req.owner); return res.json({ value: (v === undefined ? null : v) }); }
+  const { data } = await supabase.from('settings').select('value').eq('key', k).maybeSingle();
   res.json({ value: data?.value || null });
 });
 
 app.put('/settings/:key', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { value } = req.body;
-  const { error } = await supabase.from('settings').upsert({ key: req.params.key, value, updated_at: new Date().toISOString() });
+  const k = CHAVES_POR_CONTA.has(req.params.key)
+    ? req.params.key + '::' + (req.owner || ' ')   // grava SEMPRE na chave da conta
+    : req.params.key;
+  const { error } = await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
   if (error) return res.status(500).json({ error: error.message });
-  _settings[req.params.key] = value;
+  _settings[k] = value;
   res.json({ success: true });
 });
 
@@ -5078,7 +5101,7 @@ app.post('/evolution-webhook', async (req, res) => {
           try { await handleBotReply(phone, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
         }
         if (!fromMe) {
-          const n8nUrl = _settings['n8n_webhook_url'];
+          const n8nUrl = _cfg('n8n_webhook_url', ownerEmail); // n8n da DONA desta conta
           if (n8nUrl) {
             try { await axios.post(n8nUrl, { event: 'message_received', phone, name, content, type, timestamp, account_id: accountId || null }, { timeout: 8000 }); } catch(ne) {}
           }
