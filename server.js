@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 172;
+const SERVER_VER = 173;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1561,8 +1561,17 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     // Se o navegador cancelar (fechou o vídeo, pulou trecho), corta o download da Meta
     res.on("close", () => { try { up.data.destroy(); } catch (_) {} });
   } catch (err) {
-    console.error("❌ Erro ao baixar mídia:", err.response?.status || err.message);
-    if (!res.headersSent) res.status(500).json({ error: "Falha ao baixar mídia" });
+    const st = err.response?.status;
+    const msgMeta = String(err.response?.data?.error?.message || err.message || '');
+    console.error("❌ Erro ao baixar mídia:", mediaId, st || msgMeta);
+    // A Meta guarda os arquivos por tempo limitado (~30 dias). Depois disso o
+    // media_id deixa de existir — o motivo real por trás de "falha ao baixar".
+    const expirou = st === 404 || /does not exist|Unsupported get request|cannot be loaded/i.test(msgMeta);
+    if (!res.headersSent) res.status(expirou ? 410 : 500).json({
+      error: expirou
+        ? "Este arquivo não está mais disponível no WhatsApp (a Meta guarda os arquivos por cerca de 30 dias)."
+        : "Falha ao baixar mídia"
+    });
   }
 });
 
