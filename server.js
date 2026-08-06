@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 174;
+const SERVER_VER = 175;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -4224,18 +4224,21 @@ app.post('/push/test', async (req, res) => {
 // Envia push para todos os aparelhos do dono; remove inscrições mortas (404/410)
 async function sendPushToOwner(owner, payload) {
   if (!webpush || !_vapid || !supabase) return;
+  // 🔒 SEM DONO = não envia. Antes, avisos "sem dono" iam para TODOS os aparelhos
+  // cadastrados sem dono (de contas diferentes) — era o que fazia o contador de
+  // uma conta aparecer/sumir por causa da outra.
+  if (!owner) { console.warn('🔕 Push ignorado: mensagem sem dono definido'); return; }
   try {
-    // Total de MENSAGENS não lidas (soma de todas as conversas) → número no ícone do app
+    // Total de MENSAGENS não lidas DESTE dono → número no ícone do app
     try {
-      let bq = supabase.from('contacts').select('unread_count').gt('unread_count', 0);
-      bq = owner ? bq.eq('owner', owner) : bq.is('owner', null);
-      const { data: rows } = await bq;
+      const { data: rows } = await supabase.from('contacts')
+        .select('unread_count').gt('unread_count', 0).eq('owner', owner);
       payload.badge = (rows || []).reduce((s, r) => s + (r.unread_count || 0), 0);
     } catch (_) {}
+    payload.owner = owner; // o aparelho confere se o aviso é mesmo dele
 
-    let q = supabase.from('push_subscriptions').select('endpoint, subscription');
-    q = owner ? q.eq('owner', owner) : q.is('owner', null);
-    const { data: subs } = await q;
+    const { data: subs } = await supabase.from('push_subscriptions')
+      .select('endpoint, subscription').eq('owner', owner);
     for (const s of subs || []) {
       try {
         await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: 3600 });
