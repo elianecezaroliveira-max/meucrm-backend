@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 175;
+const SERVER_VER = 176;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2757,6 +2757,31 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
   } catch(e) { console.error('recordBotFail:', e.message); }
 }
 
+// 📱 Descobre o número (conta) que o bot deve usar quando nada foi configurado:
+// 1) o número da ÚLTIMA mensagem trocada com o lead, 2) o número do cadastro do
+// lead, 3) o primeiro número do dono. Evita o disparo travar com "sem número".
+async function _acctPadraoDoLead(phone, owner) {
+  if (!supabase) return null;
+  const OW = owner || ' ';
+  try {
+    const { data: ult } = await supabase.from('messages').select('account_id')
+      .eq('phone', phone).eq('owner', OW).not('account_id', 'is', null)
+      .order('timestamp', { ascending: false }).limit(1).maybeSingle();
+    if (ult?.account_id) return ult.account_id;
+  } catch (_) {}
+  try {
+    const { data: ct } = await supabase.from('contacts').select('account_id')
+      .eq('phone', phone).eq('owner', OW).maybeSingle();
+    if (ct?.account_id) return ct.account_id;
+  } catch (_) {}
+  try {
+    const { data: acc } = await supabase.from('accounts').select('id')
+      .eq('owner', OW).order('created_at', { ascending: true }).limit(1).maybeSingle();
+    if (acc?.id) return acc.id;
+  } catch (_) {}
+  return null;
+}
+
 async function sendBotMsg(phone, accountId, text, owner, nodeAccountId) {
   let acct, usedAcctId;
   if (nodeAccountId) {
@@ -3000,7 +3025,10 @@ async function processNode(run, depth=0) {
     // Número deste passo: o configurado NO NÓ ou o HERDADO da execução
     // (definido por um passo anterior com número ou pelo Round Robin).
     // Só se pergunta uma vez — os passos seguintes herdam automaticamente.
-    const nodeAcct = cfg.account_id || run.account_id || null;
+    // Sem número em lugar nenhum? NÃO bloqueia mais: escolhe sozinho o número
+    // certo para este lead (o da última conversa dele, o do cadastro ou, em
+    // último caso, o primeiro número do dono) — antes o disparo parava com erro.
+    const nodeAcct = cfg.account_id || run.account_id || await _acctPadraoDoLead(phone, botOwner);
     if (cfg.account_id && run.account_id !== cfg.account_id) {
       try { await supabase.from('bot_runs').update({ account_id: cfg.account_id, updated_at: new Date().toISOString() }).eq('id', runId); } catch (_) {}
       run.account_id = cfg.account_id; // os próximos passos herdam este número
