@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 171;
+const SERVER_VER = 172;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1507,7 +1507,36 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
       });
     };
     let up;
-    try { up = await fetchStream(false); } catch (e) { up = await fetchStream(true); } // URL pode ter expirado
+    try { up = await fetchStream(false); }
+    catch (e) {
+      try { up = await fetchStream(true); } // URL pode ter expirado
+      catch (e2) {
+        // 🔁 PLANO B: o app às vezes manda a conta errada (ex.: abrindo pelos
+        // detalhes do lead) — tenta o token de CADA conta cadastrada até achar
+        // a dona do arquivo. Só roda quando o caminho normal já falhou.
+        up = null;
+        if (supabase) {
+          try {
+            const { data: accs } = await supabase.from("accounts").select("id, token").not("token", "is", null);
+            const vistos = new Set([token]);
+            for (const a of (accs || [])) {
+              if (!a.token || vistos.has(a.token)) continue;
+              vistos.add(a.token);
+              try {
+                const ck = `${mediaId}_${a.token.substring(0, 20)}`;
+                const url2 = await getMediaUrl(mediaId, a.token, ck, true);
+                const h2 = { Authorization: `Bearer ${a.token}`, "User-Agent": "WhatsApp/2.0" };
+                if (req.headers.range && download !== "1") h2.Range = req.headers.range;
+                up = await axios.get(url2, { headers: h2, responseType: "stream", timeout: 30000, validateStatus: s => s === 200 || s === 206 });
+                console.log(`🔁 Mídia ${mediaId}: baixada com o token da conta ${a.id} (a conta pedida não servia)`);
+                break;
+              } catch (_) {}
+            }
+          } catch (_) {}
+        }
+        if (!up) throw e2;
+      }
+    }
 
     res.status(up.status); // 200 ou 206 (parcial)
     res.setHeader("Access-Control-Allow-Origin", "*");
