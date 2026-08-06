@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 176;
+const SERVER_VER = 177;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1974,6 +1974,57 @@ app.delete("/messages/id/:id", async (req, res) => {
   res.json({ success: true });
 });
 
+// ── 📷 FOTOS DOS BOTS ──
+// Guarda a imagem no cofre e devolve um link PÚBLICO (a Meta e o WhatsApp
+// precisam conseguir baixar a foto sozinhos na hora do disparo).
+app.post('/bot-media', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  try {
+    const { data, mime, filename } = req.body || {};
+    if (!data) return res.status(400).json({ error: 'Arquivo não recebido' });
+    const buf = Buffer.from(String(data).replace(/^data:[^,]+,/, ''), 'base64');
+    if (buf.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'Imagem muito grande (máx. 12 MB)' });
+    const tipo = String(mime || 'image/jpeg').split(';')[0];
+    const ext = (tipo.split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '') || 'jpg';
+    const nome = `bot/${Date.now()}_${String(filename || 'foto').replace(/[^\w.-]/g, '').slice(-40) || 'foto'}.${ext}`;
+    const { error } = await supabase.storage.from('wa-media').upload(nome, buf, { contentType: tipo, upsert: true });
+    if (error) return res.status(500).json({ error: error.message });
+    const base = process.env.BACKEND_URL || `https://${req.headers.host}`;
+    res.json({ success: true, url: `${base}/bot-media/${encodeURIComponent(nome.slice(4))}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Entrega PÚBLICA da foto do bot (sem login — quem baixa é o próprio WhatsApp)
+app.get('/bot-media/:arquivo', async (req, res) => {
+  if (!supabase) return res.status(500).send('Storage indisponível');
+  try {
+    const caminho = 'bot/' + decodeURIComponent(req.params.arquivo).replace(/^bot\//, '');
+    const { data: blob, error } = await supabase.storage.from('wa-media').download(caminho);
+    if (error || !blob) return res.status(404).send('Arquivo não encontrado');
+    const buf = Buffer.from(await blob.arrayBuffer());
+    res.setHeader('Content-Type', blob.type || 'image/jpeg');
+    res.setHeader('Content-Length', buf.length);
+    res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.status(200).end(buf);
+  } catch (e) { res.status(500).send('Falha ao carregar'); }
+});
+
+// ── 📝 NOTA INTERNA: fica no chat só para o dono (NUNCA vai para o lead) ──
+app.post("/notes", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { phone, content, account_id } = req.body || {};
+  const txt = String(content || '').trim();
+  if (!phone || !txt) return res.status(400).json({ error: "Telefone e texto são obrigatórios" });
+  const { data, error } = await supabase.from("messages").insert({
+    phone: String(phone), content: txt, type: 'note', direction: 'outbound',
+    timestamp: new Date().toISOString(), account_id: account_id || null,
+    owner: req.owner || null, status: null,
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true, data });
+});
+
 // ── Mensagens de um contato ──
 // Busca pelas DUAS variantes do número (com e sem o nono dígito): mensagens
 // enviadas por canais diferentes (QR × API) podem ter sido gravadas na outra
@@ -2782,7 +2833,35 @@ async function _acctPadraoDoLead(phone, owner) {
   return null;
 }
 
-async function sendBotMsg(phone, accountId, text, owner, nodeAccountId) {
+// 📷 FOTO DO BOT: envia a imagem (link público) com o texto como legenda
+async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
+  const ts = new Date().toISOString();
+  const prev = legenda ? (legenda.length > 80 ? legenda.slice(0, 80) + '…' : legenda) : '[Imagem]';
+  const salva = async (wamid) => {
+    if (!supabase) return;
+    await supabase.from('messages').insert({
+      phone, content: legenda || '[Imagem]', type: 'image', direction: 'outbound',
+      timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: wamid || null,
+      owner: owner || null,
+    });
+    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
+  };
+  if (acct.evolution_instance) { // QR Code
+    const r = await waSendRaw(acct.evolution_instance, phone, { image: { url: imgUrl }, caption: legenda || undefined });
+    const wamid = r?.key?.id || null;
+    await salva(wamid);
+    return wamid || true;
+  }
+  const r = await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
+    { messaging_product: 'whatsapp', to: phone, type: 'image', image: { link: imgUrl, caption: legenda || undefined } },
+    { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
+  const wamid = r.data?.messages?.[0]?.id || null;
+  await salva(wamid);
+  await applyPendingStatus(wamid);
+  return wamid;
+}
+
+async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) {
   let acct, usedAcctId;
   if (nodeAccountId) {
     // Nó com número CONFIGURADO: obedece exatamente — sem troca automática
@@ -2803,6 +2882,15 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId) {
     return null;
   }
   const phoneNumberId = acct.phone_number_id, token = acct.token;
+  // 📷 Passo com FOTO: manda a imagem (o texto vira legenda)
+  if (imgUrl) {
+    try { return await sendBotFoto(phone, acct, usedAcctId, imgUrl, text, owner); }
+    catch (e) {
+      console.error('❌ Bot foto:', e.response?.data || e.message);
+      await _recordBotFail(phone, text || '[Imagem]', 'Falha ao enviar a foto do bot: ' + (metaErrorText(e.response?.data?.error) || e.message || ''), usedAcctId, owner, 'text');
+      return null;
+    }
+  }
   // Conta QR Code: envia pelo PRÓPRIO número QR (igual ao envio manual)
   if (acct.evolution_instance) {
     try {
@@ -3037,7 +3125,8 @@ async function processNode(run, depth=0) {
       sendOk = await sendBotTemplate(phone, acctId, { ...cfg, account_id: nodeAcct }, name, notes, botOwner);
     } else {
       const text = applyVars(cfg.text || '', name, phone, notes);
-      sendOk = text ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct) : true; // sem texto = nada a enviar (não é falha)
+      // Passo pode ter FOTO (com o texto de legenda) — sem texto e sem foto = nada a fazer
+      sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null) : true;
     }
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
     const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
