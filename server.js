@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 173;
+const SERVER_VER = 174;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -476,6 +476,9 @@ app.post("/webhook", async (req, res) => {
         if (ownerEmail) messageData.owner = ownerEmail;
 
         const { error: msgErr } = await supabase.from("messages").insert(messageData);
+
+        // 🗄️ Guarda uma cópia do arquivo por 6 meses (a Meta apaga em ~30 dias)
+        if (mediaId && accountToken) arquivaMidiaApi(mediaId, accountToken, mediaMimeType).catch(() => {});
 
         if (msgErr) {
           console.error("❌ Erro ao salvar mensagem:", msgErr.message, msgErr.details);
@@ -1412,6 +1415,8 @@ app.post("/send-media", async (req, res) => {
       });
       await applyPendingStatus(mediaWamid);
     }
+    // 🗄️ Guarda uma cópia do que EU enviei por 6 meses (a Meta apaga em ~30 dias)
+    try { if (mediaId && token) arquivaMidiaApi(mediaId, token, sendMime).catch(() => {}); } catch (_) {}
     // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
     res.json({ success: true, media_id: (typeof mediaId !== 'undefined' && mediaId) || null });
   } catch (err) {
@@ -1424,6 +1429,65 @@ app.post("/send-media", async (req, res) => {
 // Faz STREAMING direto da Meta repassando o Range — método correto para vídeo
 // (sem baixar o arquivo inteiro na memória, evita travar a reprodução).
 const mediaUrlCache = new Map(); // mediaId_token -> { url, ts }
+
+// 🗄️ ARQUIVO PRÓPRIO DE 6 MESES: a Meta guarda os arquivos por ~30 dias. Ao
+// receber/enviar mídia pela API oficial, guardamos UMA CÓPIA no nosso Storage
+// (pasta api/) — assim as fotos e documentos continuam abrindo por 6 meses.
+// A limpeza automática (a mesma das mídias do QR) apaga o que passa de 183 dias.
+const _arquivando = new Set(); // evita baixar o mesmo arquivo duas vezes ao mesmo tempo
+async function arquivaMidiaApi(mediaId, token, mime) {
+  if (!supabase || !mediaId || !token || String(mediaId).startsWith('qr/')) return;
+  const caminho = 'api/' + mediaId;
+  if (_arquivando.has(caminho)) return;
+  _arquivando.add(caminho);
+  try {
+    // Já guardado antes? Não baixa de novo.
+    const { data: ja } = await supabase.storage.from('wa-media').list('api', { search: String(mediaId), limit: 1 });
+    if (ja && ja.length) return;
+    const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    });
+    const url = metaRes.data?.url;
+    if (!url) return;
+    const bin = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'WhatsApp/2.0' },
+      responseType: 'arraybuffer', timeout: 60000, maxContentLength: 80 * 1024 * 1024
+    });
+    const tipo = mime || metaRes.data?.mime_type || bin.headers['content-type'] || 'application/octet-stream';
+    const { error } = await supabase.storage.from('wa-media')
+      .upload(caminho, Buffer.from(bin.data), { contentType: tipo, upsert: true });
+    if (error) console.error('🗄️ Arquivo 6 meses falhou:', mediaId, error.message);
+    else console.log('🗄️ Mídia guardada por 6 meses:', caminho);
+  } catch (e) {
+    console.error('🗄️ Arquivo 6 meses falhou:', mediaId, e.response?.status || e.message);
+  } finally { _arquivando.delete(caminho); }
+}
+
+// 🧹 Faxina do arquivo próprio: apaga as cópias da API com mais de 6 meses
+// (183 dias). Roda 5 min depois de subir e depois uma vez por dia.
+async function _limpaCopiasApi() {
+  if (!supabase) return;
+  try {
+    const limite = Date.now() - 183 * 24 * 3600 * 1000;
+    let pag = 0, apagados = 0;
+    while (pag < 40) { // teto de segurança (4000 arquivos por faxina)
+      const { data: itens, error } = await supabase.storage.from('wa-media')
+        .list('api', { limit: 100, offset: pag * 100 });
+      if (error || !itens || !itens.length) break;
+      const velhos = itens
+        .filter(f => f.created_at && new Date(f.created_at).getTime() < limite)
+        .map(f => 'api/' + f.name);
+      if (velhos.length) {
+        await supabase.storage.from('wa-media').remove(velhos);
+        apagados += velhos.length;
+      }
+      if (itens.length < 100) break;
+      pag++;
+    }
+    if (apagados) console.log(`🧹 Cópias com mais de 6 meses apagadas: ${apagados}`);
+  } catch (e) { console.error('🧹 Faxina das cópias:', e.message); }
+}
+setTimeout(() => { _limpaCopiasApi(); setInterval(_limpaCopiasApi, 24 * 3600 * 1000); }, 5 * 60000);
 
 async function getMediaUrl(mediaId, token, cacheKey, force) {
   const hit = mediaUrlCache.get(cacheKey);
@@ -1450,8 +1514,19 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   }
   if (!token) return res.status(400).json({ error: "Token não encontrado" });
 
-  // Mídia de conta QR: servida do Supabase Storage (com suporte a Range para áudio/vídeo)
-  if (mediaId.startsWith('qr/')) {
+  // 🗄️ Cópia própria (6 meses): se o arquivo já está no NOSSO Storage, serve
+  // de lá — funciona mesmo depois que a Meta apaga (30 dias) e é mais rápido
+  let _servirDe = mediaId.startsWith('qr/') ? mediaId : null;
+  if (!_servirDe && supabase) {
+    try {
+      const { data: achou } = await supabase.storage.from('wa-media').list('api', { search: String(mediaId), limit: 1 });
+      if (achou && achou.length) _servirDe = 'api/' + mediaId;
+    } catch (_) {}
+  }
+
+  // Mídia guardada no Supabase Storage (QR ou cópia da API) — com suporte a Range
+  if (_servirDe) {
+    const mediaId = _servirDe; // caminho dentro do bucket
     try {
       if (!supabase) return res.status(500).json({ error: 'Storage indisponível' });
       const { data: blob, error } = await supabase.storage.from('wa-media').download(mediaId);
@@ -1537,6 +1612,9 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
         if (!up) throw e2;
       }
     }
+
+    // 🗄️ Veio da Meta = ainda não tínhamos cópia: guarda agora (vale por 6 meses)
+    try { arquivaMidiaApi(mediaId, token, req.query.mime).catch(() => {}); } catch (_) {}
 
     res.status(up.status); // 200 ou 206 (parcial)
     res.setHeader("Access-Control-Allow-Origin", "*");
