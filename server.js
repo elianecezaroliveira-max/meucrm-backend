@@ -67,11 +67,25 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 182;
-app.get('/versao', (req, res) => {
+const SERVER_VER = 183;
+app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
-  res.json({ server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3) });
+  // 🗄️ Quantas cópias de 6 meses já existem no cofre (diagnóstico do arquivamento)
+  let copias = null;
+  try {
+    if (supabase) {
+      let tot = 0;
+      for (let p = 0; p < 10; p++) {
+        const { data: its } = await supabase.storage.from('wa-media').list('api', { limit: 100, offset: p * 100 });
+        if (!its || !its.length) break;
+        tot += its.length;
+        if (its.length < 100) break;
+      }
+      copias = tot;
+    }
+  } catch (_) {}
+  res.json({ server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3), copias_6meses: copias });
 });
 
 // ── Verificação do Webhook ──
@@ -1470,9 +1484,12 @@ async function arquivaMidiaApi(mediaId, token, mime) {
   if (_arquivando.has(caminho)) return;
   _arquivando.add(caminho);
   try {
-    // Já guardado antes? Não baixa de novo.
-    const { data: ja } = await supabase.storage.from('wa-media').list('api', { search: String(mediaId), limit: 1 });
-    if (ja && ja.length) return;
+    // Já guardado antes? Não baixa de novo (checagem DIRETA, sem busca por lista)
+    try {
+      const { data: ja } = await supabase.storage.from('wa-media')
+        .createSignedUrl(caminho, 60); // barato: só confirma que o arquivo existe
+      if (ja && ja.signedUrl) return;
+    } catch (_) {}
     const metaRes = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
       headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     });
@@ -1544,12 +1561,15 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   if (!token) return res.status(400).json({ error: "Token não encontrado" });
 
   // 🗄️ Cópia própria (6 meses): se o arquivo já está no NOSSO Storage, serve
-  // de lá — funciona mesmo depois que a Meta apaga (30 dias) e é mais rápido
+  // de lá — funciona mesmo depois que a Meta apaga (30 dias) e é mais rápido.
+  // A checagem agora é DIRETA (baixa a cópia): a busca por lista falhava às
+  // vezes e o arquivo guardado era ignorado — parecia "sumido" antes da hora.
   let _servirDe = mediaId.startsWith('qr/') ? mediaId : null;
+  let _blobCopia = null;
   if (!_servirDe && supabase) {
     try {
-      const { data: achou } = await supabase.storage.from('wa-media').list('api', { search: String(mediaId), limit: 1 });
-      if (achou && achou.length) _servirDe = 'api/' + mediaId;
+      const { data: b } = await supabase.storage.from('wa-media').download('api/' + mediaId);
+      if (b) { _servirDe = 'api/' + mediaId; _blobCopia = b; }
     } catch (_) {}
   }
 
@@ -1558,7 +1578,9 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     const mediaId = _servirDe; // caminho dentro do bucket
     try {
       if (!supabase) return res.status(500).json({ error: 'Storage indisponível' });
-      const { data: blob, error } = await supabase.storage.from('wa-media').download(mediaId);
+      const { data: blob, error } = _blobCopia
+        ? { data: _blobCopia, error: null }
+        : await supabase.storage.from('wa-media').download(mediaId);
       if (error || !blob) return res.status(404).json({ error: 'Mídia não encontrada' });
       const buf = Buffer.from(await blob.arrayBuffer());
       const total = buf.length;
@@ -1671,12 +1693,10 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     const st = err.response?.status;
     const msgMeta = String(err.response?.data?.error?.message || err.message || '');
     console.error("❌ Erro ao baixar mídia:", mediaId, st || msgMeta);
-    // A Meta guarda os arquivos por tempo limitado (~30 dias). Depois disso o
-    // media_id deixa de existir — o motivo real por trás de "falha ao baixar".
-    const expirou = st === 404 || /does not exist|Unsupported get request|cannot be loaded/i.test(msgMeta);
-    if (!res.headersSent) res.status(expirou ? 410 : 500).json({
-      error: expirou
-        ? "Este arquivo não está mais disponível no WhatsApp (a Meta guarda os arquivos por cerca de 30 dias)."
+    const naoAchou = st === 404 || /does not exist|Unsupported get request|cannot be loaded/i.test(msgMeta);
+    if (!res.headersSent) res.status(naoAchou ? 410 : 500).json({
+      error: naoAchou
+        ? "O WhatsApp não entregou este arquivo (a Meta apaga arquivos antigos; se este é recente, use o QR Code ou me avise)."
         : "Falha ao baixar mídia"
     });
   }
