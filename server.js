@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 180;
+const SERVER_VER = 181;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1076,7 +1076,9 @@ app.post("/send", async (req, res) => {
       const { error: msgErr } = await supabase.from("messages").insert({
         phone: to, content: message, type: "text", direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'pending', wamid, owner: req.owner || null,
+        // Com o id do WhatsApp em mãos, a mensagem JÁ SAIU → nasce como "enviada"
+        // (antes nascia "pendente" e o tique voltava para o relógio por instantes)
+        status: wamid ? 'sent' : 'pending', wamid, owner: req.owner || null,
         quoted_id: quoted_id || null,
         quoted_content: quoted_content || null,
         quoted_direction: quoted_direction || null,
@@ -1437,7 +1439,7 @@ app.post("/send-media", async (req, res) => {
         phone: to, content,
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
-        status: 'pending', wamid: mediaWamid, owner: req.owner || null,
+        status: mediaWamid ? 'sent' : 'pending', wamid: mediaWamid, owner: req.owner || null,
         media_id: mediaId, media_mime_type: sendMime, // permite exibir a mídia no CRM
       });
       await applyPendingStatus(mediaWamid);
@@ -2204,7 +2206,7 @@ app.post("/send-template", async (req, res) => {
     await supabase.from("messages").insert({
       phone: to, content: shownText, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
-      status: 'pending', wamid: tplWamid, owner: req.owner || null,
+      status: tplWamid ? 'sent' : 'pending', wamid: tplWamid, owner: req.owner || null,
     });
     await applyPendingStatus(tplWamid);
     console.log("✅ Template enviado:", template_name, "→", to, "wamid:", tplWamid);
