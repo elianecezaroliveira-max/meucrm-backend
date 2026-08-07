@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 177;
+const SERVER_VER = 178;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -3138,8 +3138,9 @@ async function processNode(run, depth=0) {
       await processNode({...run,current_node_id:failNxt}, depth+1);
     } else if (!sendOk) {
       await stopRun(runId,'failed');
-    } else if (hasButtons) {
-      // Modelo com botões: aguarda o lead clicar num botão (ramifica conforme o botão)
+    } else if (hasButtons && (medges && medges.length)) {
+      // Modelo com botões: aguarda o lead clicar num botão (ramifica conforme o botão).
+      // Sem NENHUM caminho ligado, não há o que esperar → encerra (não fica "rodando").
       let pauseUntil = null;
       if (cfg.timeout_hours && cfg.timeout_hours > 0) pauseUntil = new Date(Date.now() + cfg.timeout_hours*3600000).toISOString();
       await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
@@ -4109,7 +4110,21 @@ app.post('/bots/:id/start-open-tasks', async (req,res) => {
 app.get('/bot-runs/contact/:phone', async (req,res) => {
   if (!supabase) return res.json([]);
   const { data } = await supabase.from('bot_runs').select('*, bots(name)').eq('contact_phone',req.params.phone).eq('owner', req.owner || ' ').in('status',['running','waiting_reply','paused']).order('created_at',{ascending:false});
-  res.json(data||[]);
+  // 🏁 Bot que já chegou ao FIM (o passo atual não leva a lugar nenhum) não é
+  // mais "em andamento": encerra e some da tela — não faz sentido "parar" o que
+  // já acabou.
+  const vivos = [];
+  for (const r of (data || [])) {
+    try {
+      if (!r.current_node_id) { await stopRun(r.id, 'completed'); continue; }
+      const { data: saidas } = await supabase.from('bot_edges').select('id').eq('from_node_id', r.current_node_id).limit(1);
+      const { data: nd } = await supabase.from('bot_nodes').select('type').eq('id', r.current_node_id).maybeSingle();
+      const acabou = (!saidas || !saidas.length) || (nd && nd.type === 'end');
+      if (acabou) { await stopRun(r.id, 'completed'); continue; }
+    } catch (_) {}
+    vivos.push(r);
+  }
+  res.json(vivos);
 });
 
 // ═══════════════════════════════════════
