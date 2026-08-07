@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 179;
+const SERVER_VER = 180;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -130,6 +130,30 @@ function metaErrorText(er) {
 // ordem — um "sent" atrasado não pode apagar o ✓✓ de um "delivered" já aplicado)
 const _ST_RANK = { pending: 0, sent: 1, delivered: 2, read: 3 };
 // Espelha o status na PRÉVIA da conversa (tiques na lista) — só se for a última mensagem
+// 🔢 Contador de não lidas à prova de mensagens simultâneas.
+// Quando o lead manda vários arquivos de uma vez, os avisos chegam juntos e
+// todos liam o MESMO valor antes de somar 1 — o total saía menor. Aqui cada
+// telefone tem uma fila: uma soma espera a outra terminar.
+const _filaUnread = {};
+async function _somaNaoLida(phone, owner, timestamp) {
+  if (!supabase) return;
+  const chave = (owner || ' ') + '|' + phone;
+  const anterior = _filaUnread[chave] || Promise.resolve();
+  const agora = anterior.catch(() => {}).then(async () => {
+    try {
+      const { data: c } = await supabase.from('contacts').select('unread_count')
+        .eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+      const atual = c?.unread_count || 0;
+      const upd = { unread_count: atual + 1 };
+      if (atual === 0) upd.first_unread_at = timestamp;
+      await supabase.from('contacts').update(upd).eq('phone', phone).eq('owner', owner || ' ');
+    } catch (e) { console.error('Contador de não lidas:', e.message); }
+  });
+  _filaUnread[chave] = agora;
+  await agora;
+  if (_filaUnread[chave] === agora) delete _filaUnread[chave]; // limpa a fila terminada
+}
+
 async function _mirrorContactStatus(wamid, status) {
   try {
     // SÓ mensagens ENVIADAS por nós. Quando o CRM marca a mensagem DO LEAD como
@@ -460,11 +484,9 @@ app.post("/webhook", async (req, res) => {
         const avatarInst = (await anyOpenWaInstanceForOwner(ownerEmail).catch(() => null)) || anyOpenWaInstance();
         if (avatarInst) waFetchAvatar(avatarInst, from, ownerEmail).catch(() => {});
 
-        // Incrementa contador de não lidas e marca hora da 1ª mensagem não lida
-        const currentUnread = existing?.unread_count || 0;
-        const unreadUpdate = { unread_count: currentUnread + 1 };
-        if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp; // só na 1ª mensagem não lida
-        await supabase.from("contacts").update(unreadUpdate).eq("phone", from).eq("owner", ownerEmail || ' ');
+        // Incrementa o contador de não lidas SEM se atrapalhar quando chegam
+        // várias mensagens ao mesmo tempo (4 arquivos seguidos mostravam 3)
+        await _somaNaoLida(from, ownerEmail, timestamp);
 
         // Salva mensagem
         const messageData = {
@@ -5332,13 +5354,7 @@ app.post('/evolution-webhook', async (req, res) => {
         if (!fromMe) waFetchAvatar(instanceName, phone, ownerEmail).catch(() => {});
 
         // Incrementa não-lidos só para mensagens RECEBIDAS
-        if (!fromMe) {
-          const { data: cRow } = await supabase.from('contacts').select('unread_count, first_unread_at').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
-          const currentUnread = cRow?.unread_count || 0;
-          const unreadUpdate = { unread_count: currentUnread + 1 };
-          if (currentUnread === 0) unreadUpdate.first_unread_at = timestamp;
-          await supabase.from('contacts').update(unreadUpdate).eq('phone', phone).eq('owner', ownerEmail || ' ');
-        }
+        if (!fromMe) await _somaNaoLida(phone, ownerEmail, timestamp); // soma em fila (vários arquivos juntos)
 
         const msgData = { phone, content, type, direction, timestamp, wamid };
         if (accountId) msgData.account_id = accountId;
