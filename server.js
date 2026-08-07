@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 181;
+const SERVER_VER = 182;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2399,11 +2399,16 @@ app.post('/typing', async (req, res) => {
         .eq('phone', to).eq('direction', 'inbound').eq('account_id', account_id)
         .not('wamid', 'is', null).order('timestamp', { ascending: false }).limit(1).maybeSingle();
       if (lastIn?.wamid) {
+        // A API oficial só aceita mostrar "digitando…" junto com a leitura de uma
+        // mensagem RECEBIDA. Depois que você responde, a Meta costuma recusar até
+        // o lead escrever de novo — por isso guardamos o motivo no log.
+        let recusa = null;
         await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`, {
           messaging_product: 'whatsapp', status: 'read', message_id: lastIn.wamid,
           typing_indicator: { type: 'text' }
-        }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } }).catch(() => {});
-        return res.json({ success: true, via: 'cloud' });
+        }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } })
+          .catch(e => { recusa = e.response?.data?.error?.message || e.message; console.log('⌨️ Meta recusou o "digitando…":', recusa); });
+        return res.json({ success: !recusa, via: 'cloud', motivo: recusa || undefined });
       }
     }
     res.json({ success: false });
