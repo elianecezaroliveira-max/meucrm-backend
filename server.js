@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 178;
+const SERVER_VER = 179;
 app.get('/versao', (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -132,7 +132,11 @@ const _ST_RANK = { pending: 0, sent: 1, delivered: 2, read: 3 };
 // Espelha o status na PRÉVIA da conversa (tiques na lista) — só se for a última mensagem
 async function _mirrorContactStatus(wamid, status) {
   try {
-    const { data: rows } = await supabase.from('messages').select('phone, owner, timestamp').eq('wamid', wamid).limit(3);
+    // SÓ mensagens ENVIADAS por nós. Quando o CRM marca a mensagem DO LEAD como
+    // lida, a Meta devolve um "read" com o id DELA — isso pintava de azul as
+    // minhas mensagens (inclusive as do bot) sem o lead ter visto nada.
+    const { data: rows } = await supabase.from('messages').select('phone, owner, timestamp')
+      .eq('wamid', wamid).eq('direction', 'outbound').limit(3);
     const lower = _ST_RANK[status] !== undefined ? Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < _ST_RANK[status]) : null;
     for (const r of (rows || [])) {
       let q = supabase.from('contacts').update({ last_message_status: status })
@@ -161,7 +165,8 @@ async function _mirrorContactStatus(wamid, status) {
 }
 async function updateMsgStatus(wamid, upd) {
   if (!supabase || !wamid || !upd?.status) return;
-  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid); _mirrorContactStatus(wamid, 'failed'); return; }
+  // Tique de entrega/leitura vale SÓ para mensagem enviada por mim (outbound)
+  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound'); _mirrorContactStatus(wamid, 'failed'); return; }
   const rank = _ST_RANK[upd.status];
   if (rank === undefined) return;
   const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
@@ -169,10 +174,10 @@ async function updateMsgStatus(wamid, upd) {
   const upd2 = { ...upd };
   if (upd.status === 'delivered') upd2.delivered_at = new Date().toISOString();
   if (upd.status === 'read') upd2.read_at = new Date().toISOString();
-  const { error: eCol } = await supabase.from('messages').update(upd2).eq('wamid', wamid)
+  const { error: eCol } = await supabase.from('messages').update(upd2).eq('wamid', wamid).eq('direction', 'outbound')
     .or('status.is.null,status.in.(' + lower.join(',') + ')');
   if (eCol) { // colunas de horário ainda não existem no banco: segue só com o status
-    await supabase.from('messages').update(upd).eq('wamid', wamid)
+    await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound')
       .or('status.is.null,status.in.(' + lower.join(',') + ')');
   }
   _mirrorContactStatus(wamid, upd.status);
@@ -4119,7 +4124,11 @@ app.get('/bot-runs/contact/:phone', async (req,res) => {
       if (!r.current_node_id) { await stopRun(r.id, 'completed'); continue; }
       const { data: saidas } = await supabase.from('bot_edges').select('id').eq('from_node_id', r.current_node_id).limit(1);
       const { data: nd } = await supabase.from('bot_nodes').select('type').eq('id', r.current_node_id).maybeSingle();
-      const acabou = (!saidas || !saidas.length) || (nd && nd.type === 'end');
+      // Encerrado quando: não há para onde ir, é o nó Fim, o passo sumiu do bot,
+      // ou a espera está parada há mais de 7 dias (ninguém vai responder mais)
+      const parado7d = ['waiting_reply', 'paused'].includes(r.status) &&
+        (Date.now() - new Date(r.updated_at || r.created_at || 0).getTime()) > 7 * 24 * 3600 * 1000;
+      const acabou = (!saidas || !saidas.length) || !nd || (nd && nd.type === 'end') || parado7d;
       if (acabou) { await stopRun(r.id, 'completed'); continue; }
     } catch (_) {}
     vivos.push(r);
