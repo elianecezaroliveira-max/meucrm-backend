@@ -1767,6 +1767,48 @@ app.get('/storage-emergencia', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 🧹 ÓRFÃOS: arquivos do Storage que NENHUMA mensagem usa (mídia de grupo/status
+// que era baixada e descartada). Apagar isso não muda nada no que aparece no CRM.
+//   /storage-orfaos?admin=SEU_TOKEN            → só conta (não apaga)
+//   /storage-orfaos?admin=SEU_TOKEN&apagar=1   → apaga
+app.get('/storage-orfaos', async (req, res) => {
+  if (!_storageAuthOk(req)) return res.status(401).json(_storageAuthErro);
+  if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
+  try {
+    // 1) tudo que está guardado nas pastas das contas QR (avatares fora)
+    const mapa = await _mapaStorage();
+    const qr = mapa.arquivos.filter(a => a.grupo.startsWith('qr/') && a.grupo !== 'qr/avatars');
+    // 2) tudo que as mensagens realmente usam
+    const usados = new Set();
+    for (let de = 0; ; de += 1000) {
+      const { data, error } = await supabase.from('messages').select('media_id')
+        .like('media_id', 'qr/%').range(de, de + 999);
+      if (error || !data || !data.length) break;
+      for (const r of data) if (r.media_id) usados.add(r.media_id);
+      if (data.length < 1000) break;
+    }
+    // Só considera órfão se a lista de mensagens veio (senão pararia de apagar tudo por engano)
+    const orfaos = qr.filter(a => !usados.has(a.caminho));
+    const mb = +(orfaos.reduce((s, a) => s + a.bytes, 0) / 1048576).toFixed(1);
+    if (String(req.query.apagar || '') !== '1') {
+      return res.json({ ok: true, modo: 'so_contagem', guardados_qr: qr.length, usados_no_chat: usados.size, orfaos: orfaos.length, orfaos_mb: mb });
+    }
+    if (!usados.size && orfaos.length) {
+      return res.status(409).json({ error: 'Nenhuma mensagem com mídia QR foi encontrada — por segurança, não apago nada assim. Confira o banco.' });
+    }
+    let apagados = 0;
+    for (let i = 0; i < orfaos.length; i += 100) {
+      const parte = orfaos.slice(i, i + 100);
+      const { error } = await supabase.storage.from('wa-media').remove(parte.map(a => a.caminho));
+      if (error) return res.status(500).json({ error: error.message, apagados, faltam: orfaos.length - apagados });
+      apagados += parte.length;
+    }
+    _cofreCheio = false;
+    console.log(`🧹 Órfãos apagados: ${apagados} (${mb} MB)`);
+    res.json({ ok: true, modo: 'apagou', apagados, liberado_mb: mb, mantidos_no_chat: usados.size });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 async function getMediaUrl(mediaId, token, cacheKey, force) {
   const hit = mediaUrlCache.get(cacheKey);
   if (!force && hit && (Date.now() - hit.ts) < 3 * 60 * 1000) return hit.url;
@@ -5063,12 +5105,28 @@ async function waStart(instanceName) {
         }
         continue;
       }
+      // 🚫 Grupo, status e canal NÃO viram conversa no CRM (o webhook interno já
+      // descartava) — mas a mídia deles era baixada e guardada ANTES do descarte.
+      // Foi isso que encheu o Storage: 3 GB de vídeos de grupo/status que não
+      // apareciam em lugar nenhum. Agora pulamos ANTES de baixar qualquer coisa.
+      {
+        const _rjPre = String(m.key?.remoteJid || '');
+        if (_rjPre.includes('@g.us') || _rjPre.includes('@broadcast') || _rjPre.includes('@newsletter')) continue;
+      }
       // Baixa a mídia (foto/áudio/vídeo/documento) e guarda no Supabase Storage
       let mediaPath = null, mediaMime = null;
       try {
         const mm = m.message.imageMessage || m.message.audioMessage || m.message.videoMessage
                 || m.message.documentMessage || m.message.stickerMessage;
-        if (mm && supabase) {
+        // 📦 Arquivo acima do limite não entra no cofre (mesma regra da API oficial):
+        // a mensagem aparece no chat, só sem o arquivo anexado.
+        const _fl = mm && mm.fileLength;
+        const _tamQr = !_fl ? 0 : (typeof _fl.toNumber === 'function' ? _fl.toNumber() : (Number(_fl) || 0));
+        if (mm && _tamQr > COFRE_ARQ_MAX_MB * 1048576) {
+          console.log(`📦 Mídia QR de ${Math.round(_tamQr / 1048576)} MB não guardada (limite ${COFRE_ARQ_MAX_MB} MB)`);
+        } else if (mm && supabase && _cofreCheio) {
+          console.log('📦 Cofre no limite — mídia QR não guardada');
+        } else if (mm && supabase) {
           const buf = await _baileys.downloadMediaMessage(m, 'buffer', {}, {
             logger: _pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
           mediaMime = (mm.mimetype || 'application/octet-stream').split(';')[0];
