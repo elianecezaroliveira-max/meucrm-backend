@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 184;
+const SERVER_VER = 185;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -86,7 +86,12 @@ app.get('/versao', async (req, res) => {
     }
   } catch (_) {}
   res.json({ server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3),
-    copias_6meses: copias, cofre_ultimo_ok: _cofreUltimoOk, cofre_ultimo_erro: _cofreUltimoErro });
+    copias_6meses: copias, cofre_ultimo_ok: _cofreUltimoOk, cofre_ultimo_erro: _cofreUltimoErro,
+    // 📦 Espaço do Storage (última medição da faxina) — o plano grátis do Supabase dá 1 GB
+    storage_mb: (_espacoCache ? _espacoCache.mb : null),
+    storage_teto_mb: COFRE_TETO_MB,
+    storage_medido_em: (_espacoCache ? new Date(_espacoCache.ts).toISOString() : null),
+    storage_cheio: _cofreCheio });
 });
 
 // 🩺 RAIO-X de um arquivo que não abre: mostra se há cópia no cofre e o que a
@@ -901,8 +906,7 @@ async function _limpaMidiasAntigas() {
     }
   } catch (e) { console.error('Limpeza de mídias:', e.message); }
 }
-setTimeout(() => _limpaMidiasAntigas().catch(() => {}), 10 * 60000);
-setInterval(() => _limpaMidiasAntigas().catch(() => {}), 24 * 3600000);
+// (o agendamento fica com a _faxinaCompleta, mais abaixo: idade + teto de espaço)
 
 // Vigia as contas da API oficial a cada 15 min — o aviso chega mesmo sem você
 // abrir a tela de Contas (antes, o problema só era detectado ao abrir a tela).
@@ -1510,6 +1514,10 @@ const _arquivando = new Set(); // evita baixar o mesmo arquivo duas vezes ao mes
 let _cofreUltimoOk = null, _cofreUltimoErro = null; // diagnóstico visível no /versao
 async function arquivaMidiaApi(mediaId, token, mime) {
   if (!supabase || !mediaId || !token || String(mediaId).startsWith('qr/')) return;
+  // 📦 Cofre cheio: para de copiar até a faxina abrir espaço (evita estourar a
+  // cota do Supabase e derrubar o CRM inteiro). A Meta ainda serve o arquivo
+  // pelos primeiros ~30 dias, então nada some na hora.
+  if (_cofreCheio) { _cofreUltimoErro = 'cofre no limite (' + COFRE_TETO_MB + ' MB) — cópia adiada'; return; }
   const caminho = 'api/' + mediaId;
   if (_arquivando.has(caminho)) return;
   _arquivando.add(caminho);
@@ -1525,9 +1533,16 @@ async function arquivaMidiaApi(mediaId, token, mime) {
     });
     const url = metaRes.data?.url;
     if (!url) return;
+    // 📦 Arquivo grande demais não entra no cofre: um vídeo de 60 MB come 6% do
+    // plano grátis sozinho. Acima do limite, fica só com a Meta (~30 dias).
+    const _tam = Number(metaRes.data?.file_size || 0);
+    if (_tam && _tam > COFRE_ARQ_MAX_MB * 1048576) {
+      _cofreUltimoErro = mediaId + ': arquivo de ' + Math.round(_tam / 1048576) + ' MB — acima do limite de ' + COFRE_ARQ_MAX_MB + ' MB, não copiado';
+      return;
+    }
     const bin = await axios.get(url, {
       headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'WhatsApp/2.0' },
-      responseType: 'arraybuffer', timeout: 60000, maxContentLength: 80 * 1024 * 1024
+      responseType: 'arraybuffer', timeout: 60000, maxContentLength: COFRE_ARQ_MAX_MB * 1024 * 1024
     });
     const tipo = mime || metaRes.data?.mime_type || bin.headers['content-type'] || 'application/octet-stream';
     const { error } = await supabase.storage.from('wa-media')
@@ -1565,7 +1580,192 @@ async function _limpaCopiasApi() {
     if (apagados) console.log(`🧹 Cópias com mais de 6 meses apagadas: ${apagados}`);
   } catch (e) { console.error('🧹 Faxina das cópias:', e.message); }
 }
-setTimeout(() => { _limpaCopiasApi(); setInterval(_limpaCopiasApi, 24 * 3600 * 1000); }, 5 * 60000);
+// ══════════════════════════════════════════════════════════════════════════
+// 📦 CONTROLE DE ESPAÇO DO STORAGE
+// O plano grátis do Supabase dá 1 GB. Quando estoura, o Supabase RESTRINGE o
+// projeto inteiro — o CRM sai do ar, não só as fotos. Apagar só pela idade
+// (183 dias) não bastava: o balde enchia muito antes de completar 6 meses.
+// Agora existe um TETO: passou do teto, a faxina apaga do MAIS ANTIGO para o
+// mais novo até voltar a caber. Fotos de perfil (qr/avatars) e fotos dos bots
+// (bot/) nunca são apagadas — são pequenas e a tela depende delas.
+// Dá para afinar pelo Railway: COFRE_TETO_MB e COFRE_ARQ_MAX_MB.
+// ══════════════════════════════════════════════════════════════════════════
+const COFRE_TETO_MB    = Number(process.env.COFRE_TETO_MB    || 700); // teto do balde inteiro
+const COFRE_ARQ_MAX_MB = Number(process.env.COFRE_ARQ_MAX_MB || 12);  // nada maior que isso entra no cofre
+const COFRE_ALVO_PCT   = 0.80;  // depois de podar, sobra folga até 80% do teto
+let _espacoCache = null;        // última medição { mb, grupos, ts }
+let _cofreCheio  = false;       // trava o arquivamento enquanto estiver no limite
+let _ultimaPoda  = null;        // diagnóstico
+
+// Lista TODOS os arquivos de uma pasta (com tamanho e data). Pastas são ignoradas.
+async function _listaArquivos(prefixo) {
+  const saida = [];
+  let offset = 0;
+  while (offset < 20000) { // teto de segurança
+    const { data, error } = await supabase.storage.from('wa-media')
+      .list(prefixo, { limit: 100, offset });
+    if (error || !data || !data.length) break;
+    for (const f of data) {
+      if (!f || !f.name || !f.id) continue; // sem id = é subpasta
+      saida.push({
+        caminho: prefixo ? prefixo + '/' + f.name : f.name,
+        bytes: Number(f.metadata && f.metadata.size ? f.metadata.size : 0),
+        criado: f.created_at ? new Date(f.created_at).getTime() : 0,
+        grupo: prefixo
+      });
+    }
+    if (data.length < 100) break;
+    offset += 100;
+  }
+  return saida;
+}
+
+// Mede o balde inteiro: quanto cada pasta ocupa e a lista completa de arquivos.
+async function _mapaStorage() {
+  if (!supabase) return null;
+  const pastas = ['api', 'bot'];
+  try {
+    const { data: subs } = await supabase.storage.from('wa-media').list('qr', { limit: 1000 });
+    for (const s of (subs || [])) if (s && s.name && !s.id) pastas.push('qr/' + s.name);
+  } catch (_) {}
+  const grupos = {}, arquivos = [];
+  for (const p of pastas) {
+    const its = await _listaArquivos(p);
+    let soma = 0;
+    for (const a of its) { soma += a.bytes; arquivos.push(a); }
+    grupos[p] = { arquivos: its.length, mb: +(soma / 1048576).toFixed(1) };
+  }
+  const bytes = arquivos.reduce((s, a) => s + a.bytes, 0);
+  return { bytes, mb: +(bytes / 1048576).toFixed(1), grupos, arquivos };
+}
+
+// Poda por ESPAÇO: passou do teto, apaga do mais antigo até voltar a caber.
+async function _podaPorEspaco() {
+  if (!supabase) return null;
+  try {
+    const mapa = await _mapaStorage();
+    if (!mapa) return null;
+    _espacoCache = { mb: mapa.mb, grupos: mapa.grupos, ts: Date.now() };
+    const teto = COFRE_TETO_MB * 1048576;
+    if (mapa.bytes <= teto) {
+      _cofreCheio = false;
+      _ultimaPoda = { quando: new Date().toISOString(), apagados: 0, mb: mapa.mb };
+      return _ultimaPoda;
+    }
+    const alvo = teto * COFRE_ALVO_PCT;
+    const fila = mapa.arquivos
+      .filter(a => a.grupo !== 'bot' && a.grupo !== 'qr/avatars') // esses ficam sempre
+      .sort((a, b) => a.criado - b.criado);
+    let previsto = mapa.bytes;
+    const lote = [];
+    for (const a of fila) {
+      if (previsto <= alvo) break;
+      lote.push(a);
+      previsto -= a.bytes;
+    }
+    let apagados = 0, liberado = 0;
+    for (let i = 0; i < lote.length; i += 100) {
+      const parte = lote.slice(i, i + 100);
+      const { error } = await supabase.storage.from('wa-media').remove(parte.map(a => a.caminho));
+      if (error) { console.error('📦 Poda falhou:', error.message); break; }
+      apagados += parte.length;
+      liberado += parte.reduce((s, a) => s + a.bytes, 0);
+    }
+    const restante = mapa.bytes - liberado;
+    _cofreCheio = restante > teto;
+    _espacoCache = { mb: +(restante / 1048576).toFixed(1), grupos: mapa.grupos, ts: Date.now() };
+    _ultimaPoda = { quando: new Date().toISOString(), apagados, antes_mb: mapa.mb, depois_mb: _espacoCache.mb };
+    console.log(`📦 Poda por espaço: ${apagados} arquivo(s) apagados — ${mapa.mb} MB → ${_espacoCache.mb} MB (teto ${COFRE_TETO_MB} MB)`);
+    return _ultimaPoda;
+  } catch (e) {
+    console.error('📦 Poda por espaço:', e.message);
+    return { erro: e.message };
+  }
+}
+
+// Faxina completa: idade (183 dias) + teto de espaço. 5 min após subir e 1x/dia.
+async function _faxinaCompleta() {
+  await _limpaCopiasApi().catch(() => {});
+  await _limpaMidiasAntigas().catch(() => {});
+  return await _podaPorEspaco();
+}
+setTimeout(() => { _faxinaCompleta(); setInterval(_faxinaCompleta, 24 * 3600 * 1000); }, 5 * 60000);
+
+// 🔑 Quem pode ver/forçar a faxina: quem está logada no CRM, quem manda o token
+// de integração, ou — e isso é o socorro quando o Supabase restringe o projeto e
+// o login para de funcionar — o token de administração do Railway:
+//   ?admin=<ADMIN_TOKEN ou VERIFY_TOKEN das variáveis do Railway>
+function _storageAuthOk(req) {
+  if (req.owner) return true;
+  const adm = String(req.query.admin || '').trim();
+  const espAdm = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
+  if (adm && espAdm && adm === espAdm) return true;
+  const tok = String(req.query.token || '').trim()
+    || String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+  if (!tok) return false;
+  for (const k in _settings) if (k.startsWith('api_token::') && _settings[k] === tok) return true;
+  return false;
+}
+const _storageAuthErro = { error: 'Sem permissão. Entre no CRM, ou use ?token=SEU_TOKEN (Configurações → Integração), ou ?admin=VERIFY_TOKEN (variável do Railway).' };
+
+// 📊 Quanto o Storage está ocupando, pasta por pasta.
+app.get('/storage-uso', async (req, res) => {
+  if (!_storageAuthOk(req)) return res.status(401).json(_storageAuthErro);
+  if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
+  try {
+    const m = await _mapaStorage();
+    _espacoCache = { mb: m.mb, grupos: m.grupos, ts: Date.now() };
+    res.json({
+      total_mb: m.mb,
+      teto_mb: COFRE_TETO_MB,
+      uso_pct: Math.round((m.bytes / (COFRE_TETO_MB * 1048576)) * 100),
+      arquivo_max_mb: COFRE_ARQ_MAX_MB,
+      cofre_cheio: _cofreCheio,
+      por_pasta: m.grupos,
+      ultima_poda: _ultimaPoda
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, dica: /restrict|quota/i.test(e.message || '')
+      ? 'O Supabase restringiu o projeto por cota. Libere espaço pelo painel do Supabase (Storage → wa-media → api).' : undefined });
+  }
+});
+
+// 🧹 Faxina AGORA (idade + teto). Serve para destravar sem esperar o dia virar.
+app.get('/storage-faxina', async (req, res) => {
+  if (!_storageAuthOk(req)) return res.status(401).json(_storageAuthErro);
+  if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
+  try {
+    const r = await _faxinaCompleta();
+    res.json({ ok: true, resultado: r, teto_mb: COFRE_TETO_MB });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🚨 SOCORRO: apaga uma fatia do cofre pela ORDEM DE CHEGADA (mais antigos
+// primeiro), sem depender do teto. Use quando o projeto já está restrito:
+//   /storage-emergencia?admin=SEU_TOKEN&quantos=2000&pasta=api
+app.get('/storage-emergencia', async (req, res) => {
+  if (!_storageAuthOk(req)) return res.status(401).json(_storageAuthErro);
+  if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
+  const quantos = Math.min(Math.max(parseInt(req.query.quantos, 10) || 500, 1), 5000);
+  const pasta = String(req.query.pasta || 'api').replace(/[^\w/-]/g, '') || 'api';
+  if (pasta === 'bot' || pasta === 'qr/avatars') {
+    return res.status(400).json({ error: 'Fotos de perfil e fotos dos bots não são apagadas por aqui.' });
+  }
+  try {
+    const its = (await _listaArquivos(pasta)).sort((a, b) => a.criado - b.criado).slice(0, quantos);
+    let apagados = 0, bytes = 0;
+    for (let i = 0; i < its.length; i += 100) {
+      const parte = its.slice(i, i + 100);
+      const { error } = await supabase.storage.from('wa-media').remove(parte.map(a => a.caminho));
+      if (error) return res.status(500).json({ error: error.message, apagados });
+      apagados += parte.length;
+      bytes += parte.reduce((s, a) => s + a.bytes, 0);
+    }
+    _cofreCheio = false;
+    console.log(`🚨 Emergência: ${apagados} arquivo(s) de ${pasta} apagados (${Math.round(bytes / 1048576)} MB)`);
+    res.json({ ok: true, pasta, apagados, liberado_mb: +(bytes / 1048576).toFixed(1) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 async function getMediaUrl(mediaId, token, cacheKey, force) {
   const hit = mediaUrlCache.get(cacheKey);
