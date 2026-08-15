@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 187;
+const SERVER_VER = 188;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -4600,7 +4600,8 @@ const OWNER_LEGADO = 'elianecezaroliveira@gmail.com';
 const CHAVES_POR_CONTA = new Set([
   'tag_catalog', 'n8n_webhook_url',
   'faq_enabled', 'faq_mode', 'faq_accounts', 'faq_delay_seconds', 'faq_ai_model',
-  'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer'
+  'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer',
+  'tmpl_alias' // apelidos dos modelos da API (nome só no CRM)
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
