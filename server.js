@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 186;
+const SERVER_VER = 187;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1642,7 +1642,25 @@ async function _mapaStorage() {
   return { bytes, mb: +(bytes / 1048576).toFixed(1), grupos, arquivos };
 }
 
-// Poda por ESPAÇO: passou do teto, apaga do mais antigo até voltar a caber.
+// Quais arquivos do Storage as mensagens realmente usam (media_id). Devolve
+// { set, ok } — ok=false quando a consulta falhou (aí NINGUÉM é tratado como órfão).
+async function _midiaUsadaNoChat() {
+  const usados = new Set();
+  let ok = true;
+  for (let de = 0; ; de += 1000) {
+    const { data, error } = await supabase.from('messages').select('media_id')
+      .or('media_id.like.qr/*,media_id.like.api/*').range(de, de + 999);
+    if (error) { ok = false; break; }
+    if (!data || !data.length) break;
+    for (const r of data) if (r.media_id) usados.add(r.media_id);
+    if (data.length < 1000) break;
+  }
+  return { set: usados, ok };
+}
+
+// Poda por ESPAÇO: passou do teto, apaga até voltar a caber — PRIMEIRO os
+// órfãos (que nenhuma mensagem usa), do mais antigo ao mais novo; só se ainda
+// não couber é que mexe em arquivo usado no chat (e avisa no log).
 async function _podaPorEspaco() {
   if (!supabase) return null;
   try {
@@ -1656,13 +1674,18 @@ async function _podaPorEspaco() {
       return _ultimaPoda;
     }
     const alvo = teto * COFRE_ALVO_PCT;
-    const fila = mapa.arquivos
-      .filter(a => a.grupo !== 'bot' && a.grupo !== 'qr/avatars') // esses ficam sempre
-      .sort((a, b) => a.criado - b.criado);
+    const usados = await _midiaUsadaNoChat();
+    if (!usados.ok) { console.error('📦 Poda adiada: não consegui ler as mensagens (não apago às cegas)'); return { erro: 'mensagens indisponíveis' }; }
+    const cand = mapa.arquivos.filter(a => a.grupo !== 'bot' && a.grupo !== 'qr/avatars'); // esses ficam sempre
+    const orfaos = cand.filter(a => !usados.set.has(a.caminho)).sort((a, b) => a.criado - b.criado);
+    const emUso  = cand.filter(a =>  usados.set.has(a.caminho)).sort((a, b) => a.criado - b.criado);
+    const fila = orfaos.concat(emUso);
+    let _avisouUso = false;
     let previsto = mapa.bytes;
     const lote = [];
     for (const a of fila) {
       if (previsto <= alvo) break;
+      if (!_avisouUso && usados.set.has(a.caminho)) { _avisouUso = true; console.warn('📦 ATENÇÃO: órfãos não bastaram — poda vai alcançar arquivos usados no chat (mais antigos primeiro)'); }
       lote.push(a);
       previsto -= a.bytes;
     }
@@ -1783,16 +1806,10 @@ app.get('/storage-orfaos', async (req, res) => {
     const mapa = await _mapaStorage();
     const qr = mapa.arquivos.filter(a => a.grupo.startsWith('qr/') && a.grupo !== 'qr/avatars');
     // 2) tudo que as mensagens realmente usam
-    const usados = new Set();
-    let erroMsgs = null;
-    for (let de = 0; ; de += 1000) {
-      const { data, error } = await supabase.from('messages').select('media_id')
-        .like('media_id', 'qr/%').range(de, de + 999);
-      if (error) { erroMsgs = error.message; break; }
-      if (!data || !data.length) break;
-      for (const r of data) if (r.media_id) usados.add(r.media_id);
-      if (data.length < 1000) break;
-    }
+    const u = await _midiaUsadaNoChat();
+    const usados = u.set;
+    const erroMsgs = u.ok ? null : 'falha ao ler mensagens';
+    if (!u.ok && String(req.query.apagar || '') === '1') return res.status(409).json({ error: 'Não consegui ler as mensagens — por segurança, não apago nada.' });
     // Só considera órfão se a lista de mensagens veio (senão pararia de apagar tudo por engano)
     const orfaos = qr.filter(a => !usados.has(a.caminho));
     const mb = +(orfaos.reduce((s, a) => s + a.bytes, 0) / 1048576).toFixed(1);
