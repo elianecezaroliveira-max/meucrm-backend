@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 185;
+const SERVER_VER = 186;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1596,6 +1596,7 @@ const COFRE_ALVO_PCT   = 0.80;  // depois de podar, sobra folga até 80% do teto
 let _espacoCache = null;        // última medição { mb, grupos, ts }
 let _cofreCheio  = false;       // trava o arquivamento enquanto estiver no limite
 let _ultimaPoda  = null;        // diagnóstico
+let _ultimoErroStorage = null;  // último erro do Storage ao listar (para diagnóstico)
 
 // Lista TODOS os arquivos de uma pasta (com tamanho e data). Pastas são ignoradas.
 async function _listaArquivos(prefixo) {
@@ -1604,7 +1605,8 @@ async function _listaArquivos(prefixo) {
   while (offset < 20000) { // teto de segurança
     const { data, error } = await supabase.storage.from('wa-media')
       .list(prefixo, { limit: 100, offset });
-    if (error || !data || !data.length) break;
+    if (error) { _ultimoErroStorage = prefixo + ': ' + (error.message || JSON.stringify(error)); break; }
+    if (!data || !data.length) break;
     for (const f of data) {
       if (!f || !f.name || !f.id) continue; // sem id = é subpasta
       saida.push({
@@ -1625,9 +1627,10 @@ async function _mapaStorage() {
   if (!supabase) return null;
   const pastas = ['api', 'bot'];
   try {
-    const { data: subs } = await supabase.storage.from('wa-media').list('qr', { limit: 1000 });
+    const { data: subs, error: eSubs } = await supabase.storage.from('wa-media').list('qr', { limit: 1000 });
+    if (eSubs) _ultimoErroStorage = 'qr: ' + (eSubs.message || JSON.stringify(eSubs));
     for (const s of (subs || [])) if (s && s.name && !s.id) pastas.push('qr/' + s.name);
-  } catch (_) {}
+  } catch (e) { _ultimoErroStorage = 'qr: ' + e.message; }
   const grupos = {}, arquivos = [];
   for (const p of pastas) {
     const its = await _listaArquivos(p);
@@ -1722,7 +1725,8 @@ app.get('/storage-uso', async (req, res) => {
       arquivo_max_mb: COFRE_ARQ_MAX_MB,
       cofre_cheio: _cofreCheio,
       por_pasta: m.grupos,
-      ultima_poda: _ultimaPoda
+      ultima_poda: _ultimaPoda,
+      erro_storage: _ultimoErroStorage
     });
   } catch (e) {
     res.status(500).json({ error: e.message, dica: /restrict|quota/i.test(e.message || '')
@@ -1780,10 +1784,12 @@ app.get('/storage-orfaos', async (req, res) => {
     const qr = mapa.arquivos.filter(a => a.grupo.startsWith('qr/') && a.grupo !== 'qr/avatars');
     // 2) tudo que as mensagens realmente usam
     const usados = new Set();
+    let erroMsgs = null;
     for (let de = 0; ; de += 1000) {
       const { data, error } = await supabase.from('messages').select('media_id')
         .like('media_id', 'qr/%').range(de, de + 999);
-      if (error || !data || !data.length) break;
+      if (error) { erroMsgs = error.message; break; }
+      if (!data || !data.length) break;
       for (const r of data) if (r.media_id) usados.add(r.media_id);
       if (data.length < 1000) break;
     }
@@ -1791,7 +1797,8 @@ app.get('/storage-orfaos', async (req, res) => {
     const orfaos = qr.filter(a => !usados.has(a.caminho));
     const mb = +(orfaos.reduce((s, a) => s + a.bytes, 0) / 1048576).toFixed(1);
     if (String(req.query.apagar || '') !== '1') {
-      return res.json({ ok: true, modo: 'so_contagem', guardados_qr: qr.length, usados_no_chat: usados.size, orfaos: orfaos.length, orfaos_mb: mb });
+      return res.json({ ok: true, modo: 'so_contagem', guardados_qr: qr.length, usados_no_chat: usados.size, orfaos: orfaos.length, orfaos_mb: mb,
+        erro_storage: _ultimoErroStorage, erro_mensagens: erroMsgs, pastas: Object.keys(mapa.grupos) });
     }
     if (!usados.size && orfaos.length) {
       return res.status(409).json({ error: 'Nenhuma mensagem com mídia QR foi encontrada — por segurança, não apago nada assim. Confira o banco.' });
