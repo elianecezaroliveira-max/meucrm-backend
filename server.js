@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 183;
+const SERVER_VER = 184;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -85,7 +85,36 @@ app.get('/versao', async (req, res) => {
       copias = tot;
     }
   } catch (_) {}
-  res.json({ server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3), copias_6meses: copias });
+  res.json({ server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3),
+    copias_6meses: copias, cofre_ultimo_ok: _cofreUltimoOk, cofre_ultimo_erro: _cofreUltimoErro });
+});
+
+// 🩺 RAIO-X de um arquivo que não abre: mostra se há cópia no cofre e o que a
+// Meta responde para CADA conta. Use a mesma URL do arquivo trocando
+// /media-proxy/ por /midia-diag/ (precisa estar logada no CRM).
+app.get('/midia-diag/:mediaId', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM para usar o diagnóstico' });
+  if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
+  const { mediaId } = req.params;
+  const saida = { mediaId, copia_no_cofre: false, contas: [] };
+  try {
+    const { data: b } = await supabase.storage.from('wa-media').download('api/' + mediaId);
+    saida.copia_no_cofre = !!b;
+  } catch (_) {}
+  try {
+    const { data: accs } = await supabase.from('accounts').select('id, name, token').not('token', 'is', null);
+    for (const a of (accs || [])) {
+      try {
+        const r = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+          headers: { Authorization: `Bearer ${a.token}` }, timeout: 15000
+        });
+        saida.contas.push({ conta: a.name || a.id, ok: true, tem_url: !!r.data?.url });
+      } catch (e) {
+        saida.contas.push({ conta: a.name || a.id, ok: false, meta_disse: e.response?.data?.error?.message || e.message });
+      }
+    }
+  } catch (e) { saida.erro = e.message; }
+  res.json(saida);
 });
 
 // ── Verificação do Webhook ──
@@ -1478,6 +1507,7 @@ const mediaUrlCache = new Map(); // mediaId_token -> { url, ts }
 // (pasta api/) — assim as fotos e documentos continuam abrindo por 6 meses.
 // A limpeza automática (a mesma das mídias do QR) apaga o que passa de 183 dias.
 const _arquivando = new Set(); // evita baixar o mesmo arquivo duas vezes ao mesmo tempo
+let _cofreUltimoOk = null, _cofreUltimoErro = null; // diagnóstico visível no /versao
 async function arquivaMidiaApi(mediaId, token, mime) {
   if (!supabase || !mediaId || !token || String(mediaId).startsWith('qr/')) return;
   const caminho = 'api/' + mediaId;
@@ -1502,10 +1532,12 @@ async function arquivaMidiaApi(mediaId, token, mime) {
     const tipo = mime || metaRes.data?.mime_type || bin.headers['content-type'] || 'application/octet-stream';
     const { error } = await supabase.storage.from('wa-media')
       .upload(caminho, Buffer.from(bin.data), { contentType: tipo, upsert: true });
-    if (error) console.error('🗄️ Arquivo 6 meses falhou:', mediaId, error.message);
-    else console.log('🗄️ Mídia guardada por 6 meses:', caminho);
+    if (error) { _cofreUltimoErro = mediaId + ': ' + error.message; console.error('🗄️ Arquivo 6 meses falhou:', mediaId, error.message); }
+    else { _cofreUltimoOk = caminho + ' @ ' + new Date().toISOString(); console.log('🗄️ Mídia guardada por 6 meses:', caminho); }
   } catch (e) {
-    console.error('🗄️ Arquivo 6 meses falhou:', mediaId, e.response?.status || e.message);
+    const mm = e.response?.data?.error?.message || e.message || String(e.response?.status || '');
+    _cofreUltimoErro = mediaId + ': ' + mm;
+    console.error('🗄️ Arquivo 6 meses falhou:', mediaId, mm);
   } finally { _arquivando.delete(caminho); }
 }
 
