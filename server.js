@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 204;
+const SERVER_VER = 206;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -331,11 +331,13 @@ app.post("/webhook", async (req, res) => {
           const wabaId = String((body.entry || [])[0]?.id || '');
           let ownerN = null, nomeN = '';
           if (supabase) {
-            let { data: accW } = wabaId ? await supabase.from('accounts').select('name, owner').eq('waba_id', wabaId).limit(1).maybeSingle() : { data: null };
-            if (!accW) ({ data: accW } = await supabase.from('accounts').select('name, owner').not('owner', 'is', null).limit(1).maybeSingle());
-            if (accW) { ownerN = accW.owner; nomeN = accW.name; }
+            // O evento é do PORTFÓLIO (WABA), que pode ter vários números — cita todos
+            let { data: accsW } = wabaId ? await supabase.from('accounts').select('name, owner').eq('waba_id', wabaId) : { data: null };
+            accsW = (accsW || []).filter(Boolean);
+            if (!accsW.length) { const { data: a1 } = await supabase.from('accounts').select('name, owner').not('owner', 'is', null).limit(1).maybeSingle(); if (a1) accsW = [a1]; }
+            if (accsW.length) { ownerN = accsW[0].owner; nomeN = accsW.map(a => a.name).filter(Boolean).join(', '); }
           }
-          const sufixo = nomeN ? ` (conta "${nomeN}")` : '';
+          const sufixo = nomeN ? (nomeN.includes(',') ? ` (números: ${nomeN})` : ` (conta "${nomeN}")`) : '';
           let txt = null;
           if (change.field === 'account_review_update') {
             const d = String(value?.decision || '').toUpperCase();
@@ -354,7 +356,12 @@ app.post("/webhook", async (req, res) => {
               VERIFIED_ACCOUNT: '✅ Conta VERIFICADA pela Meta'
             };
             const extra = value?.ban_info?.waba_ban_state ? ` — estado: ${value.ban_info.waba_ban_state}` : '';
-            txt = (mapaEv[ev] || ('ℹ️ Atualização da conta na Meta: ' + (ev || 'evento'))) + sufixo + extra;
+            // Eventos técnicos de bastidor (parceiro instalado, termos assinados, número
+            // adicionado ao portfólio…) NÃO viram aviso — só ficam no log
+            const _silenciosos = /^(PARTNER_|MM_LITE_|BUSINESS_CAPABILITY|CAPABILITY_UPDATE|PRIMARY_BUSINESS_LOCATION|AD_ACCOUNT_LINKED|OBO_)/;
+            if (mapaEv[ev]) txt = mapaEv[ev] + sufixo + extra;
+            else if (_silenciosos.test(ev) || !ev) { console.log('ℹ️ Evento de conta Meta (silencioso):', ev, sufixo); txt = null; }
+            else txt = 'ℹ️ Atualização da conta na Meta: ' + ev + sufixo + extra;
           } else {
             const ev = String(value?.event || '');
             txt = `📶 Qualidade do número atualizada${sufixo}: ${ev}${value?.current_limit ? ` — limite de envio: ${value.current_limit}` : ''}`;
@@ -2604,9 +2611,12 @@ async function _dripTick() {
       const regras = _dripRegras(owner);
       let mudou = false;
       for (const r of regras) {
-        if (!r.ativo || !r.de || !r.para || r.de === r.para) continue;
-        // ▶ Iniciado à mão: ignora dia/horário e vai até esvaziar a fila (ou até você pausar)
-        if (!r.manual && !_dripDentroDaJanela(r)) continue;
+        if (!r.de || !r.para || r.de === r.para) continue;
+        // Roda se: ▶ iniciado à mão (ignora dia/horário, até esvaziar ou pausar)
+        //      ou: 🕐 automático ligado E dentro dos dias/horários
+        const rodaManual = !!r.manual;
+        const rodaAuto = !!r.agendado && _dripDentroDaJanela(r);
+        if (!rodaManual && !rodaAuto) continue;
         const nx = r.next_at ? new Date(r.next_at).getTime() : 0;
         if (nx > Date.now()) continue;
         // 🛡️ Garantia absoluta do intervalo mínimo: mesmo que o agendamento se perca
@@ -2664,7 +2674,7 @@ app.get('/drip', async (req, res) => {
   const agora = new Date(Date.now() - 3 * 3600000);
   const hhmm = String(agora.getUTCHours()).padStart(2, '0') + ':' + String(agora.getUTCMinutes()).padStart(2, '0');
   const janela = {};
-  for (const r of regras) janela[r.id] = !!r.manual || _dripDentroDaJanela(r);
+  for (const r of regras) janela[r.id] = _dripDentroDaJanela(r);
   res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay() });
 });
 app.put('/drip', async (req, res) => {
@@ -2687,7 +2697,10 @@ app.put('/drip', async (req, res) => {
       nome: String(r.nome || '').slice(0, 60),
       de: String(r.de || ''), para: String(r.para || ''),
       min_seg: minN, max_seg: maxN,
-      ativo: !!r.ativo, manual: !!r.ativo && !!r.manual, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
+      manual: !!r.manual,
+      agendado: (r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo),
+      ativo: !!r.manual || ((r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo)),
+      hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: nextAt, // mantém o próximo horário (pausar/ligar não encurta o intervalo); intervalo novo → recalculado
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
