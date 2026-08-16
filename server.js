@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 191;
+const SERVER_VER = 192;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2512,6 +2512,106 @@ app.post("/import/lead", async (req, res) => {
   const r = await _importarLeads(items, n8nOwner);
   console.log(`📥 n8n importou ${r.imported} lead(s)` + (r.errors.length ? `, ${r.errors.length} erro(s)` : ""));
   res.json({ success: true, imported: r.imported, errors: r.errors });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⏳ GOTEJAMENTO (substitui o 2º fluxo do n8n): move leads de uma etapa para
+// outra UM POR VEZ, com intervalo aleatório entre eles (ex.: 3,5 a 5 min), para
+// que os bots da etapa de destino disparem espaçados. Regras por conta em
+// settings drip_rules::owner = [{ id, nome, de, para, min_seg, max_seg, ativo,
+// hora_ini, hora_fim, next_at, last }]
+// ═══════════════════════════════════════════════════════════════════════════
+function _dripRegras(owner) { try { const a = JSON.parse(_cfg('drip_rules', owner) || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+async function _dripSalva(owner, regras) {
+  const k = 'drip_rules::' + (owner || ' ');
+  const value = JSON.stringify(regras);
+  await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
+  _settings[k] = value;
+}
+function _dripDentroDaJanela(r) {
+  if (!r.hora_ini && !r.hora_fim) return true;
+  const agora = new Date(Date.now() - 3 * 3600000); // horário de Brasília
+  const hm = agora.getUTCHours() * 60 + agora.getUTCMinutes();
+  const toMin = t => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '')); return m ? (+m[1]) * 60 + (+m[2]) : null; };
+  const a = toMin(r.hora_ini), b = toMin(r.hora_fim);
+  if (a == null && b == null) return true;
+  if (a != null && b != null) return a <= b ? (hm >= a && hm < b) : (hm >= a || hm < b);
+  if (a != null) return hm >= a;
+  return hm < b;
+}
+const _dripLock = new Set();
+async function _dripTick() {
+  if (!supabase) return;
+  for (const k in _settings) {
+    if (!k.startsWith('drip_rules::')) continue;
+    const owner = k.slice('drip_rules::'.length);
+    if (!owner.trim() || _dripLock.has(owner)) continue;
+    _dripLock.add(owner);
+    try {
+      const regras = _dripRegras(owner);
+      let mudou = false;
+      for (const r of regras) {
+        if (!r.ativo || !r.de || !r.para || r.de === r.para) continue;
+        if (!_dripDentroDaJanela(r)) continue;
+        const nx = r.next_at ? new Date(r.next_at).getTime() : 0;
+        if (nx > Date.now()) continue;
+        // pega UM lead da etapa de origem (mais antigo na etapa primeiro = ordem de chegada)
+        const { data: leads } = await supabase.from('contacts').select('phone, name')
+          .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
+        const lead = leads && leads[0];
+        const minS = Math.max(5, Number(r.min_seg) || 210), maxS = Math.max(minS, Number(r.max_seg) || 300);
+        const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
+        r.next_at = new Date(Date.now() + espera * 1000).toISOString();
+        mudou = true;
+        if (!lead) { r.last = { quando: new Date().toISOString(), vazio: true }; continue; }
+        const { error } = await supabase.from('contacts').update({ stage_id: r.para }).eq('phone', lead.phone).eq('owner', owner);
+        if (error) { r.last = { quando: new Date().toISOString(), erro: error.message }; continue; }
+        try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
+        r.movidos = (r.movidos || 0) + 1;
+        r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera };
+        console.log(`⏳ Gotejamento "${r.nome || r.id}": ${lead.phone} movido; próximo em ${espera}s`);
+      }
+      if (mudou) await _dripSalva(owner, regras);
+    } catch (e) { console.error('⏳ drip:', e.message); }
+    finally { _dripLock.delete(owner); }
+  }
+}
+setTimeout(() => { _dripTick(); setInterval(_dripTick, 20000); }, 90000);
+
+app.get('/drip', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const regras = _dripRegras(req.owner);
+  // quantos leads ainda esperam em cada etapa de origem
+  const contagens = {};
+  for (const r of regras) {
+    if (!r.de || contagens[r.de] !== undefined) continue;
+    const { count } = await supabase.from('contacts').select('phone', { count: 'exact', head: true }).eq('owner', req.owner).eq('stage_id', r.de);
+    contagens[r.de] = count || 0;
+  }
+  res.json({ regras, contagens });
+});
+app.put('/drip', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const novas = Array.isArray(req.body && req.body.regras) ? req.body.regras : null;
+  if (!novas) return res.status(400).json({ error: 'regras[] obrigatório' });
+  const antigas = _dripRegras(req.owner);
+  const limpas = novas.map(r => {
+    const a = antigas.find(x => x.id === r.id) || {};
+    return {
+      id: String(r.id || ('drip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7))),
+      nome: String(r.nome || '').slice(0, 60),
+      de: String(r.de || ''), para: String(r.para || ''),
+      min_seg: Math.max(5, parseInt(r.min_seg, 10) || 210), max_seg: Math.max(5, parseInt(r.max_seg, 10) || 300),
+      ativo: !!r.ativo, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
+      next_at: (r.ativo && !a.ativo) ? null : (a.next_at || null), // ligou agora → começa já
+      movidos: a.movidos || 0, last: a.last || null
+    };
+  }).filter(r => r.de && r.para);
+  await _dripSalva(req.owner, limpas);
+  res.json({ ok: true, regras: limpas });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5027,7 +5127,8 @@ const CHAVES_POR_CONTA = new Set([
   'faq_enabled', 'faq_mode', 'faq_accounts', 'faq_delay_seconds', 'faq_ai_model',
   'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer',
   'tmpl_alias', // apelidos dos modelos da API (nome só no CRM)
-  'sheets_sync' // planilha do Google ligada ao pipeline (importação de leads)
+  'sheets_sync', // planilha do Google ligada ao pipeline (importação de leads)
+  'drip_rules'   // gotejamento: mover leads aos poucos de uma etapa para outra
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
