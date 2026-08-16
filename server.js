@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 190;
+const SERVER_VER = 191;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2566,7 +2566,8 @@ async function _lerPlanilha(spreadsheetId, sheetName) {
   } catch (e) {
     const st = e.response && e.response.status;
     const msg = e.response && e.response.data && e.response.data.error && e.response.data.error.message || e.message;
-    if (st === 403) throw new Error('Sem acesso à planilha — compartilhe-a (como leitor) com o e-mail do robô: ' + (_googleSA() || {}).client_email);
+    if (st === 403 && /has not been used|is disabled|SERVICE_DISABLED|accessNotConfigured/i.test(msg || '')) throw new Error('A Google Sheets API está DESLIGADA no projeto do robô. Ative em https://console.cloud.google.com/apis/library/sheets.googleapis.com e tente de novo em 1 minuto. Detalhe: ' + msg);
+    if (st === 403) throw new Error('Sem acesso à planilha — compartilhe-a (como leitor) com o e-mail do robô: ' + (_googleSA() || {}).client_email + '. Detalhe do Google: ' + msg);
     if (st === 404) throw new Error('Planilha não encontrada — confira o link');
     if (st === 400) throw new Error('Aba não encontrada ("' + sheetName + '") — confira o nome da aba. Detalhe: ' + msg);
     throw new Error(msg);
