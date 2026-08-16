@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 209;
+const SERVER_VER = 210;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -3344,12 +3344,88 @@ app.put("/pipeline/stages/:id", async (req, res) => {
 });
 
 // Excluir estágio (move leads para sem-status)
+// 🗑️ Excluir coluna → vai para a LIXEIRA (settings stage_trash::owner) com os leads
+// que estavam nela, para poder DESFAZER (mesmo id → bots, gotejamento e IDs externos
+// continuam funcionando ao restaurar).
+async function _stageTrash(owner) { try { const a = JSON.parse(_cfg('stage_trash', owner) || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+async function _stageTrashSalva(owner, lista) {
+  const k = 'stage_trash::' + (owner || ' ');
+  const value = JSON.stringify(lista.slice(0, 15));
+  await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
+  _settings[k] = value;
+}
 app.delete("/pipeline/stages/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  await supabase.from("contacts").update({ stage_id: null }).eq("stage_id", req.params.id).eq("owner", req.owner || ' ');
-  const { error } = await supabase.from("pipeline_stages").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
+  const OW = req.owner || ' ';
+  const { data: st } = await supabase.from('pipeline_stages').select('*').eq('id', req.params.id).eq('owner', OW).maybeSingle();
+  const { data: leads } = await supabase.from('contacts').select('phone').eq('stage_id', req.params.id).eq('owner', OW);
+  await supabase.from("contacts").update({ stage_id: null }).eq("stage_id", req.params.id).eq("owner", OW);
+  const { error } = await supabase.from("pipeline_stages").delete().eq("id", req.params.id).eq("owner", OW);
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
+  try {
+    if (st) {
+      const lixo = await _stageTrash(req.owner);
+      lixo.unshift({ stage: st, phones: (leads || []).map(l => l.phone), deleted_at: new Date().toISOString() });
+      await _stageTrashSalva(req.owner, lixo);
+    }
+  } catch (e) { console.error('lixeira de coluna:', e.message); }
+  res.json({ success: true, leads_movidos: (leads || []).length });
+});
+// Lixeira de colunas
+app.get('/pipeline/stages/trash', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const lixo = await _stageTrash(req.owner);
+  res.json(lixo.map(x => ({ id: x.stage.id, name: x.stage.name, external_id: x.stage.external_id, leads: (x.phones || []).length, deleted_at: x.deleted_at })));
+});
+// Restaurar coluna da lixeira (mesmo id) e devolver os leads
+app.post('/pipeline/stages/restore', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const id = String(req.body && req.body.id || '');
+  const lixo = await _stageTrash(req.owner);
+  const item = lixo.find(x => x.stage && x.stage.id === id);
+  if (!item) return res.status(404).json({ error: 'Coluna não está na lixeira' });
+  const st = Object.assign({}, item.stage); delete st.created_at;
+  const { error } = await supabase.from('pipeline_stages').insert(st);
+  if (error && !/duplicate|unique/i.test(error.message)) return res.status(500).json({ error: error.message });
+  let devolvidos = 0;
+  const fones = item.phones || [];
+  for (let k = 0; k < fones.length; k += 400) {
+    const { data } = await supabase.from('contacts').update({ stage_id: id }).eq('owner', req.owner).in('phone', fones.slice(k, k + 400)).is('stage_id', null).select('phone');
+    devolvidos += (data || []).length;
+  }
+  await _stageTrashSalva(req.owner, lixo.filter(x => x !== item));
+  console.log(`♻️ Coluna restaurada: ${st.name} (${devolvidos} leads de volta)`);
+  res.json({ ok: true, stage: st, leads_devolvidos: devolvidos });
+});
+// 🩹 Recuperar coluna apagada ANTES da lixeira existir: acha ids de etapa que bots,
+// gotejamento ou regras ainda referenciam mas que não existem mais, e recria com o
+// MESMO id (assim tudo volta a apontar certo). Os leads precisam ser movidos à mão.
+app.get('/pipeline/stages/orphans', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const OW = req.owner;
+  const { data: sts } = await supabase.from('pipeline_stages').select('id').eq('owner', OW);
+  const existe = new Set((sts || []).map(x => x.id));
+  const refs = {}; // id -> pistas
+  const add = (id, pista) => { if (!id || existe.has(id)) return; (refs[id] = refs[id] || new Set()).add(pista); };
+  const { data: bots } = await supabase.from('bots').select('id, name, trigger_stage_id').eq('owner', OW);
+  for (const b of (bots || [])) add(b.trigger_stage_id, 'bot "' + b.name + '"');
+  for (const r of _dripRegras(OW)) { add(r.de, 'gotejamento "' + (r.nome || '') + '" (origem)'); add(r.para, 'gotejamento "' + (r.nome || '') + '" (destino)'); }
+  try { const sa = JSON.parse(_settings['stage_actions::' + OW] || '{}'); for (const k in sa) add(k, 'automação da etapa'); for (const k in sa) for (const a of (sa[k] || [])) if (a && a.type === 'move_stage') add(a.stage_id, 'automação "mover para"'); } catch (_) {}
+  try { const { data: nodes } = await supabase.from('bot_nodes').select('config, type').eq('type', 'move_stage'); for (const n of (nodes || [])) { const c = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); add(c.stage_id, 'passo "Mudar status" de um bot'); } } catch (_) {}
+  res.json(Object.keys(refs).map(id => ({ id, pistas: [...refs[id]] })));
+});
+app.post('/pipeline/stages/recover', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const { id, name, external_id } = req.body || {};
+  if (!id || !name) return res.status(400).json({ error: 'id e name obrigatórios' });
+  const { data: max } = await supabase.from('pipeline_stages').select('position').eq('owner', req.owner).order('position', { ascending: false }).limit(1).maybeSingle();
+  const row = { id: String(id), name: String(name).trim(), owner: req.owner, position: ((max && max.position) || 0) + 1, external_id: String(external_id || '').trim() || String(Math.floor(10000000 + Math.random() * 90000000)) };
+  const { data, error } = await supabase.from('pipeline_stages').insert(row).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, stage: data });
 });
 
 // Listar contatos (com stage_id, unread_count e prévia)
@@ -5365,7 +5441,8 @@ const CHAVES_POR_CONTA = new Set([
   'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer',
   'tmpl_alias', // apelidos dos modelos da API (nome só no CRM)
   'sheets_sync', // planilha do Google ligada ao pipeline (importação de leads)
-  'drip_rules'   // gotejamento: mover leads aos poucos de uma etapa para outra
+  'drip_rules',  // gotejamento: mover leads aos poucos de uma etapa para outra
+  'stage_trash'  // lixeira de colunas do pipeline (desfazer exclusão)
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
