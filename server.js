@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 199;
+const SERVER_VER = 200;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2573,7 +2573,7 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
   for (const r of regrasDoTick) {
     const a = atuais.find(x => x.id === r.id);
     if (!a) continue;
-    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos;
+    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; if (r.manual === false && a.manual) a.manual = false;
   }
   await _dripSalva(owner, atuais);
 }
@@ -2605,7 +2605,8 @@ async function _dripTick() {
       let mudou = false;
       for (const r of regras) {
         if (!r.ativo || !r.de || !r.para || r.de === r.para) continue;
-        if (!_dripDentroDaJanela(r)) continue;
+        // ▶ Iniciado à mão: ignora dia/horário e vai até esvaziar a fila (ou até você pausar)
+        if (!r.manual && !_dripDentroDaJanela(r)) continue;
         const nx = r.next_at ? new Date(r.next_at).getTime() : 0;
         if (nx > Date.now()) continue;
         // 🔒 Confere no BANCO antes de mover (protege contra dois servidores ao mesmo
@@ -2625,7 +2626,7 @@ async function _dripTick() {
           .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
         const lead = leads && leads[0];
         mudou = true;
-        if (!lead) { r.last = { quando: new Date().toISOString(), vazio: true }; continue; }
+        if (!lead) { r.last = { quando: new Date().toISOString(), vazio: true }; if (r.manual) { r.manual = false; } continue; }
         // 3) move (só se ainda estiver na etapa de origem — evita mover quem você acabou de arrastar à mão)
         const { data: mv, error } = await supabase.from('contacts').update({ stage_id: r.para })
           .eq('phone', lead.phone).eq('owner', owner).eq('stage_id', r.de).select('phone');
@@ -2659,7 +2660,7 @@ app.get('/drip', async (req, res) => {
   const agora = new Date(Date.now() - 3 * 3600000);
   const hhmm = String(agora.getUTCHours()).padStart(2, '0') + ':' + String(agora.getUTCMinutes()).padStart(2, '0');
   const janela = {};
-  for (const r of regras) janela[r.id] = _dripDentroDaJanela(r);
+  for (const r of regras) janela[r.id] = !!r.manual || _dripDentroDaJanela(r);
   res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay() });
 });
 app.put('/drip', async (req, res) => {
@@ -2675,7 +2676,7 @@ app.put('/drip', async (req, res) => {
       nome: String(r.nome || '').slice(0, 60),
       de: String(r.de || ''), para: String(r.para || ''),
       min_seg: Math.max(5, parseInt(r.min_seg, 10) || 210), max_seg: Math.max(5, parseInt(r.max_seg, 10) || 300),
-      ativo: !!r.ativo, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
+      ativo: !!r.ativo, manual: !!r.ativo && !!r.manual, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: a.next_at || null, // mantém o próximo horário (pausar/ligar não encurta o intervalo)
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: a.last || null
