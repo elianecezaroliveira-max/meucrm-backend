@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 193;
+const SERVER_VER = 194;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2558,17 +2558,29 @@ async function _dripTick() {
         if (!_dripDentroDaJanela(r)) continue;
         const nx = r.next_at ? new Date(r.next_at).getTime() : 0;
         if (nx > Date.now()) continue;
-        // pega UM lead da etapa de origem (mais antigo na etapa primeiro = ordem de chegada)
-        const { data: leads } = await supabase.from('contacts').select('phone, name')
-          .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
-        const lead = leads && leads[0];
+        // 🔒 Confere no BANCO antes de mover (protege contra dois servidores ao mesmo
+        // tempo durante um deploy do Railway: se outro já agendou o próximo, este pula)
+        try {
+          const { data: fresco } = await supabase.from('settings').select('value').eq('key', 'drip_rules::' + owner).maybeSingle();
+          const rf = fresco && fresco.value ? (JSON.parse(fresco.value) || []).find(x => x.id === r.id) : null;
+          if (rf && rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; r.last = rf.last || r.last; r.movidos = rf.movidos || r.movidos; continue; }
+        } catch (_) {}
+        // 1) agenda o PRÓXIMO e grava JÁ (antes de mover) — se cair no meio, não repete
         const minS = Math.max(5, Number(r.min_seg) || 210), maxS = Math.max(minS, Number(r.max_seg) || 300);
         const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
         r.next_at = new Date(Date.now() + espera * 1000).toISOString();
+        await _dripSalva(owner, regras);
+        // 2) pega UM lead da etapa de origem
+        const { data: leads } = await supabase.from('contacts').select('phone, name')
+          .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
+        const lead = leads && leads[0];
         mudou = true;
         if (!lead) { r.last = { quando: new Date().toISOString(), vazio: true }; continue; }
-        const { error } = await supabase.from('contacts').update({ stage_id: r.para }).eq('phone', lead.phone).eq('owner', owner);
+        // 3) move (só se ainda estiver na etapa de origem — evita mover quem você acabou de arrastar à mão)
+        const { data: mv, error } = await supabase.from('contacts').update({ stage_id: r.para })
+          .eq('phone', lead.phone).eq('owner', owner).eq('stage_id', r.de).select('phone');
         if (error) { r.last = { quando: new Date().toISOString(), erro: error.message }; continue; }
+        if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), vazio: true }; continue; }
         try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
         r.movidos = (r.movidos || 0) + 1;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera };
@@ -2579,7 +2591,8 @@ async function _dripTick() {
     finally { _dripLock.delete(owner); }
   }
 }
-setTimeout(() => { _dripTick(); setInterval(_dripTick, 20000); }, 90000);
+// Confere a cada 5 s → o intervalo real fica entre o mínimo e o máximo (+ até 5 s)
+setTimeout(() => { _dripTick(); setInterval(_dripTick, 5000); }, 60000);
 
 app.get('/drip', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -2609,7 +2622,7 @@ app.put('/drip', async (req, res) => {
       min_seg: Math.max(5, parseInt(r.min_seg, 10) || 210), max_seg: Math.max(5, parseInt(r.max_seg, 10) || 300),
       ativo: !!r.ativo, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
-      next_at: (r.ativo && !a.ativo) ? null : (a.next_at || null), // ligou agora → começa já
+      next_at: a.next_at || null, // mantém o próximo horário (pausar/ligar não encurta o intervalo)
       movidos: a.movidos || 0, last: a.last || null
     };
   }).filter(r => r.de && r.para);
