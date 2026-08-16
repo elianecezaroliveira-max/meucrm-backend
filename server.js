@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 206;
+const SERVER_VER = 207;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -326,6 +326,47 @@ app.post("/webhook", async (req, res) => {
 
       // 🏛️ Vereditos e eventos da CONTA na Meta (análise aprovada/rejeitada,
       // banimento, restrição, qualidade) → viram AVISO + push na hora
+      // 📋 MODELOS: aprovado / reprovado / pausado / desativado / categoria ou qualidade
+      // alterada → AVISO + push (precisa do campo "message_template_status_update"
+      // assinado no webhook do app na Meta)
+      if (['message_template_status_update', 'template_category_update', 'message_template_quality_update'].includes(change.field)) {
+        try {
+          const wabaId = String((body.entry || [])[0]?.id || '');
+          let ownerN = null, nomeN = '';
+          if (supabase) {
+            let { data: accsW } = wabaId ? await supabase.from('accounts').select('name, owner').eq('waba_id', wabaId) : { data: null };
+            accsW = (accsW || []).filter(Boolean);
+            if (!accsW.length) { const { data: a1 } = await supabase.from('accounts').select('name, owner').not('owner', 'is', null).limit(1).maybeSingle(); if (a1) accsW = [a1]; }
+            if (accsW.length) { ownerN = accsW[0].owner; nomeN = accsW.map(a => a.name).filter(Boolean).join(', '); }
+          }
+          const tName = value?.message_template_name || value?.name || '?';
+          const tLang = value?.message_template_language || value?.language || '';
+          const sufixo = nomeN ? ` (${nomeN.includes(',') ? 'números: ' : 'conta '}${nomeN})` : '';
+          const modelo = `"${tName}"${tLang ? ' · ' + tLang : ''}`;
+          let txt = null;
+          if (change.field === 'message_template_status_update') {
+            const ev = String(value?.event || '').toUpperCase();
+            const motivo = value?.reason && String(value.reason).toUpperCase() !== 'NONE' ? ` — motivo: ${value.reason}` : '';
+            const mapa = {
+              APPROVED: `✅ Modelo APROVADO pela Meta: ${modelo}${sufixo} — já pode ser usado.`,
+              REJECTED: `❌ Modelo REPROVADO pela Meta: ${modelo}${sufixo}${motivo}`,
+              PAUSED: `⏸ Modelo PAUSADO pela Meta: ${modelo}${sufixo}${motivo}`,
+              DISABLED: `🚫 Modelo DESATIVADO pela Meta: ${modelo}${sufixo}${motivo}`,
+              PENDING_DELETION: `🗑 Modelo marcado para EXCLUSÃO: ${modelo}${sufixo}`,
+              FLAGGED: `⚠️ Modelo SINALIZADO pela Meta (qualidade baixa): ${modelo}${sufixo}${motivo}`,
+              IN_APPEAL: `📨 Recurso do modelo em análise: ${modelo}${sufixo}`,
+              PENDING: `⏳ Modelo em análise: ${modelo}${sufixo}`
+            };
+            txt = mapa[ev] || `ℹ️ Modelo ${modelo}: ${ev || 'atualização'}${sufixo}${motivo}`;
+          } else if (change.field === 'template_category_update') {
+            txt = `🏷 Categoria do modelo ${modelo} alterada pela Meta: ${value?.previous_category || '?'} → ${value?.new_category || '?'}${sufixo}`;
+          } else {
+            txt = `📶 Qualidade do modelo ${modelo}: ${value?.previous_quality_score || '?'} → ${value?.new_quality_score || '?'}${sufixo}`;
+          }
+          if (txt) addNotice(ownerN, txt, 'tmpl:' + change.field + ':' + wabaId + ':' + tName + ':' + (value?.event || value?.new_category || value?.new_quality_score || ''));
+        } catch (e) { console.error('Evento de modelo Meta:', e.message); }
+        continue;
+      }
       if (['account_review_update', 'account_update', 'phone_number_quality_update'].includes(change.field)) {
         try {
           const wabaId = String((body.entry || [])[0]?.id || '');
