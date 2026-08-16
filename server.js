@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 208;
+const SERVER_VER = 209;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -5021,7 +5021,23 @@ app.get('/bots', async (req,res) => {
   if (!supabase) return res.json([]);
   const { data,error } = await supabase.from('bots').select('*').eq('owner', req.owner || ' ').order('created_at',{ascending:false});
   if (error) return res.status(500).json({error:error.message});
-  res.json(data||[]);
+  const bots = data || [];
+  // 📈 Estatísticas leves por bot (execuções, última, em andamento) para os cartões
+  try {
+    if (String(req.query.stats || '') === '1' && bots.length) {
+      const ids = bots.map(b => b.id);
+      const { data: runs } = await supabase.from('bot_runs').select('bot_id, status, created_at').in('bot_id', ids).order('created_at', { ascending: false }).limit(5000);
+      const st = {};
+      for (const r of (runs || [])) {
+        const o = st[r.bot_id] = st[r.bot_id] || { execucoes: 0, andamento: 0, ultima: null };
+        o.execucoes++;
+        if (r.status === 'waiting_reply' || r.status === 'running') o.andamento++;
+        if (!o.ultima) o.ultima = r.created_at;
+      }
+      for (const b of bots) b._stats = st[b.id] || { execucoes: 0, andamento: 0, ultima: null };
+    }
+  } catch (_) {}
+  res.json(bots);
 });
 app.get('/bots/:id', async (req,res) => {
   if (!supabase) return res.json({});
