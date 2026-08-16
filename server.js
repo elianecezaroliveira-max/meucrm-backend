@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 197;
+const SERVER_VER = 198;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -1648,11 +1648,17 @@ async function _midiaUsadaNoChat() {
   const usados = new Set();
   let ok = true;
   for (let de = 0; ; de += 1000) {
-    const { data, error } = await supabase.from('messages').select('media_id')
-      .or('media_id.like.qr/*,media_id.like.api/*').range(de, de + 999);
+    const { data, error } = await supabase.from('messages').select('id, media_id')
+      .not('media_id', 'is', null).order('id', { ascending: true }).range(de, de + 999);
     if (error) { ok = false; break; }
     if (!data || !data.length) break;
-    for (const r of data) if (r.media_id) usados.add(r.media_id);
+    for (const r of data) {
+      const mid = String(r.media_id || '').trim();
+      if (!mid) continue;
+      // QR guarda o caminho completo (qr/...); a API oficial guarda o id cru e a cópia fica em api/<id>
+      usados.add(mid.startsWith('qr/') || mid.startsWith('bot/') ? mid : 'api/' + mid);
+      usados.add(mid);
+    }
     if (data.length < 1000) break;
   }
   return { set: usados, ok };
@@ -1721,8 +1727,9 @@ setTimeout(() => { _faxinaCompleta(); setInterval(_faxinaCompleta, 24 * 3600 * 1
 // de integração, ou — e isso é o socorro quando o Supabase restringe o projeto e
 // o login para de funcionar — o token de administração do Railway:
 //   ?admin=<ADMIN_TOKEN ou VERIFY_TOKEN das variáveis do Railway>
-function _storageAuthOk(req) {
-  if (req.owner) return true;
+function _storageAuthOk(req, destrutivo) {
+  if (req.owner && !destrutivo) return true; // ver números: qualquer conta logada
+  if (req.owner && destrutivo && req.owner === OWNER_LEGADO) return true; // apagar: só a dona
   const adm = String(req.query.admin || '').trim();
   const espAdm = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
   if (adm && espAdm && adm === espAdm) return true;
@@ -1759,7 +1766,7 @@ app.get('/storage-uso', async (req, res) => {
 
 // 🧹 Faxina AGORA (idade + teto). Serve para destravar sem esperar o dia virar.
 app.get('/storage-faxina', async (req, res) => {
-  if (!_storageAuthOk(req)) return res.status(401).json(_storageAuthErro);
+  if (!_storageAuthOk(req, true)) return res.status(401).json(_storageAuthErro);
   if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
   try {
     const r = await _faxinaCompleta();
@@ -1771,10 +1778,10 @@ app.get('/storage-faxina', async (req, res) => {
 // primeiro), sem depender do teto. Use quando o projeto já está restrito:
 //   /storage-emergencia?admin=SEU_TOKEN&quantos=2000&pasta=api
 app.get('/storage-emergencia', async (req, res) => {
-  if (!_storageAuthOk(req)) return res.status(401).json(_storageAuthErro);
+  if (!_storageAuthOk(req, true)) return res.status(401).json(_storageAuthErro);
   if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
   const quantos = Math.min(Math.max(parseInt(req.query.quantos, 10) || 500, 1), 5000);
-  const pasta = String(req.query.pasta || 'api').replace(/[^\w/-]/g, '') || 'api';
+  const pasta = String(req.query.pasta || 'api').replace(/[^\w/-]/g, '').replace(/\/+$/, '') || 'api';
   if (pasta === 'bot' || pasta === 'qr/avatars') {
     return res.status(400).json({ error: 'Fotos de perfil e fotos dos bots não são apagadas por aqui.' });
   }
@@ -1799,7 +1806,7 @@ app.get('/storage-emergencia', async (req, res) => {
 //   /storage-orfaos?admin=SEU_TOKEN            → só conta (não apaga)
 //   /storage-orfaos?admin=SEU_TOKEN&apagar=1   → apaga
 app.get('/storage-orfaos', async (req, res) => {
-  if (!_storageAuthOk(req)) return res.status(401).json(_storageAuthErro);
+  if (!_storageAuthOk(req, String(req.query.apagar || '') === '1')) return res.status(401).json(_storageAuthErro);
   if (!supabase) return res.status(500).json({ error: 'Supabase indisponível' });
   try {
     // 1) tudo que está guardado nas pastas das contas QR (avatares fora)
@@ -2056,11 +2063,12 @@ function _paraMp3(buf) {
       .save(outFile);
   });
 }
-async function _transcreverBuffer(buf) {
+async function _transcreverBuffer(buf, ehMp3, mimeOrig) {
   if (!process.env.GROQ_API_KEY) throw new Error('Chave GROQ_API_KEY não configurada no Railway (é a mesma da IA do FAQ).');
   const FormData = require('form-data');
   const form = new FormData();
-  form.append('file', buf, { filename: 'audio.mp3', contentType: 'audio/mpeg' });
+  const ext = ehMp3 ? 'mp3' : (String(mimeOrig || '').includes('ogg') || String(mimeOrig || '').includes('opus') ? 'ogg' : String(mimeOrig || '').includes('mp4') || String(mimeOrig || '').includes('m4a') ? 'm4a' : 'ogg');
+  form.append('file', buf, { filename: 'audio.' + ext, contentType: ehMp3 ? 'audio/mpeg' : (mimeOrig || 'audio/ogg') });
   form.append('model', process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo');
   form.append('language', 'pt');
   form.append('response_format', 'json');
@@ -2085,9 +2093,9 @@ app.post('/transcribe', async (req, res) => {
   _transcrevendo.add(String(id));
   try {
     const bruto = await _bytesDaMidia(msg);
-    let mp3 = bruto;
-    try { mp3 = await _paraMp3(bruto); } catch (e) { console.warn('📝 conversão mp3 falhou, mandando original:', e.message); }
-    const texto = await _transcreverBuffer(mp3);
+    let mp3 = bruto, ehMp3 = false;
+    try { mp3 = await _paraMp3(bruto); ehMp3 = (mp3 !== bruto); } catch (e) { console.warn('📝 conversão mp3 falhou, mandando original:', e.message); }
+    const texto = await _transcreverBuffer(mp3, ehMp3, mime);
     if (!texto) return res.json({ ok: true, transcript: '', vazio: true });
     const { error: upErr } = await supabase.from('messages').update({ transcript: texto }).eq('id', id);
     if (upErr) {
@@ -2140,27 +2148,40 @@ app.get('/search/messages', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 // ⬇ EXPORTAR LEADS (CSV para Excel) — respeita conta, etapa, etiqueta e período
 // ═══════════════════════════════════════════════════════════════════════════
-app.get('/contacts/export', async (req, res) => {
+async function _exportarLeadsCsv(req, res) {
   if (!supabase) return res.status(500).send('Supabase não configurado');
   if (!req.owner) return res.status(401).send('Faça login no CRM');
-  const { account_id, stage_id, tag, from, to, phones } = req.query;
+  const src = Object.assign({}, req.query || {}, (req.body && typeof req.body === 'object') ? req.body : {});
+  const { account_id, stage_id, tag, from, to } = src;
+  const phones = Array.isArray(src.phones) ? src.phones : (src.phones ? String(src.phones).split(',') : null);
+  const lista = phones ? phones.map(x => String(x).trim()).filter(Boolean) : null;
   const OW = req.owner;
   try {
-    let q = supabase.from('contacts').select('phone, name, email, stage_id, tags, account_id, created_at, last_message_at, last_message_direction, notes, favorite').eq('owner', OW);
-    if (account_id) q = q.eq('account_id', account_id);
-    if (stage_id) q = q.eq('stage_id', stage_id);
-    if (from) q = q.gte('created_at', from);
-    if (to) q = q.lte('created_at', to + 'T23:59:59');
-    if (phones) q = q.in('phone', String(phones).split(',').map(x => x.trim()).filter(Boolean));
-    q = q.order('created_at', { ascending: false }).limit(20000);
-    let { data, error } = await q;
-    if (error && /email|notes|favorite/i.test(error.message || '')) {
-      let q2 = supabase.from('contacts').select('phone, name, stage_id, tags, account_id, created_at, last_message_at, last_message_direction').eq('owner', OW);
-      if (account_id) q2 = q2.eq('account_id', account_id);
-      if (stage_id) q2 = q2.eq('stage_id', stage_id);
-      if (phones) q2 = q2.in('phone', String(phones).split(',').map(x => x.trim()).filter(Boolean));
-      ({ data, error } = await q2.order('created_at', { ascending: false }).limit(20000));
-    }
+    const COLS_FULL = 'phone, name, email, stage_id, tags, account_id, created_at, last_message_at, last_message_direction, notes, favorite';
+    const COLS_MIN  = 'phone, name, stage_id, tags, account_id, created_at, last_message_at, last_message_direction';
+    // Busca paginada (o PostgREST corta em 1000 linhas por padrão) e por lotes de telefones
+    const buscar = async (cols) => {
+      const lotes = lista ? [] : [null];
+      if (lista) for (let k = 0; k < lista.length; k += 400) lotes.push(lista.slice(k, k + 400));
+      const out = [];
+      for (const lote of lotes) {
+        for (let de = 0; de < 50000; de += 1000) {
+          let q = supabase.from('contacts').select(cols).eq('owner', OW);
+          if (account_id) q = q.eq('account_id', account_id);
+          if (stage_id) q = q.eq('stage_id', stage_id);
+          if (from) q = q.gte('created_at', from);
+          if (to) q = q.lte('created_at', to + 'T23:59:59');
+          if (lote) q = q.in('phone', lote);
+          const { data, error } = await q.order('created_at', { ascending: false }).order('phone', { ascending: true }).range(de, de + 999);
+          if (error) return { error };
+          out.push(...(data || []));
+          if (!data || data.length < 1000) break;
+        }
+      }
+      return { data: out };
+    };
+    let { data, error } = await buscar(COLS_FULL);
+    if (error && /email|notes|favorite/i.test(error.message || '')) ({ data, error } = await buscar(COLS_MIN));
     if (error) return res.status(500).send(error.message);
     let rows = data || [];
     if (tag) rows = rows.filter(r => (r.tags || []).includes(tag));
@@ -2171,7 +2192,8 @@ app.get('/contacts/export', async (req, res) => {
     const stN = {}; for (const s of (stages || [])) stN[s.id] = s.name;
     const acN = {}; for (const a of (accs || [])) acN[a.id] = a.name || a.phone_display || a.id;
     const fmtD = v => v ? new Date(v).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) : '';
-    const esc = v => { const t = String(v == null ? '' : v).replace(/"/g, '""'); return /[;"\n\r]/.test(t) ? '"' + t + '"' : t; };
+    // Aspas + proteção contra "injeção de fórmula" no Excel (célula começando com = + - @)
+    const esc = v => { let t = String(v == null ? '' : v); if (/^[=+\-@]/.test(t)) t = "'" + t; t = t.replace(/"/g, '""'); return /[;"\n\r']/.test(t) ? '"' + t + '"' : t; };
     const cab = ['Nome', 'Telefone', 'E-mail', 'Etapa', 'Etiquetas', 'Conta WhatsApp', 'Cadastro', 'Última mensagem', 'Última direção', 'Favorito', 'Notas'];
     const linhas = rows.map(r => [
       r.name || '', r.phone || '', r.email || '', stN[r.stage_id] || '', (r.tags || []).join(', '), acN[r.account_id] || '',
@@ -2184,7 +2206,9 @@ app.get('/contacts/export', async (req, res) => {
     res.setHeader('Content-Disposition', 'attachment; filename="' + nome + '"');
     res.send(csv);
   } catch (e) { res.status(500).send(e.message); }
-});
+}
+app.get('/contacts/export', _exportarLeadsCsv);
+app.post('/contacts/export', _exportarLeadsCsv);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 🔗 UNIFICAR CHATS DUPLICADOS (variantes do nono dígito) — SÓ dentro da MESMA
@@ -2200,12 +2224,21 @@ function _chaveNonoDigito(phone) {
 }
 async function _gruposDuplicados(owner) {
   const OW = owner || ' ';
-  const { data, error } = await supabase.from('contacts')
-    .select('phone, name, account_id, stage_id, tags, last_message_at, created_at, notes, email, favorite, avatar, unread_count')
-    .eq('owner', OW).limit(50000);
-  if (error) throw new Error(error.message);
+  const data = [];
+  for (let de = 0; de < 100000; de += 1000) {
+    let r = await supabase.from('contacts')
+      .select('phone, name, account_id, stage_id, tags, last_message_at, created_at, notes, email, favorite, avatar, unread_count')
+      .eq('owner', OW).order('phone', { ascending: true }).range(de, de + 999);
+    if (r.error && /notes|email|favorite|avatar|unread/i.test(r.error.message || '')) {
+      r = await supabase.from('contacts').select('phone, name, account_id, stage_id, tags, last_message_at, created_at')
+        .eq('owner', OW).order('phone', { ascending: true }).range(de, de + 999);
+    }
+    if (r.error) throw new Error(r.error.message);
+    data.push(...(r.data || []));
+    if (!r.data || r.data.length < 1000) break;
+  }
   const grupos = {};
-  for (const c of (data || [])) {
+  for (const c of data) {
     const k = _chaveNonoDigito(c.phone);
     if (!k) continue;
     (grupos[k] = grupos[k] || []).push(c);
@@ -2533,6 +2566,17 @@ async function _dripSalva(owner, regras) {
   await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
   _settings[k] = value;
 }
+// O robô só grava os campos DELE (next_at/last/movidos) — se você pausou/editou a
+// regra enquanto ele movia um lead, a sua alteração vence
+async function _dripSalvaProgresso(owner, regrasDoTick) {
+  const atuais = _dripRegras(owner);
+  for (const r of regrasDoTick) {
+    const a = atuais.find(x => x.id === r.id);
+    if (!a) continue;
+    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos;
+  }
+  await _dripSalva(owner, atuais);
+}
 function _dripDentroDaJanela(r) {
   const agora = new Date(Date.now() - 3 * 3600000); // horário de Brasília
   // dias da semana (0=dom … 6=sáb); lista vazia = todos os dias
@@ -2543,7 +2587,9 @@ function _dripDentroDaJanela(r) {
   const a = toMin(r.hora_ini), b = toMin(r.hora_fim);
   if (a == null && b == null) return true;
   if (a != null && b != null) return a <= b ? (hm >= a && hm < b) : (hm >= a || hm < b);
-  if (a != null) return hm >= a;
+  // só "começa às": a partir daquela hora segue até esvaziar a fila (varando a madrugada);
+  // se a fila estiver vazia às 00:00 e chegar lead novo, espera a hora de começar
+  if (a != null) { if (hm >= a) return true; return !!(r.last && r.last.quando && (Date.now() - new Date(r.last.quando).getTime()) < 30 * 60000 && !r.last.vazio); }
   return hm < b;
 }
 const _dripLock = new Set();
@@ -2573,7 +2619,7 @@ async function _dripTick() {
         const minS = Math.max(5, Number(r.min_seg) || 210), maxS = Math.max(minS, Number(r.max_seg) || 300);
         const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
         r.next_at = new Date(Date.now() + espera * 1000).toISOString();
-        await _dripSalva(owner, regras);
+        await _dripSalvaProgresso(owner, regras);
         // 2) pega UM lead da etapa de origem
         const { data: leads } = await supabase.from('contacts').select('phone, name')
           .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
@@ -2590,7 +2636,7 @@ async function _dripTick() {
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera };
         console.log(`⏳ Gotejamento "${r.nome || r.id}": ${lead.phone} movido; próximo em ${espera}s`);
       }
-      if (mudou) await _dripSalva(owner, regras);
+      if (mudou) await _dripSalvaProgresso(owner, regras);
     } catch (e) { console.error('⏳ drip:', e.message); }
     finally { _dripLock.delete(owner); }
   }
@@ -2627,7 +2673,7 @@ app.put('/drip', async (req, res) => {
       ativo: !!r.ativo, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: a.next_at || null, // mantém o próximo horário (pausar/ligar não encurta o intervalo)
-      movidos: a.movidos || 0, last: a.last || null
+      movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: a.last || null
     };
   }).filter(r => r.de && r.para);
   await _dripSalva(req.owner, limpas);
@@ -2678,7 +2724,7 @@ function _sheetsIdDeUrl(v) {
 }
 async function _lerPlanilha(spreadsheetId, sheetName) {
   const tok = await _googleAccessToken();
-  const range = encodeURIComponent((sheetName || 'Página1') + '!A1:Z5000');
+  const range = encodeURIComponent("'" + String(sheetName || 'Página1').replace(/'/g, "''") + "'!A1:Z5000");
   let r;
   try {
     r = await axios.get(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`,
