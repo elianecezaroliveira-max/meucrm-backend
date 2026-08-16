@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 200;
+const SERVER_VER = 201;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2609,6 +2609,10 @@ async function _dripTick() {
         if (!r.manual && !_dripDentroDaJanela(r)) continue;
         const nx = r.next_at ? new Date(r.next_at).getTime() : 0;
         if (nx > Date.now()) continue;
+        // 🛡️ Garantia absoluta do intervalo mínimo: mesmo que o agendamento se perca
+        // (edição/pausa no mesmo instante, redeploy), nunca move antes de min_seg do último
+        const _minGuard = Math.max(5, Number(r.min_seg) || 210) * 1000;
+        if (r.last && r.last.quando && !r.last.vazio && (Date.now() - new Date(r.last.quando).getTime()) < _minGuard) continue;
         // 🔒 Confere no BANCO antes de mover (protege contra dois servidores ao mesmo
         // tempo durante um deploy do Railway: se outro já agendou o próximo, este pula)
         try {
