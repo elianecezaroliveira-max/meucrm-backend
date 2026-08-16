@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 192;
+const SERVER_VER = 193;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2530,8 +2530,10 @@ async function _dripSalva(owner, regras) {
   _settings[k] = value;
 }
 function _dripDentroDaJanela(r) {
-  if (!r.hora_ini && !r.hora_fim) return true;
   const agora = new Date(Date.now() - 3 * 3600000); // horário de Brasília
+  // dias da semana (0=dom … 6=sáb); lista vazia = todos os dias
+  if (Array.isArray(r.dias) && r.dias.length && !r.dias.includes(agora.getUTCDay())) return false;
+  if (!r.hora_ini && !r.hora_fim) return true;
   const hm = agora.getUTCHours() * 60 + agora.getUTCMinutes();
   const toMin = t => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '')); return m ? (+m[1]) * 60 + (+m[2]) : null; };
   const a = toMin(r.hora_ini), b = toMin(r.hora_fim);
@@ -2606,6 +2608,7 @@ app.put('/drip', async (req, res) => {
       de: String(r.de || ''), para: String(r.para || ''),
       min_seg: Math.max(5, parseInt(r.min_seg, 10) || 210), max_seg: Math.max(5, parseInt(r.max_seg, 10) || 300),
       ativo: !!r.ativo, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
+      dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: (r.ativo && !a.ativo) ? null : (a.next_at || null), // ligou agora → começa já
       movidos: a.movidos || 0, last: a.last || null
     };
