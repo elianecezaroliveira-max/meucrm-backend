@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 194;
+const SERVER_VER = 195;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2724,6 +2724,14 @@ async function _sheetsSincronizar(owner, motivo) {
     const linhas = await _lerPlanilha(cfg.spreadsheet_id, cfg.sheet_name || 'DISPARO');
     const r = await _importarLeads(linhas, owner, { soNovos: !cfg.atualizar_etapa });
     cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', linhas: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, ms: Date.now() - ini };
+    // ⏳ Liga o gotejamento escolhido assim que entram leads novos
+    if (cfg.drip_rule_id && r.imported > 0) {
+      try {
+        const regras = _dripRegras(owner);
+        const rg = regras.find(x => x.id === cfg.drip_rule_id);
+        if (rg && !rg.ativo) { rg.ativo = true; await _dripSalva(owner, regras); cfg.last.gotejamento_ativado = rg.nome || rg.id; console.log('⏳ Gotejamento ativado pela planilha:', rg.nome || rg.id); }
+      } catch (e) { console.error('ativar drip pós-planilha:', e.message); }
+    }
     await _sheetsSalvaCfg(owner, cfg);
     console.log(`📊 Planilha (${owner}, ${motivo}): ${linhas.length} linha(s), ${r.imported} importado(s), ${r.pulados} já existiam`);
     return { ok: true, ...cfg.last, detalhes_erros: r.errors.slice(0, 10) };
@@ -2739,7 +2747,8 @@ app.get('/sheets/status', async (req, res) => {
   const sa = _googleSA();
   const cfg = await _sheetsCfg(req.owner);
   res.json({ robo_configurado: !!sa, robo_email: sa ? sa.client_email : null,
-    spreadsheet_id: cfg.spreadsheet_id || '', sheet_name: cfg.sheet_name || 'DISPARO', auto: !!cfg.auto, atualizar_etapa: !!cfg.atualizar_etapa, last: cfg.last || null });
+    spreadsheet_id: cfg.spreadsheet_id || '', sheet_name: cfg.sheet_name || 'DISPARO', auto: !!cfg.auto, atualizar_etapa: !!cfg.atualizar_etapa,
+    drip_rule_id: cfg.drip_rule_id || '', regras_drip: _dripRegras(req.owner).map(r => ({ id: r.id, nome: r.nome, ativo: !!r.ativo })), last: cfg.last || null });
 });
 app.post('/sheets/config', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -2750,8 +2759,47 @@ app.post('/sheets/config', async (req, res) => {
   if (b.sheet_name !== undefined) cfg.sheet_name = String(b.sheet_name || 'DISPARO').trim() || 'DISPARO';
   if (b.auto !== undefined) cfg.auto = !!b.auto;
   if (b.atualizar_etapa !== undefined) cfg.atualizar_etapa = !!b.atualizar_etapa;
+  if (b.drip_rule_id !== undefined) cfg.drip_rule_id = String(b.drip_rule_id || '');
   await _sheetsSalvaCfg(req.owner, cfg);
   res.json({ ok: true, cfg });
+});
+// 👀 PRÉVIA: mostra o que a planilha vai gerar ANTES de importar (nada é gravado)
+app.get('/sheets/preview', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  try {
+    const cfg = await _sheetsCfg(req.owner);
+    if (!cfg.spreadsheet_id) return res.status(400).json({ error: 'Nenhuma planilha configurada — cole o link e salve.' });
+    const linhas = await _lerPlanilha(cfg.spreadsheet_id, cfg.sheet_name || 'DISPARO');
+    const { data: sts } = await supabase.from('pipeline_stages').select('id, name, external_id').eq('owner', req.owner);
+    const stPorExt = {}; for (const st of (sts || [])) if (st.external_id) stPorExt[String(st.external_id)] = st;
+    const fones = linhas.map(l => String(l.phone || '').replace(/\D/g, '')).filter(p => p.length >= 8);
+    const existentes = new Map();
+    for (let k = 0; k < fones.length; k += 500) {
+      const { data } = await supabase.from('contacts').select('phone, name, stage_id').eq('owner', req.owner).in('phone', fones.slice(k, k + 500));
+      for (const c of (data || [])) existentes.set(c.phone, c);
+    }
+    const stNome = {}; for (const st of (sts || [])) stNome[st.id] = st.name;
+    let novos = 0, jaExistem = 0, invalidos = 0, semEtapa = 0;
+    const vistos = new Set();
+    const itens = linhas.map((l, i) => {
+      const phone = String(l.phone || '').replace(/\D/g, '');
+      const extId = String(l.id || '').replace(/^=+\s*/, '').trim();
+      const st = stPorExt[extId];
+      let situacao;
+      if (phone.length < 8) { situacao = 'invalido'; invalidos++; }
+      else if (vistos.has(phone)) { situacao = 'repetido'; }
+      else if (existentes.has(phone)) { situacao = 'existe'; jaExistem++; }
+      else { situacao = 'novo'; novos++; }
+      vistos.add(phone);
+      if (!st && phone.length >= 8) semEtapa++;
+      const ex = existentes.get(phone);
+      return { linha: i + 2, name: l.name || '', phone, id: extId, etapa: st ? st.name : (extId ? '⚠️ ID não encontrado' : '(sem etapa)'),
+        situacao, etapa_atual: ex ? (stNome[ex.stage_id] || '') : '' };
+    });
+    res.json({ total: linhas.length, novos, ja_existem: jaExistem, invalidos, sem_etapa: semEtapa,
+      atualizar_etapa: !!cfg.atualizar_etapa, itens: itens.slice(0, 500), truncado: itens.length > 500 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/sheets/sync', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
