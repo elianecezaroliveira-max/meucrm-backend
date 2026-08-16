@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 195;
+const SERVER_VER = 196;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2463,6 +2463,8 @@ const _n8nAuthErro = { error: 'Token de integração ausente ou inválido. Gere/
 //   opts.soNovos = true → quem já existe no CRM não é tocado (não volta de etapa)
 async function _importarLeads(items, owner, opts) {
   opts = opts || {};
+  const onProg = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  let _idx = 0;
   const stageCache = {};
   let imported = 0, atualizados = 0, pulados = 0;
   const errors = [];
@@ -2481,6 +2483,8 @@ async function _importarLeads(items, owner, opts) {
     const phone = String(it.phone || it.celular || it["Celular"] || "").replace(/\D/g, "");
     const extId = String(it.id || it["ID"] || it.stage_external_id || "").replace(/^=+\s*/, "").trim();
     const account_id = it.account_id || null;
+    _idx++;
+    if (onProg) { try { onProg({ feitos: _idx, importados: imported, pulados, erros: errors.length }); } catch (_) {} }
     if (phone.length < 8) { errors.push({ phone, error: "telefone inválido" }); continue; }
     if (existentes && existentes.has(phone)) { pulados++; continue; }
 
@@ -2714,15 +2718,19 @@ async function _sheetsSalvaCfg(owner, cfg) {
   _settings[k] = value;
 }
 const _sheetsRodando = new Set();
+const _sheetsProg = {}; // owner -> { fase, total, feitos, importados, pulados, erros, done, resultado }
 async function _sheetsSincronizar(owner, motivo) {
-  if (_sheetsRodando.has(owner)) return { erro: 'já está sincronizando' };
+  if (_sheetsRodando.has(owner)) return { ok: false, erro: 'já está sincronizando' };
   _sheetsRodando.add(owner);
   const cfg = await _sheetsCfg(owner);
   const ini = Date.now();
+  _sheetsProg[owner] = { fase: 'lendo', total: 0, feitos: 0, importados: 0, pulados: 0, erros: 0, done: false, ini };
   try {
     if (!cfg.spreadsheet_id) throw new Error('Nenhuma planilha configurada');
     const linhas = await _lerPlanilha(cfg.spreadsheet_id, cfg.sheet_name || 'DISPARO');
-    const r = await _importarLeads(linhas, owner, { soNovos: !cfg.atualizar_etapa });
+    Object.assign(_sheetsProg[owner], { fase: 'importando', total: linhas.length });
+    const r = await _importarLeads(linhas, owner, { soNovos: !cfg.atualizar_etapa,
+      onProgress: p => Object.assign(_sheetsProg[owner], p) });
     cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', linhas: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, ms: Date.now() - ini };
     // ⏳ Liga o gotejamento escolhido assim que entram leads novos
     if (cfg.drip_rule_id && r.imported > 0) {
@@ -2734,12 +2742,16 @@ async function _sheetsSincronizar(owner, motivo) {
     }
     await _sheetsSalvaCfg(owner, cfg);
     console.log(`📊 Planilha (${owner}, ${motivo}): ${linhas.length} linha(s), ${r.imported} importado(s), ${r.pulados} já existiam`);
-    return { ok: true, ...cfg.last, detalhes_erros: r.errors.slice(0, 10) };
+    const resultado = { ok: true, ...cfg.last, detalhes_erros: r.errors.slice(0, 10) };
+    Object.assign(_sheetsProg[owner], { fase: 'concluido', feitos: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, done: true, resultado });
+    return resultado;
   } catch (e) {
     cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', erro: e.message };
     try { await _sheetsSalvaCfg(owner, cfg); } catch (_) {}
     console.error('📊 Planilha falhou:', owner, e.message);
-    return { ok: false, erro: e.message };
+    const resultado = { ok: false, erro: e.message };
+    Object.assign(_sheetsProg[owner], { fase: 'erro', done: true, resultado });
+    return resultado;
   } finally { _sheetsRodando.delete(owner); }
 }
 app.get('/sheets/status', async (req, res) => {
@@ -2804,8 +2816,18 @@ app.get('/sheets/preview', async (req, res) => {
 app.post('/sheets/sync', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  if (String(req.query.bg || '') === '1') {
+    // Em segundo plano: responde já e o app acompanha o progresso em /sheets/sync/status
+    if (_sheetsRodando.has(req.owner)) return res.json({ ok: true, iniciado: false, ja_rodando: true });
+    _sheetsSincronizar(req.owner, 'manual').catch(() => {});
+    return res.json({ ok: true, iniciado: true });
+  }
   const r = await _sheetsSincronizar(req.owner, 'manual');
   res.status(r.ok ? 200 : 500).json(r);
+});
+app.get('/sheets/sync/status', (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  res.json(_sheetsProg[req.owner] || { fase: 'parado', done: true });
 });
 // ⏰ Sincronização automática: a cada hora, para as contas que ligaram "auto"
 setInterval(async () => {
