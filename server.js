@@ -4,7 +4,8 @@ const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
 
 const app = express();
-app.use(express.json({ limit: '30mb' })); // suporta fotos/vídeos em base64 (limite WhatsApp ~16MB → ~22MB em base64)
+app.set('trust proxy', true); // Railway fica atrás de proxy: req.ip = IP real
+app.use(express.json({ limit: '30mb', verify: (req, _res, buf) => { req.rawBody = buf; } })); // rawBody = assinatura do webhook da Meta
 app.use(cors());
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
@@ -67,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 207;
+const SERVER_VER = 208;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -107,7 +108,7 @@ app.get('/midia-diag/:mediaId', async (req, res) => {
     saida.copia_no_cofre = !!b;
   } catch (_) {}
   try {
-    const { data: accs } = await supabase.from('accounts').select('id, name, token').not('token', 'is', null);
+    const { data: accs } = await supabase.from('accounts').select('id, name, token').not('token', 'is', null).eq('owner', req.owner);
     for (const a of (accs || [])) {
       try {
         const r = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
@@ -302,7 +303,26 @@ async function resolveExistingPhone(phone, owner) {
 }
 
 // ── Receber mensagens ──
+// 🔏 Assinatura do webhook da Meta (X-Hub-Signature-256 = HMAC do corpo com APP_SECRET).
+// Modo padrão: só AVISA no log quando não bate (contas de portfólios/apps diferentes
+// podem ter outro segredo). Com WEBHOOK_STRICT=1 no Railway, rejeita o que não bater.
+function _assinaturaMetaOk(req) {
+  const sec = process.env.APP_SECRET;
+  const sig = String(req.headers['x-hub-signature-256'] || '');
+  if (!sec || !sig || !req.rawBody) return null; // sem como conferir
+  try {
+    const crypto = require('crypto');
+    const esperado = 'sha256=' + crypto.createHmac('sha256', sec).update(req.rawBody).digest('hex');
+    const a = Buffer.from(esperado), b = Buffer.from(sig);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (_) { return false; }
+}
 app.post("/webhook", async (req, res) => {
+  const okSig = _assinaturaMetaOk(req);
+  if (okSig === false) {
+    console.warn('🔏 Webhook da Meta com assinatura INVÁLIDA' + (process.env.WEBHOOK_STRICT === '1' ? ' — rejeitado' : ' — aceito (modo aviso; defina WEBHOOK_STRICT=1 para rejeitar)'));
+    if (process.env.WEBHOOK_STRICT === '1') return res.sendStatus(401);
+  }
   // Responde 200 IMEDIATAMENTE — se a resposta demorar, a Meta reenvia o webhook
   // e a mensagem chega duplicada no CRM.
   res.sendStatus(200);
@@ -1107,7 +1127,7 @@ app.post("/send", async (req, res) => {
   // 1. Tenta buscar conta do banco de dados pelo account_id
   if (supabase && account_id) {
     const { data: account, error: accErr } = await supabase
-      .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).single();
+      .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).eq("owner", req.owner || ' ').single();
     if (accErr) console.error("❌ Erro ao buscar conta para envio:", accErr.message);
     if (account) {
       phoneNumberId = account.phone_number_id;
@@ -1200,7 +1220,7 @@ app.post("/react", async (req, res) => {
   // Conta QR (motor embutido): reage direto pelo WhatsApp pareado
   if (WA_EMBEDDED && supabase && account_id) {
     const { data: accQ } = await supabase.from('accounts')
-      .select('type, evolution_instance').eq('id', account_id).maybeSingle();
+      .select('type, evolution_instance').eq('id', account_id).eq('owner', req.owner || ' ').maybeSingle();
     if (accQ?.type === 'evolution' && accQ.evolution_instance) {
       try {
         const sock = _waSocks[accQ.evolution_instance];
@@ -1370,7 +1390,7 @@ app.post("/send-media", async (req, res) => {
   let phoneNumberId, token, accountType = 'cloudapi', evolutionInstance = null;
   if (supabase && account_id) {
     const { data: account } = await supabase
-      .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).single();
+      .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).eq("owner", req.owner || ' ').single();
     if (account) {
       phoneNumberId = account.phone_number_id; token = account.token;
       accountType = account.type || 'cloudapi'; evolutionInstance = account.evolution_instance || null;
@@ -2530,7 +2550,8 @@ app.post("/contacts/import", async (req, res) => {
 function _n8nAuthOk(req, owner) {
   const tok = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim() || String(req.query.token || '').trim();
   const esperado = _settings['api_token::' + (owner || ' ')];
-  return !!esperado && !!tok && tok === esperado;
+  if (!esperado || !tok) return false;
+  try { const c = require('crypto'); const a = Buffer.from(String(tok)), b = Buffer.from(String(esperado)); return a.length === b.length && c.timingSafeEqual(a, b); } catch (_) { return false; }
 }
 const _n8nAuthErro = { error: 'Token de integração ausente ou inválido. Gere/copie o token no CRM (Configurações → Integração) e envie como ?token=SEU_TOKEN na URL ou no header Authorization: Bearer SEU_TOKEN.' };
 
@@ -3065,7 +3086,7 @@ app.post('/bot-media', async (req, res) => {
 app.get('/bot-media/:arquivo', async (req, res) => {
   if (!supabase) return res.status(500).send('Storage indisponível');
   try {
-    const caminho = 'bot/' + decodeURIComponent(req.params.arquivo).replace(/^bot\//, '');
+    const caminho = 'bot/' + decodeURIComponent(req.params.arquivo).replace(/^bot\//, '').replace(/\.\./g, '').replace(/^\/+/, '');
     const { data: blob, error } = await supabase.storage.from('wa-media').download(caminho);
     if (error || !blob) return res.status(404).send('Arquivo não encontrado');
     const buf = Buffer.from(await blob.arrayBuffer());
@@ -3143,7 +3164,7 @@ app.get("/templates", async (req, res) => {
   const { account_id } = req.query;
   if (!supabase || !account_id) return res.status(400).json({ error: "account_id obrigatório" });
   const { data: account, error: accErr } = await supabase
-    .from("accounts").select("token, waba_id").eq("id", account_id).single();
+    .from("accounts").select("token, waba_id").eq("id", account_id).eq("owner", req.owner || ' ').single();
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
   try {
@@ -3164,7 +3185,7 @@ app.post("/templates", async (req, res) => {
     return res.status(400).json({ error: "Campos obrigatórios: account_id, name, category, language, components" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { data: account, error: accErr } = await supabase
-    .from("accounts").select("token, waba_id").eq("id", account_id).single();
+    .from("accounts").select("token, waba_id").eq("id", account_id).eq("owner", req.owner || ' ').single();
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   try {
     const response = await axios.post(
@@ -3187,7 +3208,7 @@ app.delete("/templates/:template_id", async (req, res) => {
   const { account_id } = req.query;
   if (!supabase || !account_id) return res.status(400).json({ error: "account_id obrigatório" });
   const { data: account, error: accErr } = await supabase
-    .from("accounts").select("token, waba_id").eq("id", account_id).single();
+    .from("accounts").select("token, waba_id").eq("id", account_id).eq("owner", req.owner || ' ').single();
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
   const name = decodeURIComponent(req.params.template_id);
@@ -3219,7 +3240,7 @@ app.post("/send-template", async (req, res) => {
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { data: account, error: accErr } = await supabase
-    .from("accounts").select("phone_number_id, token").eq("id", account_id).single();
+    .from("accounts").select("phone_number_id, token").eq("id", account_id).eq("owner", req.owner || ' ').single();
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   try {
     const templateMsg = {
@@ -3392,7 +3413,7 @@ app.post('/edit-message', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   let acct = null;
   if (account_id) {
-    const { data } = await supabase.from('accounts').select('type, evolution_instance').eq('id', account_id).maybeSingle();
+    const { data } = await supabase.from('accounts').select('type, evolution_instance').eq('id', account_id).eq('owner', req.owner || ' ').maybeSingle();
     acct = data;
   }
   if (!acct?.evolution_instance)
@@ -3421,7 +3442,7 @@ app.post('/typing', async (req, res) => {
     const st = ['composing', 'recording', 'paused'].includes(state) ? state : 'composing';
     let acct = null;
     if (account_id) {
-      const { data } = await supabase.from('accounts').select('evolution_instance, phone_number_id, token').eq('id', account_id).maybeSingle();
+      const { data } = await supabase.from('accounts').select('evolution_instance, phone_number_id, token').eq('id', account_id).eq('owner', req.owner || ' ').maybeSingle();
       acct = data;
     }
     // QR Code (Baileys)
@@ -3631,7 +3652,7 @@ app.get('/wa-profile', async (req, res) => {
   try {
     const { account_id } = req.query;
     if (!supabase || !account_id) return res.json({});
-    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id).maybeSingle();
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id).eq('owner', req.owner || ' ').maybeSingle();
     if (!acct) return res.json({});
     if (acct.evolution_instance) return res.json({ type: 'qr' }); // QR não expõe leitura fácil
     if (acct.phone_number_id && acct.token) {
@@ -3650,7 +3671,7 @@ app.post('/wa-profile', async (req, res) => {
   try {
     const { account_id, name, about, description, email, address, website, photoBase64 } = req.body || {};
     if (!supabase || !account_id) return res.status(400).json({ error: 'account_id obrigatório' });
-    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id).maybeSingle();
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id).eq('owner', req.owner || ' ').maybeSingle();
     if (!acct) return res.status(404).json({ error: 'Conta não encontrada' });
 
     // ── Número QR (Baileys) ──
@@ -3702,6 +3723,11 @@ app.get('/link-preview', async (req, res) => {
   try {
     const url = String(req.query.url || '');
     if (!/^https?:\/\//i.test(url)) return res.json({});
+    // 🔒 Nunca busca endereços internos (SSRF)
+    try {
+      const h = new URL(url).hostname.toLowerCase();
+      if (/^(localhost|127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|\[?fc|\[?fd|\[?fe80)/.test(h) || !h.includes('.')) return res.json({});
+    } catch (_) { return res.json({}); }
     const hit = _linkPrevCache.get(url);
     if (hit && Date.now() - hit.ts < 6 * 3600000) return res.json(hit.data);
     const r = await axios.get(url, { timeout: 6000, maxContentLength: 512 * 1024, maxRedirects: 3,
@@ -3730,7 +3756,7 @@ app.get('/presence', async (req, res) => {
   try {
     const { phone, account_id } = req.query;
     if (!phone || !account_id || !supabase) return res.json({});
-    const { data: acct } = await supabase.from('accounts').select('evolution_instance').eq('id', account_id).maybeSingle();
+    const { data: acct } = await supabase.from('accounts').select('evolution_instance').eq('id', account_id).eq('owner', req.owner || ' ').maybeSingle();
     const inst = acct?.evolution_instance;
     if (!inst || !_waSocks[inst] || _waState[inst] !== 'open') return res.json({});
     const sock = _waSocks[inst];
@@ -5332,9 +5358,12 @@ function _cfg(key, owner) {
   return own === OWNER_LEGADO ? _settings[key] : undefined;
 }
 
+// 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
+  if (_SETTINGS_PROIBIDAS.test(k)) return res.status(403).json({ error: 'chave protegida' });
   if (CHAVES_POR_CONTA.has(k)) { const v = _cfg(k, req.owner); return res.json({ value: (v === undefined ? null : v) }); }
   const { data } = await supabase.from('settings').select('value').eq('key', k).maybeSingle();
   res.json({ value: data?.value || null });
@@ -5342,6 +5371,8 @@ app.get('/settings/:key', async (req, res) => {
 
 app.put('/settings/:key', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  if (_SETTINGS_PROIBIDAS.test(req.params.key)) return res.status(403).json({ error: 'chave protegida' });
   const { value } = req.body;
   const k = CHAVES_POR_CONTA.has(req.params.key)
     ? req.params.key + '::' + (req.owner || ' ')   // grava SEMPRE na chave da conta
@@ -5562,6 +5593,7 @@ async function waCleanupInstance(inst) {
 
 // Diagnóstico do motor embutido (para depurar sem acesso aos logs)
 app.get('/wa/debug', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
   const instances = {};
   for (const k of new Set([...Object.keys(_waSocks), ...Object.keys(_waState)])) {
     instances[k] = { state: _waState[k] || null, phone: _waPhone[k] || null, err: _waErr[k] || null, temQr: !!qrCache[k] };
@@ -6177,6 +6209,7 @@ app.get('/evolution/qr/:instance', async (req, res) => {
 
 // GET /evolution/debug — mostra info bruta da Evolution API
 app.get('/evolution/debug', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
     res.json({ instances: data, url: EVOLUTION_URL });
@@ -6282,6 +6315,14 @@ app.delete('/evolution/disconnect/:instance', async (req, res) => {
 
 // POST /evolution-webhook — recebe mensagens da Evolution API
 app.post('/evolution-webhook', async (req, res) => {
+  // 🔒 Só o motor embutido (chamada interna 127.0.0.1) ou uma Evolution externa com o
+  // segredo EVOLUTION_WEBHOOK_SECRET (header x-webhook-secret). Antes era aberto: qualquer
+  // um na internet podia "inventar" mensagens em qualquer conta.
+  const ipRaw = String(req.socket?.remoteAddress || '');
+  const loopback = /^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(ipRaw);
+  const segredo = process.env.EVOLUTION_WEBHOOK_SECRET;
+  const okSecret = segredo && String(req.headers['x-webhook-secret'] || req.query.secret || '') === segredo;
+  if (!loopback && !okSecret) { console.warn('🔒 evolution-webhook recusado de', ipRaw); return res.sendStatus(401); }
   res.sendStatus(200);
   try {
     const { event, instance: instanceName, data } = req.body;
