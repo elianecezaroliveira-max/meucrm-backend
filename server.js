@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 189;
+const SERVER_VER = 190;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2459,16 +2459,22 @@ const _n8nAuthErro = { error: 'Token de integração ausente ou inválido. Gere/
 //   phone | celular | "Celular"     →  telefone
 //   id | "ID" | stage_external_id   →  ID da etapa (external_id de pipeline_stages)
 //   account_id (opcional)           →  vincula a uma conta WhatsApp
-app.post("/import/lead", async (req, res) => {
-  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const items = Array.isArray(req.body) ? req.body
-              : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
-  const n8nOwner = (String(req.query.owner||'').trim()) || (!Array.isArray(req.body) && req.body.owner) || 'elianecezaroliveira@gmail.com';
-  if (!_n8nAuthOk(req, n8nOwner)) return res.status(401).json(_n8nAuthErro);
+// Núcleo da importação (usado pelo n8n E pela planilha do Google).
+//   opts.soNovos = true → quem já existe no CRM não é tocado (não volta de etapa)
+async function _importarLeads(items, owner, opts) {
+  opts = opts || {};
   const stageCache = {};
-  let imported = 0;
+  let imported = 0, atualizados = 0, pulados = 0;
   const errors = [];
-
+  let existentes = null;
+  if (opts.soNovos) {
+    const fones = (items || []).map(it => String(it.phone || it.celular || it["Celular"] || "").replace(/\D/g, "")).filter(p => p.length >= 8);
+    existentes = new Set();
+    for (let k = 0; k < fones.length; k += 500) {
+      const { data } = await supabase.from('contacts').select('phone').eq('owner', owner).in('phone', fones.slice(k, k + 500));
+      for (const c of (data || [])) existentes.add(c.phone);
+    }
+  }
   for (const it of (items || [])) {
     // remove um "=" no início (marcador de expressão do n8n que às vezes vaza como texto)
     const name  = (String(it.name || it.title || it["Lead Titulo"] || "").replace(/^=+\s*/, "").trim()) || "Lead";
@@ -2476,27 +2482,179 @@ app.post("/import/lead", async (req, res) => {
     const extId = String(it.id || it["ID"] || it.stage_external_id || "").replace(/^=+\s*/, "").trim();
     const account_id = it.account_id || null;
     if (phone.length < 8) { errors.push({ phone, error: "telefone inválido" }); continue; }
+    if (existentes && existentes.has(phone)) { pulados++; continue; }
 
     let stage_id = null;
     if (extId) {
       if (stageCache[extId] === undefined) {
-        const { data: st } = await supabase.from("pipeline_stages").select("id").eq("external_id", extId).eq("owner", n8nOwner).maybeSingle();
+        const { data: st } = await supabase.from("pipeline_stages").select("id").eq("external_id", extId).eq("owner", owner).maybeSingle();
         stageCache[extId] = st ? st.id : null;
       }
       stage_id = stageCache[extId];
     }
 
-    const row = { phone, name, owner: n8nOwner };
+    const row = { phone, name, owner };
     if (account_id) row.account_id = account_id;
     if (stage_id) row.stage_id = stage_id;
     // Não define last_message_* → o lead aparece só no Pipeline até iniciar conversa
     const { error: e } = await supabase.from("contacts").upsert(row, { onConflict: "owner,phone" });
     if (e) errors.push({ phone, error: e.message }); else imported++;
   }
+  return { imported, atualizados, pulados, errors };
+}
 
-  console.log(`📥 n8n importou ${imported} lead(s)` + (errors.length ? `, ${errors.length} erro(s)` : ""));
-  res.json({ success: true, imported, errors });
+app.post("/import/lead", async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const items = Array.isArray(req.body) ? req.body
+              : (Array.isArray(req.body.leads) ? req.body.leads : [req.body]);
+  const n8nOwner = (String(req.query.owner||'').trim()) || (!Array.isArray(req.body) && req.body.owner) || 'elianecezaroliveira@gmail.com';
+  if (!_n8nAuthOk(req, n8nOwner)) return res.status(401).json(_n8nAuthErro);
+  const r = await _importarLeads(items, n8nOwner);
+  console.log(`📥 n8n importou ${r.imported} lead(s)` + (r.errors.length ? `, ${r.errors.length} erro(s)` : ""));
+  res.json({ success: true, imported: r.imported, errors: r.errors });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 📊 PLANILHA DO GOOGLE → PIPELINE (substitui o fluxo do n8n)
+// Segurança: o servidor entra no Google com uma CONTA DE SERVIÇO (e-mail robô)
+// cuja chave fica SÓ na variável GOOGLE_SA_JSON do Railway. Você compartilha a
+// planilha com esse e-mail como leitor — o robô não enxerga mais nada do Drive.
+// Configuração por conta em settings sheets_sync::owner:
+//   { spreadsheet_id, sheet_name, auto, atualizar_etapa, last }
+// ═══════════════════════════════════════════════════════════════════════════
+function _googleSA() {
+  try {
+    const raw = process.env.GOOGLE_SA_JSON;
+    if (!raw) return null;
+    const j = JSON.parse(raw);
+    if (!j.client_email || !j.private_key) return null;
+    j.private_key = String(j.private_key).replace(/\\n/g, '\n');
+    return j;
+  } catch (_) { return null; }
+}
+let _gTok = null; // { token, exp }
+async function _googleAccessToken() {
+  const sa = _googleSA();
+  if (!sa) throw new Error('GOOGLE_SA_JSON não configurada no Railway');
+  if (_gTok && _gTok.exp > Date.now() + 60000) return _gTok.token;
+  const crypto = require('crypto');
+  const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64({ alg: 'RS256', typ: 'JWT' });
+  const claim = b64({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/spreadsheets.readonly',
+    aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 });
+  const sig = crypto.sign('RSA-SHA256', Buffer.from(header + '.' + claim), sa.private_key).toString('base64url');
+  const jwt = header + '.' + claim + '.' + sig;
+  const r = await axios.post('https://oauth2.googleapis.com/token',
+    new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: jwt }).toString(),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 20000 });
+  _gTok = { token: r.data.access_token, exp: Date.now() + (Number(r.data.expires_in || 3600) * 1000) };
+  return _gTok.token;
+}
+function _sheetsIdDeUrl(v) {
+  const t = String(v || '').trim();
+  const m = /\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/.exec(t);
+  return m ? m[1] : t.replace(/[^a-zA-Z0-9_-]/g, '');
+}
+async function _lerPlanilha(spreadsheetId, sheetName) {
+  const tok = await _googleAccessToken();
+  const range = encodeURIComponent((sheetName || 'Página1') + '!A1:Z5000');
+  let r;
+  try {
+    r = await axios.get(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`,
+      { headers: { Authorization: 'Bearer ' + tok }, params: { valueRenderOption: 'FORMATTED_VALUE' }, timeout: 30000 });
+  } catch (e) {
+    const st = e.response && e.response.status;
+    const msg = e.response && e.response.data && e.response.data.error && e.response.data.error.message || e.message;
+    if (st === 403) throw new Error('Sem acesso à planilha — compartilhe-a (como leitor) com o e-mail do robô: ' + (_googleSA() || {}).client_email);
+    if (st === 404) throw new Error('Planilha não encontrada — confira o link');
+    if (st === 400) throw new Error('Aba não encontrada ("' + sheetName + '") — confira o nome da aba. Detalhe: ' + msg);
+    throw new Error(msg);
+  }
+  const vals = (r.data && r.data.values) || [];
+  if (!vals.length) return [];
+  const cab = vals[0].map(h => String(h || '').trim());
+  const linhas = [];
+  for (let i = 1; i < vals.length; i++) {
+    const row = vals[i]; if (!row || !row.length) continue;
+    const o = {};
+    cab.forEach((h, k) => { if (h) o[h] = row[k] == null ? '' : String(row[k]); });
+    // aceita variações do cabeçalho (com/sem espaço, maiúsculas)
+    const pick = (...ns) => { for (const n of ns) { const k = Object.keys(o).find(x => x.replace(/\s+/g, '').toLowerCase() === n.replace(/\s+/g, '').toLowerCase()); if (k) return o[k]; } return ''; };
+    o.name = pick('Lead Titulo', 'Lead Título', 'Nome', 'name', 'title');
+    o.phone = pick('Celular', 'Telefone', 'phone', 'WhatsApp');
+    o.id = pick('ID', 'id', 'Etapa ID', 'stage_external_id');
+    if (!o.phone && !o.name) continue;
+    linhas.push(o);
+  }
+  return linhas;
+}
+async function _sheetsCfg(owner) { try { return JSON.parse(_cfg('sheets_sync', owner) || '{}') || {}; } catch (_) { return {}; } }
+async function _sheetsSalvaCfg(owner, cfg) {
+  const k = 'sheets_sync::' + (owner || ' ');
+  const value = JSON.stringify(cfg);
+  await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
+  _settings[k] = value;
+}
+const _sheetsRodando = new Set();
+async function _sheetsSincronizar(owner, motivo) {
+  if (_sheetsRodando.has(owner)) return { erro: 'já está sincronizando' };
+  _sheetsRodando.add(owner);
+  const cfg = await _sheetsCfg(owner);
+  const ini = Date.now();
+  try {
+    if (!cfg.spreadsheet_id) throw new Error('Nenhuma planilha configurada');
+    const linhas = await _lerPlanilha(cfg.spreadsheet_id, cfg.sheet_name || 'DISPARO');
+    const r = await _importarLeads(linhas, owner, { soNovos: !cfg.atualizar_etapa });
+    cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', linhas: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, ms: Date.now() - ini };
+    await _sheetsSalvaCfg(owner, cfg);
+    console.log(`📊 Planilha (${owner}, ${motivo}): ${linhas.length} linha(s), ${r.imported} importado(s), ${r.pulados} já existiam`);
+    return { ok: true, ...cfg.last, detalhes_erros: r.errors.slice(0, 10) };
+  } catch (e) {
+    cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', erro: e.message };
+    try { await _sheetsSalvaCfg(owner, cfg); } catch (_) {}
+    console.error('📊 Planilha falhou:', owner, e.message);
+    return { ok: false, erro: e.message };
+  } finally { _sheetsRodando.delete(owner); }
+}
+app.get('/sheets/status', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const sa = _googleSA();
+  const cfg = await _sheetsCfg(req.owner);
+  res.json({ robo_configurado: !!sa, robo_email: sa ? sa.client_email : null,
+    spreadsheet_id: cfg.spreadsheet_id || '', sheet_name: cfg.sheet_name || 'DISPARO', auto: !!cfg.auto, atualizar_etapa: !!cfg.atualizar_etapa, last: cfg.last || null });
+});
+app.post('/sheets/config', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const b = req.body || {};
+  const cfg = await _sheetsCfg(req.owner);
+  if (b.spreadsheet !== undefined) cfg.spreadsheet_id = _sheetsIdDeUrl(b.spreadsheet);
+  if (b.sheet_name !== undefined) cfg.sheet_name = String(b.sheet_name || 'DISPARO').trim() || 'DISPARO';
+  if (b.auto !== undefined) cfg.auto = !!b.auto;
+  if (b.atualizar_etapa !== undefined) cfg.atualizar_etapa = !!b.atualizar_etapa;
+  await _sheetsSalvaCfg(req.owner, cfg);
+  res.json({ ok: true, cfg });
+});
+app.post('/sheets/sync', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const r = await _sheetsSincronizar(req.owner, 'manual');
+  res.status(r.ok ? 200 : 500).json(r);
+});
+// ⏰ Sincronização automática: a cada hora, para as contas que ligaram "auto"
+setInterval(async () => {
+  try {
+    if (!supabase || !_googleSA()) return;
+    for (const k in _settings) {
+      if (!k.startsWith('sheets_sync::')) continue;
+      const owner = k.slice('sheets_sync::'.length).trim();
+      if (!owner) continue;
+      let cfg = {}; try { cfg = JSON.parse(_settings[k] || '{}'); } catch (_) {}
+      if (cfg && cfg.auto && cfg.spreadsheet_id) await _sheetsSincronizar(owner, 'automática');
+    }
+  } catch (e) { console.error('📊 auto-sync:', e.message); }
+}, 60 * 60 * 1000);
 
 // ── Alterar a ETAPA de um lead já existente (via n8n) ──
 // Aceita 1 lead OU array. Identifica o lead pelo telefone e a etapa por:
@@ -4867,7 +5025,8 @@ const CHAVES_POR_CONTA = new Set([
   'tag_catalog', 'n8n_webhook_url',
   'faq_enabled', 'faq_mode', 'faq_accounts', 'faq_delay_seconds', 'faq_ai_model',
   'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer',
-  'tmpl_alias' // apelidos dos modelos da API (nome só no CRM)
+  'tmpl_alias', // apelidos dos modelos da API (nome só no CRM)
+  'sheets_sync' // planilha do Google ligada ao pipeline (importação de leads)
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
