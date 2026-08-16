@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 196;
+const SERVER_VER = 197;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2732,14 +2732,6 @@ async function _sheetsSincronizar(owner, motivo) {
     const r = await _importarLeads(linhas, owner, { soNovos: !cfg.atualizar_etapa,
       onProgress: p => Object.assign(_sheetsProg[owner], p) });
     cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', linhas: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, ms: Date.now() - ini };
-    // ⏳ Liga o gotejamento escolhido assim que entram leads novos
-    if (cfg.drip_rule_id && r.imported > 0) {
-      try {
-        const regras = _dripRegras(owner);
-        const rg = regras.find(x => x.id === cfg.drip_rule_id);
-        if (rg && !rg.ativo) { rg.ativo = true; await _dripSalva(owner, regras); cfg.last.gotejamento_ativado = rg.nome || rg.id; console.log('⏳ Gotejamento ativado pela planilha:', rg.nome || rg.id); }
-      } catch (e) { console.error('ativar drip pós-planilha:', e.message); }
-    }
     await _sheetsSalvaCfg(owner, cfg);
     console.log(`📊 Planilha (${owner}, ${motivo}): ${linhas.length} linha(s), ${r.imported} importado(s), ${r.pulados} já existiam`);
     const resultado = { ok: true, ...cfg.last, detalhes_erros: r.errors.slice(0, 10) };
