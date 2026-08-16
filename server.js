@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 202;
+const SERVER_VER = 203;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2675,14 +2675,21 @@ app.put('/drip', async (req, res) => {
   const antigas = _dripRegras(req.owner);
   const limpas = novas.map(r => {
     const a = antigas.find(x => x.id === r.id) || {};
+    const minN = Math.max(5, parseInt(r.min_seg, 10) || 210), maxN = Math.max(minN, Math.max(5, parseInt(r.max_seg, 10) || 300));
+    // Mudou o intervalo → o PRÓXIMO já obedece o novo (recalcula a partir do último movimento)
+    let nextAt = a.next_at || null;
+    if (a.id && (Number(a.min_seg) !== minN || Number(a.max_seg) !== maxN)) {
+      const base = (a.last && a.last.quando && !a.last.vazio) ? new Date(a.last.quando).getTime() : null;
+      nextAt = base ? new Date(base + (Math.floor(Math.random() * (maxN - minN + 1)) + minN) * 1000).toISOString() : null;
+    }
     return {
       id: String(r.id || ('drip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7))),
       nome: String(r.nome || '').slice(0, 60),
       de: String(r.de || ''), para: String(r.para || ''),
-      min_seg: Math.max(5, parseInt(r.min_seg, 10) || 210), max_seg: Math.max(5, parseInt(r.max_seg, 10) || 300),
+      min_seg: minN, max_seg: maxN,
       ativo: !!r.ativo, manual: !!r.ativo && !!r.manual, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
-      next_at: a.next_at || null, // mantém o próximo horário (pausar/ligar não encurta o intervalo)
+      next_at: nextAt, // mantém o próximo horário (pausar/ligar não encurta o intervalo); intervalo novo → recalculado
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
     };
   }).filter(r => r.de && r.para);
