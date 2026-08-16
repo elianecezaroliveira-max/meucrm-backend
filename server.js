@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 201;
+const SERVER_VER = 202;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2683,7 +2683,7 @@ app.put('/drip', async (req, res) => {
       ativo: !!r.ativo, manual: !!r.ativo && !!r.manual, hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: a.next_at || null, // mantém o próximo horário (pausar/ligar não encurta o intervalo)
-      movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: a.last || null
+      movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
     };
   }).filter(r => r.de && r.para);
   await _dripSalva(req.owner, limpas);
