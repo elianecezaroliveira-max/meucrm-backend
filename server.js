@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 198;
+const SERVER_VER = 199;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2655,7 +2655,12 @@ app.get('/drip', async (req, res) => {
     const { count } = await supabase.from('contacts').select('phone', { count: 'exact', head: true }).eq('owner', req.owner).eq('stage_id', r.de);
     contagens[r.de] = count || 0;
   }
-  res.json({ regras, contagens });
+  // diz para a tela se cada regra está dentro da janela agora (dia/hora)
+  const agora = new Date(Date.now() - 3 * 3600000);
+  const hhmm = String(agora.getUTCHours()).padStart(2, '0') + ':' + String(agora.getUTCMinutes()).padStart(2, '0');
+  const janela = {};
+  for (const r of regras) janela[r.id] = _dripDentroDaJanela(r);
+  res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay() });
 });
 app.put('/drip', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
