@@ -67,7 +67,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 188;
+const SERVER_VER = 189;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2012,6 +2012,272 @@ app.get("/tags", async (req, res) => {
 });
 
 // ── Busca por nome, telefone OU conteúdo das mensagens ──
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 📝 TRANSCRIÇÃO DE ÁUDIO (Groq Whisper — mesma chave GROQ_API_KEY da IA do FAQ)
+// O texto fica salvo em messages.transcript (rode atualizacao-transcricao.sql).
+// ═══════════════════════════════════════════════════════════════════════════
+// Bytes da mídia de uma mensagem: cópia no Storage (QR ou cofre da API) → Meta
+async function _bytesDaMidia(msg) {
+  const mid = String(msg.media_id || '');
+  if (!mid) throw new Error('mensagem sem mídia');
+  if (mid.startsWith('qr/')) {
+    const { data, error } = await supabase.storage.from('wa-media').download(mid);
+    if (error || !data) throw new Error('áudio não encontrado no Storage');
+    return Buffer.from(await data.arrayBuffer());
+  }
+  try {
+    const { data } = await supabase.storage.from('wa-media').download('api/' + mid);
+    if (data) return Buffer.from(await data.arrayBuffer());
+  } catch (_) {}
+  let token = process.env.WHATSAPP_TOKEN;
+  if (msg.account_id) {
+    const { data: acc } = await supabase.from('accounts').select('token').eq('id', msg.account_id).maybeSingle();
+    if (acc && acc.token) token = acc.token;
+  }
+  if (!token) throw new Error('token da conta não encontrado');
+  const url = await getMediaUrl(mid, token, mid + '_' + (msg.account_id || ''), true);
+  const r = await axios.get(url, { headers: { Authorization: 'Bearer ' + token, 'User-Agent': 'WhatsApp/2.0' },
+    responseType: 'arraybuffer', timeout: 30000, maxContentLength: 25 * 1024 * 1024 });
+  return Buffer.from(r.data);
+}
+// Converte para mp3 16 kHz mono (formato que o Whisper aceita com certeza)
+function _paraMp3(buf) {
+  return new Promise((resolve, reject) => {
+    if (!_ffmpeg) return resolve(buf); // sem ffmpeg: tenta mandar como veio
+    const os = require('os'), fs = require('fs'), path = require('path');
+    const inFile = path.join(os.tmpdir(), 'tr_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+    const outFile = inFile + '.mp3';
+    const cleanup = () => { try { fs.unlinkSync(inFile); } catch (_) {} try { fs.unlinkSync(outFile); } catch (_) {} };
+    fs.writeFileSync(inFile, buf);
+    _ffmpeg(inFile).noVideo().audioCodec('libmp3lame').audioBitrate('48k').audioChannels(1).audioFrequency(16000).format('mp3')
+      .on('end', () => { try { const out = fs.readFileSync(outFile); cleanup(); resolve(out); } catch (e) { cleanup(); reject(e); } })
+      .on('error', err => { cleanup(); reject(err); })
+      .save(outFile);
+  });
+}
+async function _transcreverBuffer(buf) {
+  if (!process.env.GROQ_API_KEY) throw new Error('Chave GROQ_API_KEY não configurada no Railway (é a mesma da IA do FAQ).');
+  const FormData = require('form-data');
+  const form = new FormData();
+  form.append('file', buf, { filename: 'audio.mp3', contentType: 'audio/mpeg' });
+  form.append('model', process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo');
+  form.append('language', 'pt');
+  form.append('response_format', 'json');
+  form.append('temperature', '0');
+  const r = await axios.post('https://api.groq.com/openai/v1/audio/transcriptions', form, {
+    headers: { ...form.getHeaders(), Authorization: 'Bearer ' + process.env.GROQ_API_KEY }, timeout: 90000,
+    maxBodyLength: 30 * 1024 * 1024 });
+  return String(r.data && r.data.text || '').trim();
+}
+const _transcrevendo = new Set();
+app.post('/transcribe', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const id = req.body && req.body.message_id;
+  if (!id) return res.status(400).json({ error: 'message_id obrigatório' });
+  const { data: msg, error } = await supabase.from('messages').select('*').eq('id', id).eq('owner', req.owner).maybeSingle();
+  if (error || !msg) return res.status(404).json({ error: 'Mensagem não encontrada' });
+  if (msg.transcript) return res.json({ ok: true, transcript: msg.transcript, cached: true });
+  const mime = String(msg.media_mime_type || '');
+  if (msg.type !== 'audio' && !mime.startsWith('audio/')) return res.status(400).json({ error: 'Esta mensagem não é um áudio' });
+  if (_transcrevendo.has(String(id))) return res.status(429).json({ error: 'Já estou transcrevendo este áudio…' });
+  _transcrevendo.add(String(id));
+  try {
+    const bruto = await _bytesDaMidia(msg);
+    let mp3 = bruto;
+    try { mp3 = await _paraMp3(bruto); } catch (e) { console.warn('📝 conversão mp3 falhou, mandando original:', e.message); }
+    const texto = await _transcreverBuffer(mp3);
+    if (!texto) return res.json({ ok: true, transcript: '', vazio: true });
+    const { error: upErr } = await supabase.from('messages').update({ transcript: texto }).eq('id', id);
+    if (upErr) {
+      // coluna ainda não existe? devolve o texto mesmo assim e avisa
+      return res.json({ ok: true, transcript: texto, nao_salvo: true, aviso: 'Rode atualizacao-transcricao.sql no Supabase para o texto ficar salvo (' + upErr.message + ')' });
+    }
+    res.json({ ok: true, transcript: texto });
+  } catch (e) {
+    const m = e.response && e.response.data && e.response.data.error ? (e.response.data.error.message || JSON.stringify(e.response.data.error)) : e.message;
+    console.error('📝 transcrição:', m);
+    res.status(500).json({ error: 'Não consegui transcrever: ' + m });
+  } finally { _transcrevendo.delete(String(id)); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔎 BUSCA DENTRO DAS MENSAGENS: devolve as mensagens (não só os contatos)
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/search/messages', async (req, res) => {
+  if (!supabase) return res.json([]);
+  const raw = String(req.query.q || '').trim();
+  if (raw.length < 2) return res.json([]);
+  const term = raw.replace(/[,()%]/g, ' ').trim();
+  const like = `%${term}%`;
+  const { account_id } = req.query;
+  const OW = req.owner || ' ';
+  try {
+    let q = supabase.from('messages').select('id, phone, content, transcript, direction, timestamp, type, account_id')
+      .eq('owner', OW).or(`content.ilike.${like},transcript.ilike.${like}`)
+      .order('timestamp', { ascending: false }).limit(60);
+    if (account_id) q = q.eq('account_id', account_id);
+    let { data, error } = await q;
+    if (error && /transcript/i.test(error.message || '')) { // sem a coluna ainda
+      let q2 = supabase.from('messages').select('id, phone, content, direction, timestamp, type, account_id')
+        .eq('owner', OW).ilike('content', like).order('timestamp', { ascending: false }).limit(60);
+      if (account_id) q2 = q2.eq('account_id', account_id);
+      ({ data, error } = await q2);
+    }
+    if (error) return res.status(500).json({ error: error.message });
+    const rows = data || [];
+    const phones = [...new Set(rows.map(r => r.phone).filter(Boolean))];
+    let nomes = {};
+    if (phones.length) {
+      const { data: cs } = await supabase.from('contacts').select('phone, name, account_id').eq('owner', OW).in('phone', phones);
+      for (const c of (cs || [])) nomes[c.phone] = c;
+    }
+    res.json(rows.map(r => ({ ...r, name: (nomes[r.phone] || {}).name || null, contact_account_id: (nomes[r.phone] || {}).account_id || null })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⬇ EXPORTAR LEADS (CSV para Excel) — respeita conta, etapa, etiqueta e período
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/contacts/export', async (req, res) => {
+  if (!supabase) return res.status(500).send('Supabase não configurado');
+  if (!req.owner) return res.status(401).send('Faça login no CRM');
+  const { account_id, stage_id, tag, from, to, phones } = req.query;
+  const OW = req.owner;
+  try {
+    let q = supabase.from('contacts').select('phone, name, email, stage_id, tags, account_id, created_at, last_message_at, last_message_direction, notes, favorite').eq('owner', OW);
+    if (account_id) q = q.eq('account_id', account_id);
+    if (stage_id) q = q.eq('stage_id', stage_id);
+    if (from) q = q.gte('created_at', from);
+    if (to) q = q.lte('created_at', to + 'T23:59:59');
+    if (phones) q = q.in('phone', String(phones).split(',').map(x => x.trim()).filter(Boolean));
+    q = q.order('created_at', { ascending: false }).limit(20000);
+    let { data, error } = await q;
+    if (error && /email|notes|favorite/i.test(error.message || '')) {
+      let q2 = supabase.from('contacts').select('phone, name, stage_id, tags, account_id, created_at, last_message_at, last_message_direction').eq('owner', OW);
+      if (account_id) q2 = q2.eq('account_id', account_id);
+      if (stage_id) q2 = q2.eq('stage_id', stage_id);
+      if (phones) q2 = q2.in('phone', String(phones).split(',').map(x => x.trim()).filter(Boolean));
+      ({ data, error } = await q2.order('created_at', { ascending: false }).limit(20000));
+    }
+    if (error) return res.status(500).send(error.message);
+    let rows = data || [];
+    if (tag) rows = rows.filter(r => (r.tags || []).includes(tag));
+    const [{ data: stages }, { data: accs }] = await Promise.all([
+      supabase.from('pipeline_stages').select('id, name'),
+      supabase.from('accounts').select('id, name, phone_display')
+    ]);
+    const stN = {}; for (const s of (stages || [])) stN[s.id] = s.name;
+    const acN = {}; for (const a of (accs || [])) acN[a.id] = a.name || a.phone_display || a.id;
+    const fmtD = v => v ? new Date(v).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) : '';
+    const esc = v => { const t = String(v == null ? '' : v).replace(/"/g, '""'); return /[;"\n\r]/.test(t) ? '"' + t + '"' : t; };
+    const cab = ['Nome', 'Telefone', 'E-mail', 'Etapa', 'Etiquetas', 'Conta WhatsApp', 'Cadastro', 'Última mensagem', 'Última direção', 'Favorito', 'Notas'];
+    const linhas = rows.map(r => [
+      r.name || '', r.phone || '', r.email || '', stN[r.stage_id] || '', (r.tags || []).join(', '), acN[r.account_id] || '',
+      fmtD(r.created_at), fmtD(r.last_message_at), r.last_message_direction === 'inbound' ? 'Lead' : (r.last_message_direction === 'outbound' ? 'Você' : ''),
+      r.favorite ? 'Sim' : '', (r.notes || '').replace(/\r?\n/g, ' ')
+    ].map(esc).join(';'));
+    const csv = '﻿' + cab.join(';') + '\r\n' + linhas.join('\r\n');
+    const nome = 'leads_' + new Date().toISOString().slice(0, 10) + '.csv';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + nome + '"');
+    res.send(csv);
+  } catch (e) { res.status(500).send(e.message); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔗 UNIFICAR CHATS DUPLICADOS (variantes do nono dígito) — SÓ dentro da MESMA
+// conta (owner). Nunca cruza e-mails diferentes.
+//   GET  /contacts/duplicates            → só lista (não mexe em nada)
+//   POST /contacts/unify-duplicates      → unifica
+// ═══════════════════════════════════════════════════════════════════════════
+function _chaveNonoDigito(phone) {
+  const p = String(phone || '').replace(/\D/g, '');
+  if (/^55\d{2}9\d{8}$/.test(p)) return p.slice(0, 4) + p.slice(5); // tira o 9 → chave canônica
+  if (/^55\d{2}[6-9]\d{7}$/.test(p)) return p;
+  return null; // não é celular BR → não participa
+}
+async function _gruposDuplicados(owner) {
+  const OW = owner || ' ';
+  const { data, error } = await supabase.from('contacts')
+    .select('phone, name, account_id, stage_id, tags, last_message_at, created_at, notes, email, favorite, avatar, unread_count')
+    .eq('owner', OW).limit(50000);
+  if (error) throw new Error(error.message);
+  const grupos = {};
+  for (const c of (data || [])) {
+    const k = _chaveNonoDigito(c.phone);
+    if (!k) continue;
+    (grupos[k] = grupos[k] || []).push(c);
+  }
+  const dup = Object.values(grupos).filter(g => g.length > 1);
+  // Quem fica: o que tem a conversa mais recente (empate → o com 9, formato atual)
+  return dup.map(g => {
+    const ord = [...g].sort((a, b) => {
+      const ta = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
+      const tb = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
+      if (tb !== ta) return tb - ta;
+      return String(b.phone).length - String(a.phone).length;
+    });
+    return { fica: ord[0], somem: ord.slice(1) };
+  });
+}
+app.get('/contacts/duplicates', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  try {
+    const g = await _gruposDuplicados(req.owner);
+    res.json({ grupos: g.length, contatos_a_remover: g.reduce((s, x) => s + x.somem.length, 0),
+      exemplos: g.slice(0, 20).map(x => ({ fica: { phone: x.fica.phone, name: x.fica.name }, somem: x.somem.map(y => ({ phone: y.phone, name: y.name })) })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/contacts/unify-duplicates', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const OW = req.owner;
+  try {
+    const grupos = await _gruposDuplicados(OW);
+    let unificados = 0, msgsMovidas = 0, erros = [];
+    for (const g of grupos) {
+      const fica = g.fica;
+      for (const dup of g.somem) {
+        try {
+          // 1) mensagens, tarefas e disparos passam para o telefone que fica
+          const { count } = await supabase.from('messages').update({ phone: fica.phone }, { count: 'exact' }).eq('phone', dup.phone).eq('owner', OW);
+          msgsMovidas += (count || 0);
+          await supabase.from('tasks').update({ phone: fica.phone }).eq('phone', dup.phone).eq('owner', OW);
+          try { await supabase.from('bot_runs').update({ contact_phone: fica.phone }).eq('contact_phone', dup.phone); } catch (_) {}
+          // 2) completa o que faltava no que fica (nome, etiquetas, notas, e-mail, etapa)
+          const patch = {};
+          if ((!fica.name || /^\+?\d+$/.test(fica.name)) && dup.name && !/^\+?\d+$/.test(dup.name)) patch.name = dup.name;
+          if (!fica.stage_id && dup.stage_id) patch.stage_id = dup.stage_id;
+          if (!fica.email && dup.email) patch.email = dup.email;
+          if (!fica.avatar && dup.avatar) patch.avatar = dup.avatar;
+          if (dup.favorite && !fica.favorite) patch.favorite = true;
+          const tags = [...new Set([...(fica.tags || []), ...(dup.tags || [])])];
+          if (tags.length !== (fica.tags || []).length) patch.tags = tags;
+          if (dup.notes && String(dup.notes).trim()) patch.notes = (fica.notes ? fica.notes + '\n\n' : '') + dup.notes;
+          if ((dup.unread_count || 0) > 0) patch.unread_count = (fica.unread_count || 0) + dup.unread_count;
+          if (Object.keys(patch).length) {
+            const { error: pe } = await supabase.from('contacts').update(patch).eq('phone', fica.phone).eq('owner', OW);
+            if (pe && /email|avatar|notes|favorite|unread/i.test(pe.message || '')) { // colunas opcionais ausentes
+              delete patch.email; delete patch.avatar; delete patch.notes; delete patch.favorite; delete patch.unread_count;
+              if (Object.keys(patch).length) await supabase.from('contacts').update(patch).eq('phone', fica.phone).eq('owner', OW);
+            }
+            Object.assign(fica, patch);
+          }
+          // 3) apaga o duplicado (só desta conta)
+          const { error: de } = await supabase.from('contacts').delete().eq('phone', dup.phone).eq('owner', OW);
+          if (de) throw new Error(de.message);
+          unificados++;
+        } catch (e) { erros.push(dup.phone + ': ' + e.message); }
+      }
+    }
+    console.log(`🔗 Unificação (${OW}): ${unificados} contato(s) unificados, ${msgsMovidas} mensagens movidas`);
+    res.json({ ok: true, unificados, mensagens_movidas: msgsMovidas, erros });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/search", async (req, res) => {
   if (!supabase) return res.json([]);
   const raw = (req.query.q || "").trim();
