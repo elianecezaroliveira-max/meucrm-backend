@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 210;
+const SERVER_VER = 211;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -3907,14 +3907,57 @@ app.delete("/contacts/:phone/messages", async (req, res) => {
   res.json({ success: true });
 });
 
+// 🗑️ Excluir leads → LIXEIRA (settings lead_trash::owner): guarda o cadastro dos leads
+// por 30 dias e NÃO apaga as mensagens (ficam guardadas pelo telefone) — assim
+// "Restaurar" devolve o lead inteiro, com conversa, etapa, etiquetas e notas.
+async function _leadTrash(owner) { try { const a = JSON.parse(_cfg('lead_trash', owner) || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+async function _leadTrashSalva(owner, lista) {
+  const corte = Date.now() - 30 * 86400000;
+  lista = lista.filter(x => x && x.deleted_at && new Date(x.deleted_at).getTime() > corte).slice(0, 500);
+  const k = 'lead_trash::' + (owner || ' ');
+  const value = JSON.stringify(lista);
+  await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
+  _settings[k] = value;
+}
 app.delete("/contacts/bulk-delete", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phones } = req.body;
   if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
-  await supabase.from("messages").delete().in("phone", phones).eq("owner", req.owner || ' ');
-  const { error } = await supabase.from("contacts").delete().in("phone", phones).eq("owner", req.owner || ' ');
+  const OW = req.owner || ' ';
+  const { data: rows } = await supabase.from('contacts').select('*').in('phone', phones).eq('owner', OW);
+  const { error } = await supabase.from("contacts").delete().in("phone", phones).eq("owner", OW);
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
+  try {
+    const lixo = await _leadTrash(req.owner);
+    const agora = new Date().toISOString();
+    for (const r of (rows || [])) lixo.unshift({ contact: r, deleted_at: agora });
+    await _leadTrashSalva(req.owner, lixo);
+  } catch (e) { console.error('lixeira de leads:', e.message); }
+  console.log(`🗑️ ${phones.length} lead(s) excluídos (na lixeira por 30 dias)`);
+  res.json({ success: true, na_lixeira: (rows || []).length });
+});
+app.get('/contacts/trash', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const lixo = await _leadTrash(req.owner);
+  res.json(lixo.map(x => ({ phone: x.contact.phone, name: x.contact.name, stage_id: x.contact.stage_id, deleted_at: x.deleted_at })));
+});
+app.post('/contacts/restore', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const fones = Array.isArray(req.body && req.body.phones) ? req.body.phones.map(String) : [];
+  if (!fones.length) return res.status(400).json({ error: 'phones obrigatório' });
+  const lixo = await _leadTrash(req.owner);
+  let restaurados = 0, erros = [];
+  for (const ph of fones) {
+    const item = lixo.find(x => x.contact && x.contact.phone === ph);
+    if (!item) { erros.push(ph + ': não está na lixeira'); continue; }
+    const c = Object.assign({}, item.contact); delete c.created_at;
+    const { error } = await supabase.from('contacts').upsert(c, { onConflict: 'owner,phone' });
+    if (error) { erros.push(ph + ': ' + error.message); continue; }
+    restaurados++;
+  }
+  await _leadTrashSalva(req.owner, lixo.filter(x => !fones.includes(x.contact && x.contact.phone) || erros.some(e => e.startsWith(x.contact.phone + ':'))));
+  res.json({ ok: true, restaurados, erros });
 });
 
 app.put("/contacts/bulk-tags", async (req, res) => {
@@ -5442,7 +5485,8 @@ const CHAVES_POR_CONTA = new Set([
   'tmpl_alias', // apelidos dos modelos da API (nome só no CRM)
   'sheets_sync', // planilha do Google ligada ao pipeline (importação de leads)
   'drip_rules',  // gotejamento: mover leads aos poucos de uma etapa para outra
-  'stage_trash'  // lixeira de colunas do pipeline (desfazer exclusão)
+  'stage_trash', // lixeira de colunas do pipeline (desfazer exclusão)
+  'lead_trash'   // lixeira de leads excluídos (30 dias)
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
