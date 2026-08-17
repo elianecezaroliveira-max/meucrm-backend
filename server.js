@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 211;
+const SERVER_VER = 212;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -3124,20 +3124,39 @@ app.get("/messages/:phone", async (req, res) => {
     .order("timestamp", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
-  // CURA RETROATIVA da divergência prévia × conversa: se a prévia do contato diz
-  // "lida"/"entregue", as mensagens enviadas até aquele momento recebem o mesmo
-  // status (o WhatsApp muitas vezes só confirma a última — as antigas ficavam cinza)
+  // CURA RETROATIVA (só a partir de RECIBOS REAIS): "leu uma = leu as anteriores".
+  // Antes ela partia do status da PRÉVIA do contato — se a prévia estivesse com um
+  // "lida" herdado, pintava de azul mensagens que ninguém leu (caso do bot).
+  // Agora a referência é a última mensagem enviada que TEM recibo de leitura/entrega
+  // e, no fim, a prévia é corrigida para o status real da última mensagem enviada.
   (async () => {
     try {
-      const { data: c } = await supabase.from('contacts')
-        .select('last_message_status, last_message_at, last_message_direction')
-        .eq('phone', req.params.phone).eq('owner', req.owner || ' ').maybeSingle();
-      if (c && c.last_message_direction === 'outbound' && (c.last_message_status === 'read' || c.last_message_status === 'delivered')) {
-        const abaixo = c.last_message_status === 'read' ? 'pending,sent,delivered' : 'pending,sent';
-        await supabase.from('messages').update({ status: c.last_message_status })
-          .eq('phone', req.params.phone).eq('owner', req.owner || ' ').eq('direction', 'outbound')
-          .lt('timestamp', c.last_message_at)
-          .or('status.is.null,status.in.(' + abaixo + ')');
+      const OW = req.owner || ' ', ph = req.params.phone;
+      const base = () => supabase.from('messages').select('status, timestamp').eq('phone', ph).eq('owner', OW).eq('direction', 'outbound');
+      // REPARO do estrago antigo: mensagem marcada "lida" SEM horário de leitura e
+      // mais nova que a última leitura REAL (com horário) só pode ter vindo da
+      // herança errada → volta para "entregue". (Se a conversa não tem nenhuma
+      // leitura com horário, não mexe — pode ser histórico anterior à coluna read_at.)
+      try {
+        const { data: ultReal, error: eR } = await supabase.from('messages').select('timestamp').eq('phone', ph).eq('owner', OW)
+          .eq('direction', 'outbound').not('read_at', 'is', null).order('timestamp', { ascending: false }).limit(1).maybeSingle();
+        if (!eR && ultReal) await supabase.from('messages').update({ status: 'delivered' }).eq('phone', ph).eq('owner', OW)
+          .eq('direction', 'outbound').eq('status', 'read').is('read_at', null).gt('timestamp', ultReal.timestamp);
+      } catch (_) {}
+      const { data: ultR } = await base().eq('status', 'read').order('timestamp', { ascending: false }).limit(1).maybeSingle();
+      if (ultR) await supabase.from('messages').update({ status: 'read' }).eq('phone', ph).eq('owner', OW).eq('direction', 'outbound')
+        .lt('timestamp', ultR.timestamp).or('status.is.null,status.in.(pending,sent,delivered)');
+      const { data: ultD } = await base().eq('status', 'delivered').order('timestamp', { ascending: false }).limit(1).maybeSingle();
+      if (ultD) await supabase.from('messages').update({ status: 'delivered' }).eq('phone', ph).eq('owner', OW).eq('direction', 'outbound')
+        .lt('timestamp', ultD.timestamp).or('status.is.null,status.in.(pending,sent)');
+      // Prévia = status REAL da última mensagem enviada (nunca "lida" por herança)
+      const { data: c } = await supabase.from('contacts').select('last_message_status, last_message_at, last_message_direction').eq('phone', ph).eq('owner', OW).maybeSingle();
+      if (c && c.last_message_direction === 'outbound') {
+        const { data: ult } = await base().order('timestamp', { ascending: false }).limit(1).maybeSingle();
+        if (ult) {
+          const real = (!ult.status || ult.status === 'pending') ? null : ult.status;
+          if ((c.last_message_status || null) !== real) await supabase.from('contacts').update({ last_message_status: real }).eq('phone', ph).eq('owner', OW);
+        }
       }
     } catch (_) {}
   })();
@@ -4140,7 +4159,9 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
       await supabase.from('messages').insert({ phone, content:text, type:'text', direction:'outbound', timestamp:ts, account_id:usedAcctId, status:'pending', wamid, owner:owner||null });
       await applyPendingStatus(wamid); // aplica status que chegou antes do insert
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
-      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
+      // last_message_status: null é OBRIGATÓRIO — sem isso a prévia herdava o "lida"
+      // da mensagem anterior e a cura retroativa pintava a mensagem do bot de azul
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null, unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
     }
     return wamid;
   } catch(e) {
@@ -5875,6 +5896,10 @@ async function waStart(instanceName) {
     for (const u of updates || []) {
       const st = u.update?.status, id = u.key?.id;
       if (!st || !id) continue;
+      // Só recibo do OUTRO lado sobre mensagem MINHA (key.fromMe). O "read-self"
+      // (meu próprio celular abrindo a conversa) vem com fromMe=false — ignorado,
+      // senão pintava de azul sem o lead ter lido.
+      if (u.key && u.key.fromMe === false) continue;
       const mapped = st === 4 || st === 'READ' ? 'read' : (st === 3 || st === 'DELIVERY_ACK' ? 'delivered' : null);
       if (mapped) { try { await updateMsgStatus(id, { status: mapped }); } catch (_) {} }
     }
@@ -5886,6 +5911,9 @@ async function waStart(instanceName) {
     for (const ev of events || []) {
       const id = ev.key?.id; const rc = ev.receipt || {};
       if (!id) continue;
+      if (ev.key && ev.key.fromMe === false) continue; // recibo de mensagem que NÃO é minha
+      // Recibo do MEU próprio aparelho (outro dispositivo meu) não é leitura do lead
+      try { const me = sock.user?.id ? String(sock.user.id).split(':')[0].split('@')[0] : ''; const uj = String(rc.userJid || '').split(':')[0].split('@')[0]; if (me && uj && me === uj) continue; } catch (_) {}
       const mapped = rc.readTimestamp ? 'read' : (rc.receiptTimestamp ? 'delivered' : null);
       if (mapped) { try { await updateMsgStatus(id, { status: mapped }); } catch (_) {} }
     }
