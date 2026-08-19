@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 213;
+const SERVER_VER = 214;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -4318,9 +4318,31 @@ function businessHoursState(nowMs, cfg) {
   return { open: false, nextOpenMs: nowMs + 3600000 };
 }
 
+// ⚡ CACHE CURTO do desenho do bot (nós e setas) — cada passo fazia 2-4 consultas
+// ao banco só para reler o fluxo; agora relê no máximo a cada 20s (e zera ao salvar)
+const _botGraphCache = { nodes: new Map(), edges: new Map() };
+const _BOT_GRAPH_TTL = 20000;
+function _botGraphLimpa() { _botGraphCache.nodes.clear(); _botGraphCache.edges.clear(); }
+async function _nodeById(id) {
+  if (!supabase || !id) return null;
+  const c = _botGraphCache.nodes.get(id);
+  if (c && Date.now() - c.ts < _BOT_GRAPH_TTL) return c.v;
+  const { data } = await supabase.from('bot_nodes').select('*').eq('id', id).maybeSingle();
+  _botGraphCache.nodes.set(id, { v: data || null, ts: Date.now() });
+  return data || null;
+}
+async function _edgesFrom(fromNodeId) {
+  if (!supabase || !fromNodeId) return [];
+  const c = _botGraphCache.edges.get(fromNodeId);
+  if (c && Date.now() - c.ts < _BOT_GRAPH_TTL) return c.v;
+  const { data } = await supabase.from('bot_edges').select('*').eq('from_node_id', fromNodeId);
+  const v = data || [];
+  _botGraphCache.edges.set(fromNodeId, { v, ts: Date.now() });
+  return v;
+}
 async function getNextNodeId(fromNodeId, edgeLabel) {
   if (!supabase) return null;
-  const { data:edges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', fromNodeId);
+  const edges = await _edgesFrom(fromNodeId);
   if (!edges?.length) return null;
   if (edgeLabel) {
     const m = edges.find(e => e.label && e.label.toLowerCase() === edgeLabel.toLowerCase());
@@ -4338,7 +4360,7 @@ async function processNode(run, depth=0) {
   if (!supabase || depth > 30) return; // prevent infinite loops
   const { id:runId, contact_phone:phone, account_id:acctId, current_node_id:nodeId, owner:botOwner } = run;
   const OW = botOwner || ' '; // sentinela p/ escopo por dono
-  const { data:node } = await supabase.from('bot_nodes').select('*').eq('id', nodeId).maybeSingle();
+  const node = await _nodeById(nodeId);
   if (!node) { await stopRun(runId,'stopped'); return; }
   const cfg = node.config || {};
 
@@ -4371,7 +4393,7 @@ async function processNode(run, depth=0) {
       sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null) : true;
     }
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
-    const { data:medges } = await supabase.from('bot_edges').select('to_node_id,label').eq('from_node_id', nodeId);
+    const medges = await _edgesFrom(nodeId);
     const okNxt   = medges?.find(e=>!e.label||e.label===''||e.label==='default')?.to_node_id || null;
     const failNxt = medges?.find(e=>(e.label||'').toLowerCase()==='__failed__')?.to_node_id || null;
     const hasButtons = cfg.mode === 'template' && Array.isArray(cfg.buttons) && cfg.buttons.length > 0;
@@ -4474,7 +4496,7 @@ async function processNode(run, depth=0) {
       try {
         const nxtPeek = await getNextNodeId(nodeId, null);
         if (nxtPeek) {
-          const { data: nxNode } = await supabase.from('bot_nodes').select('type, config').eq('id', nxtPeek).maybeSingle();
+          const nxNode = await _nodeById(nxtPeek);
           if (nxNode && nxNode.type === 'message') {
             const typeAcct = (nxNode.config && nxNode.config.account_id) || run.account_id || null;
             if (typeAcct) {
@@ -4547,7 +4569,7 @@ async function handleBotReply(phone, text, owner) {
   // NUNCA dispara nada na conversa (a resposta segue para o atendimento normal).
   const ageMs = Date.now() - new Date(run.updated_at || run.created_at || 0).getTime();
   if (ageMs > 48*3600000) { await stopRun(run.id, 'stopped'); return false; }
-  const { data:edges } = await supabase.from('bot_edges').select('*').eq('from_node_id', run.current_node_id);
+  const edges = await _edgesFrom(run.current_node_id);
   if (!edges?.length) { await stopRun(run.id,'completed'); return true; }
   const tl = text.toLowerCase().trim();
   let matched = null;
@@ -4654,7 +4676,7 @@ async function fireStageBots(phone, stageId, owner, depth = 0) {
   } catch(e) { console.error('fireStageBots error:', e.message); }
 }
 
-async function startBot(botId, phone, accountId, owner, seedAccount) {
+async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPlano) {
   if (!supabase) return null;
   let ownerEmail = owner;
   if (!ownerEmail) { const { data:b } = await supabase.from('bots').select('owner').eq('id',botId).maybeSingle(); ownerEmail = b?.owner || null; }
@@ -4672,6 +4694,9 @@ async function startBot(botId, phone, accountId, owner, seedAccount) {
     created_at:new Date().toISOString(), updated_at:new Date().toISOString()
   }).select().single();
   if (error) { console.error('❌ Bot run insert:', error.message); return null; }
+  // Disparo manual do chat: devolve já (a tela mostra "bot ativo" na hora) e o
+  // primeiro passo roda em seguida — sem o botão ficar travado esperando o envio
+  if (emSegundoPlano) { processNode(run).catch(e => console.error('processNode bg:', e.message)); return run; }
   await processNode(run);
   return run;
 }
@@ -4700,7 +4725,7 @@ setInterval(async () => {
     // execução esquecida), NÃO envia nada "do nada" — encerra em silêncio.
     if (Date.now() - new Date(run.pause_until).getTime() > 15*60000) { await stopRun(run.id,'stopped'); continue; }
     // Se o nó atual é "Horário comercial", re-avalia o próprio nó (não avança)
-    const { data:curNode } = await supabase.from('bot_nodes').select('type').eq('id', run.current_node_id).maybeSingle();
+    const curNode = await _nodeById(run.current_node_id);
     if (curNode?.type === 'business_hours') {
       await supabase.from('bot_runs').update({ status:'running', pause_until:null, updated_at:now }).eq('id',run.id);
       await processNode({...run, status:'running'});
@@ -5215,6 +5240,7 @@ app.delete('/bots/:id', async (req,res) => {
   const { data: own } = await supabase.from('bots').select('id').eq('id',id).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
   await supabase.from('bot_runs').delete().eq('bot_id',id);
+  _botGraphLimpa();
   await supabase.from('bot_edges').delete().eq('bot_id',id);
   await supabase.from('bot_nodes').delete().eq('bot_id',id);
   const { error } = await supabase.from('bots').delete().eq('id',id).eq('owner', req.owner || ' ');
@@ -5240,6 +5266,7 @@ app.put('/bots/:id/flow', async (req,res) => {
   const { data: own } = await supabase.from('bots').select('id').eq('id',botId).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
   try {
+    _botGraphLimpa();
     await supabase.from('bot_edges').delete().eq('bot_id',botId);
     await supabase.from('bot_nodes').delete().eq('bot_id',botId);
     if (nodes?.length) { const { error:ne } = await supabase.from('bot_nodes').insert(nodes.map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0), owner:req.owner||null }))); if (ne) throw ne; }
@@ -5286,7 +5313,7 @@ app.post('/bots/:id/start', async (req,res) => {
   // confirma que o bot é do dono
   const { data: own } = await supabase.from('bots').select('id').eq('id',req.params.id).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
-  const run = await startBot(req.params.id, phone, account_id, req.owner, true); // manual no chat: herda o número da conversa
+  const run = await startBot(req.params.id, phone, account_id, req.owner, true, true); // manual no chat: herda o número da conversa; responde na hora
   if (!run) return res.status(500).json({error:'Erro ao iniciar bot (verifique se o fluxo tem nó Início)'});
   res.json({success:true, run_id:run.id});
 });
