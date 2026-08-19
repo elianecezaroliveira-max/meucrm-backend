@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 212;
+const SERVER_VER = 213;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2647,6 +2647,9 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
   await _dripSalva(owner, atuais);
 }
 function _dripDentroDaJanela(r) {
+  // ⏹ "Parar" com o automático ligado: fica parada até o horário marcado (fim da
+  // janela de hoje) — depois o automático retoma sozinho na próxima janela
+  if (r.parado_ate && Date.now() < new Date(r.parado_ate).getTime()) return false;
   const agora = new Date(Date.now() - 3 * 3600000); // horário de Brasília
   // dias da semana (0=dom … 6=sáb); lista vazia = todos os dias
   if (Array.isArray(r.dias) && r.dias.length && !r.dias.includes(agora.getUTCDay())) return false;
@@ -2765,6 +2768,7 @@ app.put('/drip', async (req, res) => {
       hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: nextAt, // mantém o próximo horário (pausar/ligar não encurta o intervalo); intervalo novo → recalculado
+      parado_ate: (r.parado_ate && !isNaN(Date.parse(r.parado_ate)) && Date.parse(r.parado_ate) > Date.now()) ? new Date(r.parado_ate).toISOString() : null,
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
     };
   }).filter(r => r.de && r.para);
