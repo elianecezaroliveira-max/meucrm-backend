@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 214;
+const SERVER_VER = 216;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -755,8 +755,15 @@ app.post("/auth/whatsapp", async (req, res) => {
         }
 
         // 6. Salva conta no Supabase
+        // Conta JÁ existente = PRESERVA o nome que você deu (a Meta não manda mais
+        // o nome dela por cima quando você reconecta/atualiza o token)
+        let _nomeAtual = null;
+        try {
+          const { data: _ex } = await supabase.from('accounts').select('name').eq('phone_number_id', phone.id).maybeSingle();
+          _nomeAtual = _ex?.name || null;
+        } catch (_) {}
         const accountData = {
-          name: phone.verified_name || wabaName,
+          name: _nomeAtual || phone.verified_name || wabaName,
           phone_number_id: phone.id,
           phone_display: phone.display_phone_number,
           token: userToken,
@@ -1044,12 +1051,87 @@ app.post("/accounts", async (req, res) => {
     } catch (e) { console.log('⚠️ Webhook subscribe:', e.response?.data?.error?.message); }
   }
 
+  // Conta JÁ existente (ex.: você reenviou o token) = PRESERVA o nome atual.
+  // Para trocar o nome, use o ✏️ na lista de Contas.
+  let _nomePreservado = null;
+  try {
+    const { data: _ex } = await supabase.from('accounts').select('name').eq('phone_number_id', phone_number_id).maybeSingle();
+    _nomePreservado = _ex?.name || null;
+  } catch (_) {}
   const { data, error } = await supabase
     .from("accounts")
-    .upsert({ name, phone_number_id, phone_display, waba_id, token, owner: req.owner || null }, { onConflict: 'phone_number_id' })
+    .upsert({ name: _nomePreservado || name, phone_number_id, phone_display, waba_id, token, owner: req.owner || null }, { onConflict: 'phone_number_id' })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true, data, aviso: waba_id ? null : 'WABA não localizada — os modelos podem não aparecer' });
+  const _avisos = [];
+  if (!waba_id) _avisos.push('WABA não localizada — os modelos podem não aparecer');
+  if (_nomePreservado && _nomePreservado !== name) _avisos.push('O nome "' + _nomePreservado + '" foi mantido (use o ✏️ em Contas para trocar)');
+  res.json({ success: true, data, aviso: _avisos.length ? _avisos.join('. ') : null });
+});
+
+// 🩺 DIAGNÓSTICO do número na Meta: diz EXATAMENTE o que falta para ele sair de
+// "Pendente" (verificação do número, registro na Cloud API, aprovação do nome)
+app.get('/accounts/:id/meta-diag', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { data: a } = await supabase.from('accounts').select('id, name, phone_number_id, token, waba_id, evolution_instance')
+    .eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
+  if (a.evolution_instance) return res.json({ tipo: 'qr', aviso: 'Conta QR Code — não passa pela aprovação da Meta.' });
+  if (!a.phone_number_id || !a.token) return res.status(400).json({ error: 'Faltam Phone Number ID/Token nesta conta.' });
+  try {
+    const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}`, {
+      params: { access_token: a.token, fields: 'id,display_phone_number,verified_name,status,quality_rating,name_status,code_verification_status,platform_type' },
+      timeout: 10000
+    });
+    const d = r.data || {};
+    const st = String(d.status || '').toUpperCase();
+    const cod = String(d.code_verification_status || '').toUpperCase();
+    const nome = String(d.name_status || '').toUpperCase();
+    const passos = [];
+    if (cod && cod !== 'VERIFIED') passos.push('1) VERIFICAR O NÚMERO: no Gerenciador da Meta (WhatsApp > Números), clique no número e conclua a verificação por SMS ou ligação.');
+    if (st === 'PENDING' || st === 'UNVERIFIED') passos.push('2) REGISTRAR na Cloud API: use o botão "⚡ Ativar na Meta" aqui no VETRA (registra o número com um PIN de 6 dígitos).');
+    if (nome && !['APPROVED', 'AVAILABLE_WITHOUT_REVIEW'].includes(nome)) passos.push('3) NOME DE EXIBIÇÃO em análise/rejeitado (' + nome + '): a Meta leva até 48h. O número pode ficar "Pendente" até aprovar.');
+    res.json({ tipo: 'api', numero: d.display_phone_number || null, nome_exibicao: d.verified_name || null,
+      status: st || null, verificacao: cod || null, nome_status: nome || null, qualidade: d.quality_rating || null, passos });
+  } catch (e) {
+    res.status(400).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// ⚡ ATIVAR: registra o número na Cloud API (é o que tira do "Pendente" e liga o envio).
+// PIN: o de 6 dígitos da verificação em duas etapas do número (padrão do CRM se não enviar).
+app.post('/accounts/:id/ativar', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { data: a } = await supabase.from('accounts').select('id, name, phone_number_id, token, waba_id, evolution_instance')
+    .eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
+  if (a.evolution_instance) return res.status(400).json({ error: 'Conta QR Code não precisa de ativação na Meta.' });
+  if (!a.phone_number_id || !a.token) return res.status(400).json({ error: 'Faltam Phone Number ID/Token nesta conta.' });
+  const pin = String(req.body?.pin || process.env.WHATSAPP_PIN || '123456').replace(/\D/g, '');
+  if (pin.length !== 6) return res.status(400).json({ error: 'O PIN precisa ter 6 dígitos.' });
+  try {
+    await axios.post(`https://graph.facebook.com/v23.0/${a.phone_number_id}/register`,
+      { messaging_product: 'whatsapp', pin },
+      { headers: { Authorization: `Bearer ${a.token}`, 'Content-Type': 'application/json' }, timeout: 15000 });
+    // Garante também a inscrição da WABA no webhook (sem isso não chegam mensagens)
+    if (a.waba_id) { try { await axios.post(`https://graph.facebook.com/v23.0/${a.waba_id}/subscribed_apps`, {}, { params: { access_token: a.token } }); } catch (_) {} }
+    delete _acctStatusCache[a.id]; // força reler o estado real na próxima consulta
+    let st = null;
+    try {
+      const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}`, { params: { access_token: a.token, fields: 'status' }, timeout: 8000 });
+      st = String(r.data?.status || '').toUpperCase() || null;
+    } catch (_) {}
+    res.json({ success: true, status: st });
+  } catch (e) {
+    const err = e.response?.data?.error || {};
+    const cod = err.code, sub = err.error_subcode;
+    let dica = err.message || e.message;
+    if (cod === 133005 || sub === 2388005) dica = 'PIN incorreto: este número já tem verificação em duas etapas com OUTRO PIN. Use o PIN correto ou peça a redefinição no Gerenciador da Meta (WhatsApp > Números > o número > Verificação em duas etapas).';
+    else if (cod === 133010) dica = 'O número ainda NÃO foi verificado na Meta. Conclua a verificação por SMS/ligação no Gerenciador antes de ativar.';
+    else if (cod === 133006) dica = 'O número precisa ser verificado novamente na Meta (SMS ou ligação) antes do registro.';
+    else if (cod === 100) dica = 'A Meta recusou o registro: ' + dica + ' — confira se o token tem permissão sobre este número.';
+    res.status(400).json({ error: dica, codigo: cod || null });
+  }
 });
 
 // ── Renomear conta (API oficial ou QR Code) ──
