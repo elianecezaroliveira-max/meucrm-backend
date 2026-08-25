@@ -66,9 +66,21 @@ app.use(async (req, res, next) => {
   next();
 });
 
+// 🛡️ REDE DE SEGURANÇA: uma falha inesperada dentro de uma rota (ex.: dado
+// estranho vindo de fora) só vira log — nunca derruba o CRM inteiro.
+process.on('unhandledRejection', (e) => console.error('⚠️ Falha não tratada:', (e && e.message) || e));
+process.on('uncaughtException', (e) => console.error('⚠️ Erro não tratado:', (e && e.stack) || e));
+// Exige estar logado (ou usar o token de integração) — usada nas rotas sensíveis
+// Decodifica sem quebrar: "%zz" derrubava a rota (e o processo)
+function _decSeguro(v) { try { return decodeURIComponent(String(v == null ? '' : v)); } catch (_) { return String(v == null ? '' : v); } }
+function _exigeLogin(req, res) {
+  if (req.owner) return true;
+  res.status(401).json({ error: 'Faça login no CRM' });
+  return false;
+}
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 219;
+const SERVER_VER = 222;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -962,7 +974,8 @@ async function _limpaMidiasAntigas() {
     for (const p of (pastas || [])) {
       if (!p || !p.name || p.name === 'avatars') continue; // avatares ficam
       let removidas = 0, offset = 0;
-      while (true) {
+      let _voltas = 0;
+      while (_voltas++ < 60) { // teto de segurança: nunca gira para sempre
         const { data: arqs } = await supabase.storage.from('wa-media').list('qr/' + p.name, { limit: 1000, offset });
         if (!arqs || !arqs.length) break;
         const velhos = arqs
@@ -1150,6 +1163,18 @@ app.patch("/accounts/:id", async (req, res) => {
 
 // ── Remover conta ──
 app.delete("/accounts/:id", async (req, res) => {
+  // Conta por QR: encerra a conexão ANTES de apagar — senão o WhatsApp continuava
+  // conectado e as mensagens chegavam "sem dono" (invisíveis no CRM)
+  try {
+    const { data: _a } = await supabase.from('accounts').select('evolution_instance').eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+    const _inst = _a && _a.evolution_instance;
+    if (_inst) {
+      const sock = _waSocks[_inst];
+      if (sock) { try { await sock.logout(); } catch (_) {} try { sock.end(undefined); } catch (_) {} delete _waSocks[_inst]; }
+      delete _waState[_inst]; delete _waPhone[_inst]; delete qrCache[_inst];
+      try { await supabase.from('wa_sessions').delete().eq('instance', _inst); } catch (_) {}
+    }
+  } catch (e) { console.error('encerrar QR ao apagar conta:', e.message); }
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { error } = await supabase.from("accounts").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
@@ -1238,7 +1263,7 @@ app.post("/send", async (req, res) => {
         const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
         // Inclui owner — sem ele a mensagem não aparece no CRM (o GET /messages filtra por owner)
         await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
-        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
+        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, status: wamid ? 'sent' : 'pending', wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
       }
       return res.json({ success: true, via: 'evolution' });
     } catch(e) {
@@ -1296,6 +1321,7 @@ app.post("/send", async (req, res) => {
 
 // ── Reagir a uma mensagem com emoji (passe emoji vazio para remover) ──
 app.post("/react", async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   const { to, wamid, emoji, account_id } = req.body;
   if (!to || !wamid) return res.status(400).json({ error: "Informe 'to' e 'wamid'" });
 
@@ -1886,6 +1912,9 @@ function _storageAuthOk(req, destrutivo) {
   const tok = String(req.query.token || '').trim()
     || String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
   if (!tok) return false;
+  // Token de integração: só LEITURA dos números (apagar exige a dona ou o token
+  // de administração — antes qualquer cliente podia apagar arquivos de outro)
+  if (destrutivo) return false;
   for (const k in _settings) if (k.startsWith('api_token::') && _settings[k] === tok) return true;
   return false;
 }
@@ -2008,12 +2037,31 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
 
   // Busca token da conta
   let token = process.env.WHATSAPP_TOKEN;
+  let _contaDaMidia = null;
   if (supabase && account_id) {
     const { data: account } = await supabase
-      .from("accounts").select("token").eq("id", account_id).maybeSingle();
+      .from("accounts").select("token, owner, evolution_instance").eq("id", account_id).maybeSingle();
+    _contaDaMidia = account || null;
     if (account?.token) token = account.token;
   }
-  if (!token) return res.status(400).json({ error: "Token não encontrado" });
+  // 🔒 Arquivo do WhatsApp por QR: o caminho é "qr/<número>/arquivo" e só é
+  // servido se pertencer ao MESMO número informado (antes bastava saber o
+  // caminho para ver o arquivo de outra conta)
+  if (String(mediaId).startsWith('qr/') && supabase) {
+    const instDoArquivo = String(mediaId).split('/')[1] || '';
+    // Quem é o dono do número que gerou o arquivo?
+    let donoDoArquivo = null;
+    try {
+      const { data: dn } = await supabase.from('accounts').select('owner').eq('evolution_instance', instDoArquivo).maybeSingle();
+      donoDoArquivo = dn ? (dn.owner || null) : null;
+    } catch (_) {}
+    // Só recusa quando dá para PROVAR que é de outra conta (imagem em <img> não
+    // manda login, então nunca bloqueamos por falta de informação)
+    const quemPede = req.owner || (_contaDaMidia && _contaDaMidia.owner) || null;
+    if (donoDoArquivo && quemPede && String(donoDoArquivo).toLowerCase() !== String(quemPede).toLowerCase())
+      return res.status(403).json({ error: 'Arquivo de outra conta' });
+  }
+  if (!token && !String(mediaId).startsWith('qr/')) return res.status(400).json({ error: "Token não encontrado" });
 
   // 🗄️ Cópia própria (6 meses): se o arquivo já está no NOSSO Storage, serve
   // de lá — funciona mesmo depois que a Meta apaga (30 dias) e é mais rápido.
@@ -2098,7 +2146,11 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
         up = null;
         if (supabase) {
           try {
-            const { data: accs } = await supabase.from("accounts").select("id, token").not("token", "is", null);
+            let _qb = supabase.from("accounts").select("id, token").not("token", "is", null);
+            // Só as contas do MESMO dono (antes tentava o token de TODOS os clientes)
+            const _ownerBusca = (_contaDaMidia && _contaDaMidia.owner) || req.owner || null;
+            if (_ownerBusca) _qb = _qb.eq('owner', _ownerBusca); else _qb = _qb.eq('id', account_id || '');
+            const { data: accs } = await _qb;
             const vistos = new Set([token]);
             for (const a of (accs || [])) {
               if (!a.token || vistos.has(a.token)) continue;
@@ -2594,7 +2646,7 @@ app.post("/contacts", async (req, res) => {
   const { name, phone, account_id } = req.body;
   if (!name || !phone) return res.status(400).json({ error: "Nome e celular são obrigatórios" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const cleanPhone = phone.replace(/\D/g, '');
+  const cleanPhone = String(phone).replace(/\D/g, '');
   if (cleanPhone.length < 8) return res.status(400).json({ error: "Número de celular inválido" });
   // UNIFICAÇÃO: se o número JÁ existe (com OU sem o nono dígito), reaproveita o
   // registro existente — o nome vira o último informado e o chat continua UM só
@@ -3207,13 +3259,17 @@ app.delete("/messages/id/:id", async (req, res) => {
 // Guarda a imagem no cofre e devolve um link PÚBLICO (a Meta e o WhatsApp
 // precisam conseguir baixar a foto sozinhos na hora do disparo).
 app.post('/bot-media', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   try {
     const { data, mime, filename } = req.body || {};
     if (!data) return res.status(400).json({ error: 'Arquivo não recebido' });
     const buf = Buffer.from(String(data).replace(/^data:[^,]+,/, ''), 'base64');
     if (buf.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'Imagem muito grande (máx. 12 MB)' });
-    const tipo = String(mime || 'image/jpeg').split(';')[0];
+    let tipo = String(mime || 'image/jpeg').split(';')[0].toLowerCase();
+    // Só foto ou vídeo: qualquer outro tipo vira imagem (o link é público — nada
+    // de hospedar página/arquivo estranho no endereço do CRM)
+    if (!/^(image\/(jpeg|jpg|png|webp|gif)|video\/(mp4|3gpp|quicktime))$/.test(tipo)) tipo = 'image/jpeg';
     const ext = (tipo.split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '') || 'jpg';
     const nome = `bot/${Date.now()}_${String(filename || 'foto').replace(/[^\w.-]/g, '').slice(-40) || 'foto'}.${ext}`;
     const { error } = await supabase.storage.from('wa-media').upload(nome, buf, { contentType: tipo, upsert: true });
@@ -3371,7 +3427,7 @@ app.delete("/templates/:template_id", async (req, res) => {
     .from("accounts").select("token, waba_id").eq("id", account_id).eq("owner", req.owner || ' ').single();
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
-  const name = decodeURIComponent(req.params.template_id);
+  const name = _decSeguro(req.params.template_id);
   const hsm_id = req.query.hsm_id;
   try {
     const params = { name, access_token: account.token };
@@ -3759,18 +3815,19 @@ async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
   if (!supabase) return;
   const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
   await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
-  await supabase.from('messages').insert({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, wamid: wamid || null, owner: req.owner || null });
+  await supabase.from('messages').insert({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, status: wamid ? 'sent' : 'pending', wamid: wamid || null, owner: req.owner || null });
 }
 
 // 📍 Enviar localização (QR e API oficial)
 app.post('/send-location', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   try {
     let { to, account_id, lat, lng, name } = req.body || {};
     lat = parseFloat(lat); lng = parseFloat(lng);
     if (!to || isNaN(lat) || isNaN(lng)) return res.status(400).json({ error: 'Informe to, lat e lng' });
     to = await resolveExistingPhone(to, req.owner);
     stopBotRunsForPhone(to, req.owner);
-    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').maybeSingle();
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').eq('owner', req.owner || ' ').maybeSingle();
     if (!acct) return res.status(400).json({ error: 'Conta não encontrada' });
     const content = `📍 ${name || 'Localização'}\nhttps://maps.google.com/?q=${lat},${lng}`;
     let wamid = null;
@@ -3790,13 +3847,14 @@ app.post('/send-location', async (req, res) => {
 
 // 👤 Enviar cartão de contato (QR e API oficial)
 app.post('/send-contact', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   try {
     let { to, account_id, cname, cphone } = req.body || {};
     if (!to || !cname || !cphone) return res.status(400).json({ error: 'Informe to, cname e cphone' });
     to = await resolveExistingPhone(to, req.owner);
     stopBotRunsForPhone(to, req.owner);
     const digits = String(cphone).replace(/\D/g, '');
-    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').maybeSingle();
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').eq('owner', req.owner || ' ').maybeSingle();
     if (!acct) return res.status(400).json({ error: 'Conta não encontrada' });
     const content = `👤 ${cname}\n+${digits}`;
     let wamid = null;
@@ -3817,12 +3875,13 @@ app.post('/send-contact', async (req, res) => {
 
 // 📊 Enviar enquete (SÓ números QR — a API oficial não tem enquete)
 app.post('/send-poll', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   try {
     let { to, account_id, question, options } = req.body || {};
     if (!to || !question || !Array.isArray(options) || options.length < 2) return res.status(400).json({ error: 'Informe to, question e pelo menos 2 options' });
     to = await resolveExistingPhone(to, req.owner);
     stopBotRunsForPhone(to, req.owner);
-    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').maybeSingle();
+    const { data: acct } = await supabase.from('accounts').select('*').eq('id', account_id || '').eq('owner', req.owner || ' ').maybeSingle();
     if (!acct?.evolution_instance) return res.status(400).json({ error: 'Enquetes só funcionam em números QR Code' });
     const r = await waSendRaw(acct.evolution_instance, to, { poll: { name: question, values: options.slice(0, 12), selectableCount: 1 } });
     try {
@@ -3842,10 +3901,11 @@ app.post('/send-poll', async (req, res) => {
 
 // 🚫 Apagar mensagem PARA TODOS (SÓ QR — a API oficial não permite)
 app.post('/message-revoke', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   try {
     const { phone, account_id, wamid } = req.body || {};
     if (!phone || !wamid) return res.status(400).json({ error: 'Informe phone e wamid' });
-    const { data: acct } = await supabase.from('accounts').select('evolution_instance').eq('id', account_id || '').maybeSingle();
+    const { data: acct } = await supabase.from('accounts').select('evolution_instance').eq('id', account_id || '').eq('owner', req.owner || ' ').maybeSingle();
     const inst = acct?.evolution_instance;
     if (!inst || !_waSocks[inst] || _waState[inst] !== 'open') return res.status(400).json({ error: 'Apagar para todos só funciona em números QR conectados' });
     const sock = _waSocks[inst];
@@ -3885,9 +3945,23 @@ function _brPhoneVariants(ph) {
   if (/^55\d{11}$/.test(ph) && ph[4] === '9') out.add(ph.slice(0, 4) + ph.slice(5));
   return Array.from(out);
 }
-app.get('/typing-list', (req, res) => {
+// Instâncias QR de cada dono (cache de 60s) — o "digitando…" só mostra os SEUS
+const _instDoDono = {};
+async function _minhasInstancias(owner) {
+  const c = _instDoDono[owner];
+  if (c && Date.now() - c.ts < 60000) return c.set;
+  const { data } = await supabase.from('accounts').select('evolution_instance').eq('owner', owner).not('evolution_instance', 'is', null);
+  const set = new Set((data || []).map(x => String(x.evolution_instance)));
+  _instDoDono[owner] = { set, ts: Date.now() };
+  return set;
+}
+app.get('/typing-list', async (req, res) => {
+  if (!req.owner || !supabase) return res.json({});
+  let minhas = new Set();
+  try { minhas = await _minhasInstancias(req.owner); } catch (_) { return res.json({}); }
   const out = {}; const now = Date.now();
   for (const [k, p] of Object.entries(_waPresence)) {
+    if (!minhas.has(String(k.split('|')[0] || ''))) continue; // número de outra conta: não é da sua conta
     if ((p.state === 'composing' || p.state === 'recording') && now - p.at < 12000) {
       const ph = (k.split('|')[1] || '').split('@')[0].split(':')[0];
       if (ph) _brPhoneVariants(ph).forEach(v => { out[v] = p.state; });
@@ -3979,7 +4053,7 @@ app.get('/link-preview', async (req, res) => {
     } catch (_) { return res.json({}); }
     const hit = _linkPrevCache.get(url);
     if (hit && Date.now() - hit.ts < 6 * 3600000) return res.json(hit.data);
-    const r = await axios.get(url, { timeout: 6000, maxContentLength: 512 * 1024, maxRedirects: 3,
+    const r = await axios.get(url, { timeout: 6000, maxContentLength: 512 * 1024, maxRedirects: 0, validateStatus: c => c >= 200 && c < 300, // sem seguir redirecionamento: um link podia desviar para um endereço interno do servidor
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VETRA-CRM/1.0)' }, responseType: 'text',
       validateStatus: st => st >= 200 && st < 400 });
     const html = String(r.data || '').slice(0, 300000);
@@ -4036,7 +4110,7 @@ app.get('/presence', async (req, res) => {
 app.put('/contacts/:phone/mute', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('contacts').update({ muted: !!req.body.muted })
-    .eq('phone', decodeURIComponent(req.params.phone)).eq('owner', req.owner || ' ');
+    .eq('phone', _decSeguro(req.params.phone)).eq('owner', req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -4045,7 +4119,7 @@ app.put('/contacts/:phone/mute', async (req, res) => {
 app.put('/contacts/:phone/unread', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('contacts').update({ unread_count: 1, first_unread_at: new Date().toISOString() })
-    .eq('phone', decodeURIComponent(req.params.phone)).eq('owner', req.owner || ' ');
+    .eq('phone', _decSeguro(req.params.phone)).eq('owner', req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -4062,7 +4136,7 @@ async function _isContactMuted(phone, owner) {
 app.put('/contacts/:phone/pin', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('contacts').update({ pinned: !!req.body.pinned })
-    .eq('phone', decodeURIComponent(req.params.phone)).eq('owner', req.owner || ' ');
+    .eq('phone', _decSeguro(req.params.phone)).eq('owner', req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -4071,7 +4145,7 @@ app.put('/contacts/:phone/pin', async (req, res) => {
 // (etapa, etiquetas, anotações e tarefas são preservados)
 app.delete("/contacts/:phone/messages", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const phone = decodeURIComponent(req.params.phone);
+  const phone = _decSeguro(req.params.phone);
   await supabase.from("messages").delete().eq("phone", phone).eq("owner", req.owner || ' ');
   const { error } = await supabase.from("contacts")
     .update({ last_message_preview: null, last_message_direction: null, unread_count: 0, first_unread_at: null })
@@ -4478,28 +4552,34 @@ async function _nodeById(id) {
   const c = _botGraphCache.nodes.get(id);
   if (c && Date.now() - c.ts < _BOT_GRAPH_TTL) return c.v;
   const { data } = await supabase.from('bot_nodes').select('*').eq('id', id).maybeSingle();
-  _botGraphCache.nodes.set(id, { v: data || null, ts: Date.now() });
-  return data || null;
+  if (!data) return null; // nó ausente NÃO entra no cache (salvar o bot apaga e recria os nós)
+  _botGraphCache.nodes.set(id, { v: data, ts: Date.now() });
+  return data;
 }
 async function _edgesFrom(fromNodeId) {
   if (!supabase || !fromNodeId) return [];
   const c = _botGraphCache.edges.get(fromNodeId);
   if (c && Date.now() - c.ts < _BOT_GRAPH_TTL) return c.v;
   const { data } = await supabase.from('bot_edges').select('*').eq('from_node_id', fromNodeId);
-  const v = data || [];
-  _botGraphCache.edges.set(fromNodeId, { v, ts: Date.now() });
-  return v;
+  if (!data || !data.length) return []; // sem setas: não guarda (pode ser o instante do salvamento)
+  _botGraphCache.edges.set(fromNodeId, { v: data, ts: Date.now() });
+  return data;
 }
 async function getNextNodeId(fromNodeId, edgeLabel) {
   if (!supabase) return null;
   const edges = await _edgesFrom(fromNodeId);
   if (!edges?.length) return null;
   if (edgeLabel) {
-    const m = edges.find(e => e.label && e.label.toLowerCase() === edgeLabel.toLowerCase());
+    const m = edges.find(e => e.label && e.label.toLowerCase() === String(edgeLabel).toLowerCase());
     if (m) return m.to_node_id;
   }
-  const def = edges.find(e => !e.label || e.label==='' || e.label==='default');
-  return def?.to_node_id || edges[0]?.to_node_id || null;
+  const def = edges.find(e => !e.label || e.label === '' || e.label === 'default');
+  if (def) return def.to_node_id;
+  // Pediu uma saída ESPECÍFICA que não existe (ex.: sem resposta, número do rodízio,
+  // fora do horário) e não há saída padrão → PARA. Antes ele pegava a primeira seta
+  // qualquer: quem não respondeu seguia pelo caminho do "sim".
+  if (edgeLabel) return null;
+  return edges[0]?.to_node_id || null;
 }
 
 async function stopRun(runId, status='completed') {
@@ -4507,7 +4587,12 @@ async function stopRun(runId, status='completed') {
 }
 
 async function processNode(run, depth=0) {
-  if (!supabase || depth > 30) return; // prevent infinite loops
+  if (!supabase) return;
+  if (depth > 30) { // fluxo em círculo: encerra (antes ficava "rodando" para sempre)
+    console.error('🤖 Bot com muitos passos seguidos — execução encerrada:', run && run.id);
+    try { await stopRun(run.id, 'stopped'); } catch (_) {}
+    return;
+  }
   const { id:runId, contact_phone:phone, account_id:acctId, current_node_id:nodeId, owner:botOwner } = run;
   const OW = botOwner || ' '; // sentinela p/ escopo por dono
   const node = await _nodeById(nodeId);
@@ -4555,8 +4640,8 @@ async function processNode(run, depth=0) {
     } else if (hasButtons && (medges && medges.length)) {
       // Modelo com botões: aguarda o lead clicar num botão (ramifica conforme o botão).
       // Sem NENHUM caminho ligado, não há o que esperar → encerra (não fica "rodando").
-      let pauseUntil = null;
-      if (cfg.timeout_hours && cfg.timeout_hours > 0) pauseUntil = new Date(Date.now() + cfg.timeout_hours*3600000).toISOString();
+      const _hrs = (cfg.timeout_hours && cfg.timeout_hours > 0) ? cfg.timeout_hours : 48;
+      let pauseUntil = new Date(Date.now() + _hrs * 3600000).toISOString();
       await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
     } else if (okNxt) {
       await supabase.from('bot_runs').update({ current_node_id:okNxt, updated_at:new Date().toISOString() }).eq('id',runId);
@@ -4629,8 +4714,10 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'wait_reply') {
-    let pauseUntil = null;
-    if (cfg.timeout_hours && cfg.timeout_hours > 0) pauseUntil = new Date(Date.now() + cfg.timeout_hours*3600000).toISOString();
+    // Sem prazo configurado, usa 48h de segurança: execução parada para sempre
+    // travava o lead fora dos próximos disparos em massa desse bot.
+    const _hrs = (cfg.timeout_hours && cfg.timeout_hours > 0) ? cfg.timeout_hours : 48;
+    let pauseUntil = new Date(Date.now() + _hrs * 3600000).toISOString();
     await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
 
   } else if (node.type === 'pause') {
@@ -4640,6 +4727,7 @@ async function processNode(run, depth=0) {
     await supabase.from('bot_runs').update({ status:'paused', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
     // Espera CURTA (até 2 min): cronômetro EXATO na memória — retoma na hora certa.
     // O ciclo de 30s fica só para esperas longas e como segurança pós-reinício.
+    const _prof = depth; // mantém a contagem de passos (senão um fluxo em círculo nunca para)
     if (waitMs <= 120000) {
       // "digitando…" para o lead enquanto o cronômetro roda, se o PRÓXIMO passo é uma mensagem
       let typingTimer = null;
@@ -4671,7 +4759,7 @@ async function processNode(run, depth=0) {
           const nxt = await getNextNodeId(nodeId, null);
           if (nxt) {
             await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId);
-            await processNode({ ...run, current_node_id:nxt, status:'running' });
+            await processNode({ ...run, current_node_id:nxt, status:'running' }, _prof + 1);
           } else {
             await stopRun(runId,'completed');
           }
@@ -4866,11 +4954,22 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
 // Timer: retoma runs pausadas/expiradas do bot.
 // 30s (era 5s) — economiza CPU/banda no Railway; as esperas dos bots são de
 // minutos/horas, então até 30s de folga não muda nada na prática.
+let _retomaOcupado = false;
 setInterval(async () => {
-  if (!supabase) return;
+  if (!supabase || _retomaOcupado) return; // um ciclo por vez (senão o mesmo passo rodava 2x)
+  _retomaOcupado = true;
+  try {
   const now = new Date().toISOString();
   const { data:paused } = await supabase.from('bot_runs').select('*').in('status',['paused','waiting_reply']).lte('pause_until',now).not('pause_until','is',null);
   for (const run of paused||[]) {
+    // 🔒 CLAIM: só continua quem conseguir "pegar" a execução (evita o mesmo passo
+    // sair duas vezes quando o cronômetro curto e este ciclo se cruzam)
+    const { data: pego } = await supabase.from('bot_runs')
+      .update({ pause_until: null, updated_at: new Date().toISOString() })
+      .eq('id', run.id).eq('status', run.status).not('pause_until', 'is', null).select('id');
+    if (!pego || !pego.length) continue;
+    const _devolve = async () => { try { await supabase.from('bot_runs').update({ pause_until: run.pause_until }).eq('id', run.id).eq('status', run.status); } catch (_) {} };
+    try {
     // EXPIRADA: se a hora de retomar passou há mais de 15 min (servidor reiniciou,
     // execução esquecida), NÃO envia nada "do nada" — encerra em silêncio.
     if (Date.now() - new Date(run.pause_until).getTime() > 15*60000) { await stopRun(run.id,'stopped'); continue; }
@@ -4881,10 +4980,15 @@ setInterval(async () => {
       await processNode({...run, status:'running'});
       continue;
     }
-    const nxt = await getNextNodeId(run.current_node_id,'__timeout__') || await getNextNodeId(run.current_node_id,'__other__') || await getNextNodeId(run.current_node_id,null);
+    // Só as saídas de "sem resposta". Sem elas desenhadas, a execução ENCERRA —
+    // antes ela seguia pela primeira seta qualquer (quem não respondeu ia pelo "Sim")
+    const nxt = await getNextNodeId(run.current_node_id, '__timeout__') || await getNextNodeId(run.current_node_id, '__other__');
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, status:'running', pause_until:null, updated_at:now }).eq('id',run.id); await processNode({...run,current_node_id:nxt,status:'running'}); }
     else { await stopRun(run.id,'completed'); }
+    } catch (e) { console.error('⏰ retomada de uma execução:', e.message); await _devolve(); }
   }
+  } catch (e) { console.error('⏰ retomada de bots:', e.message); }
+  finally { _retomaOcupado = false; }
 }, 30000);
 
 // ═══════════════════════════════════════════════════════════════════
@@ -5028,7 +5132,7 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
   const delayMs = Math.max(0, (Number.isFinite(delaySec) ? delaySec : 25) * 1000);
   setTimeout(async () => {
     try {
-      const wamid = await sendBotMsg(phone, acct, m.faq.answer, owner);
+      const wamid = await sendBotMsg(phone, acct, m.faq.answer, owner, acct || await _acctPadraoDoLead(phone, owner));
       if (!wamid) {
         // envio falhou: remove a reserva para permitir nova tentativa numa próxima mensagem
         await supabase.from('faq_replies').delete()
@@ -5264,7 +5368,7 @@ async function handleWrongPerson(phone, text, owner, accountId) {
 
   setTimeout(async () => {
     try {
-      const wamid = await sendBotMsg(phone, acct, answer, owner);
+      const wamid = await sendBotMsg(phone, acct, answer, owner, acct || await _acctPadraoDoLead(phone, owner));
       if (!wamid) {
         await supabase.from('faq_replies').delete()
           .eq('owner', owner || null).eq('phone', phone).eq('faq_id', WRONGPERSON_FAQ_ID);
@@ -5421,8 +5525,9 @@ app.put('/bots/:id/flow', async (req,res) => {
     await supabase.from('bot_nodes').delete().eq('bot_id',botId);
     if (nodes?.length) { const { error:ne } = await supabase.from('bot_nodes').insert(nodes.map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0), owner:req.owner||null }))); if (ne) throw ne; }
     if (edges?.length) { const { error:ee } = await supabase.from('bot_edges').insert(edges.map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'', owner:req.owner||null }))); if (ee) throw ee; }
+    _botGraphLimpa(); // limpa de novo DEPOIS de gravar (o fluxo novo entra em vigor na hora)
     res.json({success:true});
-  } catch(err) { res.status(500).json({error:err.message}); }
+  } catch(err) { _botGraphLimpa(); res.status(500).json({error:err.message}); }
 });
 // Duplicar um bot (copia config, nós e arestas com novos ids)
 app.post('/bots/:id/duplicate', async (req,res) => {
@@ -6393,7 +6498,9 @@ async function initEmbeddedWa() {
   const _avatarSweep = async () => {
     try {
       if (!anyOpenWaInstance()) {
-        if (++_sweepTries < 10) setTimeout(_avatarSweep, 20000);
+        // Nenhum número conectado agora: tenta de novo em 20s e, depois de 10
+        // tentativas, volta a conferir a cada 6h (antes a varredura morria de vez)
+        setTimeout(_avatarSweep, ++_sweepTries < 10 ? 20000 : 6 * 3600000);
         return;
       }
       const { data: rows } = await supabase.from('contacts')
@@ -6617,11 +6724,15 @@ app.post('/accounts/:id/reconnect-qr', async (req, res) => {
 
 // POST /evolution/save-account — salva conta Evolution no Supabase após conexão
 app.post('/evolution/save-account', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   const { instance, phone } = req.body;
   if (!instance) return res.status(400).json({ error: 'instance obrigatório' });
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
-  // Se a conta já existe (reconexão), PRESERVA o nome personalizado
-  const { data: exist } = await supabase.from('accounts').select('name').eq('phone_number_id', instance).maybeSingle();
+  // Se a conta já existe (reconexão), PRESERVA o nome personalizado — e ela
+  // precisa ser SUA (senão qualquer um sobrescreveria a conta de outra pessoa)
+  const { data: exist } = await supabase.from('accounts').select('name, owner').eq('phone_number_id', instance).maybeSingle();
+  if (exist && exist.owner && String(exist.owner).toLowerCase() !== String(req.owner).toLowerCase())
+    return res.status(403).json({ error: 'Este número pertence a outra conta.' });
   const name = exist?.name || (phone ? `WhatsApp ${phone}` : `WhatsApp QR (${instance})`);
   const { data, error } = await supabase.from('accounts')
     .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '', owner: req.owner || null }, { onConflict: 'phone_number_id' })
@@ -6633,7 +6744,14 @@ app.post('/evolution/save-account', async (req, res) => {
 
 // DELETE /evolution/disconnect/:instance
 app.delete('/evolution/disconnect/:instance', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   const inst = req.params.instance;
+  // Só desconecta um número SEU
+  try {
+    const { data: dono } = await supabase.from('accounts').select('owner').eq('evolution_instance', inst).maybeSingle();
+    if (dono && dono.owner && String(dono.owner).toLowerCase() !== String(req.owner).toLowerCase())
+      return res.status(403).json({ error: 'Este número pertence a outra conta.' });
+  } catch (_) {}
   if (WA_EMBEDDED) {
     try {
       const sock = _waSocks[inst];
@@ -6645,14 +6763,14 @@ app.delete('/evolution/disconnect/:instance', async (req, res) => {
       delete _waState[inst]; delete _waPhone[inst]; delete qrCache[inst];
       if (supabase) {
         await supabase.from('wa_sessions').delete().eq('instance', inst);
-        await supabase.from('accounts').delete().eq('evolution_instance', inst);
+        await supabase.from('accounts').delete().eq('evolution_instance', inst).eq('owner', req.owner || ' ');
       }
       return res.json({ success: true });
     } catch (e) { return res.status(500).json({ error: e.message }); }
   }
   try {
     await axios.delete(`${EVOLUTION_URL}/instance/delete/${inst}`, { headers: evoHdr(), timeout: 10000 });
-    if (supabase) await supabase.from('accounts').delete().eq('evolution_instance', inst);
+    if (supabase) await supabase.from('accounts').delete().eq('evolution_instance', inst).eq('owner', req.owner || ' ');
     res.json({ success: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
