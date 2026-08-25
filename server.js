@@ -80,7 +80,14 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 222;
+const SERVER_VER = 224;
+// Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
+// "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
+function _contasCompartilhadas() {
+  let apelidos = 0;
+  try { apelidos = Object.keys(JSON.parse(_settings['owner_aliases'] || '{}')).length; } catch (_) {}
+  return { login_compartilhado: !!_settings['owner_default'], apelidos_de_login: apelidos };
+}
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -98,7 +105,7 @@ app.get('/versao', async (req, res) => {
       copias = tot;
     }
   } catch (_) {}
-  res.json({ server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3),
+  res.json({ contas: _contasCompartilhadas(), server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3),
     copias_6meses: copias, cofre_ultimo_ok: _cofreUltimoOk, cofre_ultimo_erro: _cofreUltimoErro,
     // 📦 Espaço do Storage (última medição da faxina) — o plano grátis do Supabase dá 1 GB
     storage_mb: (_espacoCache ? _espacoCache.mb : null),
@@ -2866,13 +2873,24 @@ async function _dripTick() {
         // (edição/pausa no mesmo instante, redeploy), nunca move antes de min_seg do último
         const _minGuard = _dripMinMax(r).minS * 1000;
         if (r.last && r.last.quando && !r.last.vazio && (Date.now() - new Date(r.last.quando).getTime()) < _minGuard) continue;
-        // 🔒 Confere no BANCO antes de mover (protege contra dois servidores ao mesmo
-        // tempo durante um deploy do Railway: se outro já agendou o próximo, este pula)
+        // 🔒 PALAVRA FINAL É DO BANCO. Relê a regra agora mesmo e só move se ELA
+        // ainda estiver ligada. Isso resolve dois casos reais:
+        //  • você desligou o Automático e a memória deste servidor ainda estava velha;
+        //  • dois servidores no ar durante um deploy (um já agendou o próximo).
         try {
           const { data: fresco } = await supabase.from('settings').select('value').eq('key', 'drip_rules::' + owner).maybeSingle();
           const rf = fresco && fresco.value ? (JSON.parse(fresco.value) || []).find(x => x.id === r.id) : null;
-          if (rf && rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; r.last = rf.last || r.last; r.movidos = rf.movidos || r.movidos; continue; }
-        } catch (_) {}
+          if (!rf) { r.manual = false; r.agendado = false; continue; } // regra apagada
+          // Espelha o estado real do banco na cópia da memória
+          r.manual = !!rf.manual; r.agendado = !!rf.agendado; r.parado_ate = rf.parado_ate || null;
+          r.de = rf.de || r.de; r.para = rf.para || r.para;
+          r.min_seg = rf.min_seg || r.min_seg; r.max_seg = rf.max_seg || r.max_seg; r.numeros = rf.numeros || r.numeros;
+          r.dias = Array.isArray(rf.dias) ? rf.dias : r.dias; r.hora_ini = rf.hora_ini || ''; r.hora_fim = rf.hora_fim || '';
+          r.movidos = rf.movidos || 0; r.last = rf.last || r.last; r.reset_seq = rf.reset_seq || 0;
+          const ligadaAgora = !!rf.manual || (!!rf.agendado && _dripDentroDaJanela(r));
+          if (!ligadaAgora) { mudou = true; continue; } // DESLIGADA no banco: não move nada
+          if (rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; continue; }
+        } catch (e) { console.error('⏳ leitura de segurança do gotejamento:', e.message); continue; }
         // 1) agenda o PRÓXIMO e grava JÁ (antes de mover) — se cair no meio, não repete
         const { minS, maxS } = _dripMinMax(r); // já dividido pela quantidade de números
         const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
@@ -2891,8 +2909,8 @@ async function _dripTick() {
         if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), vazio: true }; continue; }
         try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
         r.movidos = (r.movidos || 0) + 1;
-        r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera };
-        console.log(`⏳ Gotejamento "${r.nome || r.id}": ${lead.phone} movido; próximo em ${espera}s`);
+        r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
+        console.log(`⏳ Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
       }
       if (mudou) await _dripSalvaProgresso(owner, regras);
     } catch (e) { console.error('⏳ drip:', e.message); }
@@ -2923,10 +2941,18 @@ app.get('/drip', async (req, res) => {
 app.put('/drip', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
-  const novas = Array.isArray(req.body && req.body.regras) ? req.body.regras : null;
+  // Modo 1 regra: mexe SÓ nela e mantém as outras exatamente como estão no banco.
+  // (Antes a tela mandava a lista inteira; se ela estivesse desatualizada, um
+  // ligar/desligar podia RESSUSCITAR o estado antigo de outra regra.)
+  const umaSo = req.body && req.body.regra && req.body.regra.id ? req.body.regra : null;
+  const guardadas = _dripRegras(req.owner);
+  const novas = umaSo
+    ? guardadas.map(x => (String(x.id) === String(umaSo.id) ? Object.assign({}, x, umaSo) : x))
+    : (Array.isArray(req.body && req.body.regras) ? req.body.regras : null);
+  if (umaSo && !guardadas.some(x => String(x.id) === String(umaSo.id))) novas.push(umaSo);
   if (!novas) return res.status(400).json({ error: 'regras[] obrigatório' });
   if (novas.length > 50) return res.status(400).json({ error: 'Máximo de 50 regras.' });
-  const antigas = _dripRegras(req.owner);
+  const antigas = guardadas;
   // 🔒 As etapas precisam ser DESTA conta (nada de mover leads para etapa de outro dono)
   let idsValidos = null;
   try {
