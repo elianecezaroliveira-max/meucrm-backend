@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 217;
+const SERVER_VER = 219;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2724,7 +2724,12 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
   for (const r of regrasDoTick) {
     const a = atuais.find(x => x.id === r.id);
     if (!a) continue;
-    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; if (r.manual === false && a.manual) a.manual = false;
+    // 🛑 Você mexeu na regra enquanto o robô movia (Parar/zerar/editar): a SUA
+    // alteração vence — o robô não regrava o contador nem o "último movido".
+    if (Number(a.reset_seq || 0) !== Number(r.reset_seq || 0)) { if (r.manual === false && a.manual) a.manual = false; continue; }
+    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos;
+    if (r.manual === false && a.manual) a.manual = false;
+    if (r.agendado === false && a.agendado) { a.agendado = false; a.ativo = false; }
   }
   await _dripSalva(owner, atuais);
 }
@@ -2743,7 +2748,14 @@ function _dripDentroDaJanela(r) {
   if (a != null && b != null) return a <= b ? (hm >= a && hm < b) : (hm >= a || hm < b);
   // só "começa às": a partir daquela hora segue até esvaziar a fila (varando a madrugada);
   // se a fila estiver vazia às 00:00 e chegar lead novo, espera a hora de começar
-  if (a != null) { if (hm >= a) return true; return !!(r.last && r.last.quando && (Date.now() - new Date(r.last.quando).getTime()) < 30 * 60000 && !r.last.vazio); }
+  if (a != null) {
+    if (hm >= a) return true;
+    // Antes da hora de começar: só continua se AINDA está no meio de uma fila que
+    // varou a madrugada. A folga acompanha o intervalo da regra (o fixo de 30 min
+    // cortava filas com intervalo maior, ex.: 35–50 min).
+    const folga = Math.max(30 * 60000, _dripMinMax(r).maxS * 2000 + 120000);
+    return !!(r.last && r.last.quando && (Date.now() - new Date(r.last.quando).getTime()) < folga && !r.last.vazio);
+  }
   return hm < b;
 }
 // 📱 Quantos NÚMEROS o bot da etapa de destino usa: o intervalo é DIVIDIDO por
@@ -2757,6 +2769,17 @@ function _dripMinMax(r) {
   const maxS = Math.max(minS, Math.round((Math.max(1, Number(r.max_seg) || 300)) / div));
   return { minS, maxS };
 }
+// Etapas existentes do dono (cache de 60s): o gotejamento NUNCA move um lead para
+// uma etapa apagada (o lead sumiria do quadro)
+const _dripStagesCache = {};
+async function _dripEtapasDoDono(owner) {
+  const c = _dripStagesCache[owner];
+  if (c && Date.now() - c.ts < 60000) return c.set;
+  const { data } = await supabase.from('pipeline_stages').select('id').eq('owner', owner);
+  const set = new Set((data || []).map(x => String(x.id)));
+  _dripStagesCache[owner] = { set, ts: Date.now() };
+  return set;
+}
 const _dripLock = new Set();
 async function _dripTick() {
   if (!supabase) return;
@@ -2768,8 +2791,18 @@ async function _dripTick() {
     try {
       const regras = _dripRegras(owner);
       let mudou = false;
+      const etapas = await _dripEtapasDoDono(owner);
       for (const r of regras) {
         if (!r.de || !r.para || r.de === r.para) continue;
+        // Etapa apagada (origem ou destino): a regra PARA sozinha e avisa
+        if (etapas.size && (!etapas.has(String(r.de)) || !etapas.has(String(r.para)))) {
+          if (r.manual || r.agendado) {
+            r.manual = false; r.agendado = false; r.ativo = false; mudou = true;
+            r.last = { quando: new Date().toISOString(), erro: 'Etapa da regra foi apagada — gotejamento desligado' };
+            try { addNotice(owner, `⏳ O gotejamento "${r.nome || r.id}" foi DESLIGADO: uma das etapas dele foi apagada.`, 'drip-etapa:' + r.id); } catch (_) {}
+          }
+          continue;
+        }
         // Roda se: ▶ iniciado à mão (ignora dia/horário, até esvaziar ou pausar)
         //      ou: 🕐 automático ligado E dentro dos dias/horários
         const rodaManual = !!r.manual;
@@ -2840,7 +2873,15 @@ app.put('/drip', async (req, res) => {
   if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
   const novas = Array.isArray(req.body && req.body.regras) ? req.body.regras : null;
   if (!novas) return res.status(400).json({ error: 'regras[] obrigatório' });
+  if (novas.length > 50) return res.status(400).json({ error: 'Máximo de 50 regras.' });
   const antigas = _dripRegras(req.owner);
+  // 🔒 As etapas precisam ser DESTA conta (nada de mover leads para etapa de outro dono)
+  let idsValidos = null;
+  try {
+    const { data: sts } = await supabase.from('pipeline_stages').select('id').eq('owner', req.owner);
+    if (Array.isArray(sts)) idsValidos = new Set(sts.map(x => String(x.id)));
+  } catch (_) {}
+  const _hhmm = v => (/^([01]?\d|2[0-3]):[0-5]\d$/.test(String(v || '')) ? String(v) : '');
   const limpas = novas.map(r => {
     const a = antigas.find(x => x.id === r.id) || {};
     const minN = Math.max(1, parseInt(r.min_seg, 10) || 210), maxN = Math.max(minN, Math.max(1, parseInt(r.max_seg, 10) || 300));
@@ -2856,17 +2897,18 @@ app.put('/drip', async (req, res) => {
       id: String(r.id || ('drip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7))),
       nome: String(r.nome || '').slice(0, 60),
       de: String(r.de || ''), para: String(r.para || ''),
+      reset_seq: Number(a.reset_seq || 0) + (r.zerar_movidos ? 1 : 0),
       min_seg: minN, max_seg: maxN, numeros: numN,
       manual: !!r.manual,
       agendado: (r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo),
       ativo: !!r.manual || ((r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo)),
-      hora_ini: String(r.hora_ini || ''), hora_fim: String(r.hora_fim || ''),
+      hora_ini: _hhmm(r.hora_ini), hora_fim: _hhmm(r.hora_fim),
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: nextAt, // mantém o próximo horário (pausar/ligar não encurta o intervalo); intervalo novo → recalculado
       parado_ate: (r.parado_ate && !isNaN(Date.parse(r.parado_ate)) && Date.parse(r.parado_ate) > Date.now()) ? new Date(r.parado_ate).toISOString() : null,
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
     };
-  }).filter(r => r.de && r.para);
+  }).filter(r => r.de && r.para && r.de !== r.para && (!idsValidos || (idsValidos.has(r.de) && idsValidos.has(r.para))));
   await _dripSalva(req.owner, limpas);
   res.json({ ok: true, regras: limpas });
 });
@@ -3487,6 +3529,18 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
       await _stageTrashSalva(req.owner, lixo);
     }
   } catch (e) { console.error('lixeira de coluna:', e.message); }
+  // ⏳ Gotejamentos que usavam esta etapa são DESLIGADOS (senão continuariam
+  // mandando leads para uma etapa que não existe mais)
+  try {
+    const regras = _dripRegras(req.owner);
+    let mexeu = false;
+    for (const r of regras) {
+      if (String(r.de) !== String(req.params.id) && String(r.para) !== String(req.params.id)) continue;
+      if (r.manual || r.agendado) { r.manual = false; r.agendado = false; r.ativo = false; mexeu = true; }
+    }
+    if (mexeu) { await _dripSalva(req.owner, regras); addNotice(req.owner, `⏳ Gotejamento(s) que usavam a etapa "${st?.name || ''}" foram desligados.`, 'drip-del:' + req.params.id); }
+    delete _dripStagesCache[req.owner];
+  } catch (e) { console.error('drip pós-exclusão de etapa:', e.message); }
   res.json({ success: true, leads_movidos: (leads || []).length });
 });
 // Lixeira de colunas
@@ -3513,6 +3567,7 @@ app.post('/pipeline/stages/restore', async (req, res) => {
     devolvidos += (data || []).length;
   }
   await _stageTrashSalva(req.owner, lixo.filter(x => x !== item));
+  try { delete _dripStagesCache[req.owner]; } catch (_) {} // a etapa voltou: o gotejamento a enxerga na hora
   console.log(`♻️ Coluna restaurada: ${st.name} (${devolvidos} leads de volta)`);
   res.json({ ok: true, stage: st, leads_devolvidos: devolvidos });
 });
