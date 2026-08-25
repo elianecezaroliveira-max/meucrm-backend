@@ -68,7 +68,7 @@ app.use(async (req, res, next) => {
 
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 216;
+const SERVER_VER = 217;
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -2746,6 +2746,17 @@ function _dripDentroDaJanela(r) {
   if (a != null) { if (hm >= a) return true; return !!(r.last && r.last.quando && (Date.now() - new Date(r.last.quando).getTime()) < 30 * 60000 && !r.last.vazio); }
   return hm < b;
 }
+// 📱 Quantos NÚMEROS o bot da etapa de destino usa: o intervalo é DIVIDIDO por
+// eles, para que CADA número mantenha o ritmo que você configurou.
+// Ex.: 35–50 min com 2 números → um lead a cada 17,5–25 min (cada número volta a
+// enviar só depois de 35–50 min).
+function _dripDiv(r) { const n = parseInt(r && r.numeros, 10); return (n >= 1 && n <= 20) ? n : 1; }
+function _dripMinMax(r) {
+  const div = _dripDiv(r);
+  const minS = Math.max(1, Math.round((Math.max(1, Number(r.min_seg) || 210)) / div));
+  const maxS = Math.max(minS, Math.round((Math.max(1, Number(r.max_seg) || 300)) / div));
+  return { minS, maxS };
+}
 const _dripLock = new Set();
 async function _dripTick() {
   if (!supabase) return;
@@ -2768,7 +2779,7 @@ async function _dripTick() {
         if (nx > Date.now()) continue;
         // 🛡️ Garantia absoluta do intervalo mínimo: mesmo que o agendamento se perca
         // (edição/pausa no mesmo instante, redeploy), nunca move antes de min_seg do último
-        const _minGuard = Math.max(1, Number(r.min_seg) || 210) * 1000;
+        const _minGuard = _dripMinMax(r).minS * 1000;
         if (r.last && r.last.quando && !r.last.vazio && (Date.now() - new Date(r.last.quando).getTime()) < _minGuard) continue;
         // 🔒 Confere no BANCO antes de mover (protege contra dois servidores ao mesmo
         // tempo durante um deploy do Railway: se outro já agendou o próximo, este pula)
@@ -2778,7 +2789,7 @@ async function _dripTick() {
           if (rf && rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; r.last = rf.last || r.last; r.movidos = rf.movidos || r.movidos; continue; }
         } catch (_) {}
         // 1) agenda o PRÓXIMO e grava JÁ (antes de mover) — se cair no meio, não repete
-        const minS = Math.max(1, Number(r.min_seg) || 210), maxS = Math.max(minS, Number(r.max_seg) || 300);
+        const { minS, maxS } = _dripMinMax(r); // já dividido pela quantidade de números
         const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
         r.next_at = new Date(Date.now() + espera * 1000).toISOString();
         await _dripSalvaProgresso(owner, regras);
@@ -2833,17 +2844,19 @@ app.put('/drip', async (req, res) => {
   const limpas = novas.map(r => {
     const a = antigas.find(x => x.id === r.id) || {};
     const minN = Math.max(1, parseInt(r.min_seg, 10) || 210), maxN = Math.max(minN, Math.max(1, parseInt(r.max_seg, 10) || 300));
-    // Mudou o intervalo → o PRÓXIMO já obedece o novo (recalcula a partir do último movimento)
+    const numN = (() => { const n = parseInt(r.numeros, 10); return (n >= 1 && n <= 20) ? n : ((a.numeros >= 1 && a.numeros <= 20) ? a.numeros : 1); })();
+    // Mudou o intervalo (ou a quantidade de números) → o PRÓXIMO já obedece o novo
     let nextAt = a.next_at || null;
-    if (a.id && (Number(a.min_seg) !== minN || Number(a.max_seg) !== maxN)) {
+    if (a.id && (Number(a.min_seg) !== minN || Number(a.max_seg) !== maxN || Number(a.numeros || 1) !== numN)) {
       const base = (a.last && a.last.quando && !a.last.vazio) ? new Date(a.last.quando).getTime() : null;
-      nextAt = base ? new Date(base + (Math.floor(Math.random() * (maxN - minN + 1)) + minN) * 1000).toISOString() : null;
+      const mm = _dripMinMax({ min_seg: minN, max_seg: maxN, numeros: numN });
+      nextAt = base ? new Date(base + (Math.floor(Math.random() * (mm.maxS - mm.minS + 1)) + mm.minS) * 1000).toISOString() : null;
     }
     return {
       id: String(r.id || ('drip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7))),
       nome: String(r.nome || '').slice(0, 60),
       de: String(r.de || ''), para: String(r.para || ''),
-      min_seg: minN, max_seg: maxN,
+      min_seg: minN, max_seg: maxN, numeros: numN,
       manual: !!r.manual,
       agendado: (r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo),
       ativo: !!r.manual || ((r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo)),
