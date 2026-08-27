@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 232;
+const SERVER_VER = 233;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2079,9 +2079,9 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   // A checagem agora é DIRETA (baixa a cópia): a busca por lista falhava às
   // vezes e o arquivo guardado era ignorado — parecia "sumido" antes da hora.
   // 🔒 Anexo de NOTA INTERNA: só o dono da nota vê
-  if (String(mediaId).startsWith('notas/')) {
-    const marca = Buffer.from(String(req.owner || '')).toString('hex').slice(0, 24);
-    if (!req.owner || String(mediaId).split('/')[1] !== marca) return res.status(403).json({ error: 'Nota de outra conta' });
+  if (String(mediaId).startsWith('notas/') && req.owner) {
+    const marca = Buffer.from(String(req.owner)).toString('hex').slice(0, 24);
+    if (String(mediaId).split('/')[1] !== marca) return res.status(403).json({ error: 'Nota de outra conta' });
   }
   let _servirDe = (mediaId.startsWith('qr/') || mediaId.startsWith('notas/') || mediaId.startsWith('bot/')) ? mediaId : null;
   let _blobCopia = null;
@@ -3431,13 +3431,13 @@ app.post("/notes", async (req, res) => {
   if (arquivo) {
     try {
       const buf = Buffer.from(String(arquivo).replace(/^data:[^,]+,/, ''), 'base64');
-      if (buf.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'Arquivo muito grande (máx. 12 MB)' });
+      if (buf.length > 16 * 1024 * 1024) return res.status(400).json({ error: 'Arquivo muito grande (máx. 16 MB)' });
       mediaMime = String(mime || 'application/octet-stream').split(';')[0].toLowerCase();
       const ext = (String(filename || '').match(/\.([a-z0-9]{1,6})$/i) || [])[1] || (mediaMime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '');
       const pasta = 'notas/' + Buffer.from(String(req.owner || 'x')).toString('hex').slice(0, 24);
       mediaId = `${pasta}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const { error: upErr } = await supabase.storage.from('wa-media').upload(mediaId, buf, { contentType: mediaMime, upsert: false });
-      if (upErr) return res.status(500).json({ error: 'Não consegui guardar o arquivo da nota: ' + upErr.message });
+      if (upErr) { console.error('❌ Anexo da nota:', upErr.message); return res.status(500).json({ error: 'Não consegui guardar o arquivo da nota: ' + upErr.message }); }
     } catch (e) { return res.status(400).json({ error: 'Arquivo inválido' }); }
   }
   const { data, error } = await supabase.from("messages").insert({
