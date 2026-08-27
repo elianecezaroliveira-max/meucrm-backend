@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3000;
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-  console.log("✅ Supabase conectado!");
+  console.log("Supabase conectado!");
 }
 
 // ── Multi-tenant: identifica o usuário logado (dono) a partir do token do Supabase ──
@@ -68,8 +68,8 @@ app.use(async (req, res, next) => {
 
 // 🛡️ REDE DE SEGURANÇA: uma falha inesperada dentro de uma rota (ex.: dado
 // estranho vindo de fora) só vira log — nunca derruba o CRM inteiro.
-process.on('unhandledRejection', (e) => console.error('⚠️ Falha não tratada:', (e && e.message) || e));
-process.on('uncaughtException', (e) => console.error('⚠️ Erro não tratado:', (e && e.stack) || e));
+process.on('unhandledRejection', (e) => console.error('Falha não tratada:', (e && e.message) || e));
+process.on('uncaughtException', (e) => console.error('Erro não tratado:', (e && e.stack) || e));
 // Exige estar logado (ou usar o token de integração) — usada nas rotas sensíveis
 // Decodifica sem quebrar: "%zz" derrubava a rota (e o processo)
 function _decSeguro(v) { try { return decodeURIComponent(String(v == null ? '' : v)); } catch (_) { return String(v == null ? '' : v); } }
@@ -78,9 +78,9 @@ function _exigeLogin(req, res) {
   res.status(401).json({ error: 'Faça login no CRM' });
   return false;
 }
-app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
+app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 233;
+const SERVER_VER = 234;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -152,7 +152,7 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ Webhook verificado!");
+    console.log("Webhook verificado!");
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
@@ -343,7 +343,7 @@ function _assinaturaMetaOk(req) {
 app.post("/webhook", async (req, res) => {
   const okSig = _assinaturaMetaOk(req);
   if (okSig === false) {
-    console.warn('🔏 Webhook da Meta com assinatura INVÁLIDA' + (process.env.WEBHOOK_STRICT === '1' ? ' — rejeitado' : ' — aceito (modo aviso; defina WEBHOOK_STRICT=1 para rejeitar)'));
+    console.warn('Webhook da Meta com assinatura INVÁLIDA' + (process.env.WEBHOOK_STRICT === '1' ? ' — rejeitado' : ' — aceito (modo aviso; defina WEBHOOK_STRICT=1 para rejeitar)'));
     if (process.env.WEBHOOK_STRICT === '1') return res.sendStatus(401);
   }
   // Responde 200 IMEDIATAMENTE — se a resposta demorar, a Meta reenvia o webhook
@@ -353,10 +353,10 @@ app.post("/webhook", async (req, res) => {
     const body = req.body;
 
     // Log para debug - mostra o que chegou
-    console.log("📩 Webhook recebido:", JSON.stringify(body).substring(0, 300));
+    console.log("Webhook recebido:", JSON.stringify(body).substring(0, 300));
 
     if (body.object !== "whatsapp_business_account") {
-      console.log("⚠️ Objeto ignorado:", body.object);
+      console.log("Objeto ignorado:", body.object);
       return;
     }
 
@@ -391,20 +391,20 @@ app.post("/webhook", async (req, res) => {
             const ev = String(value?.event || '').toUpperCase();
             const motivo = value?.reason && String(value.reason).toUpperCase() !== 'NONE' ? ` — motivo: ${value.reason}` : '';
             const mapa = {
-              APPROVED: `✅ Modelo APROVADO pela Meta: ${modelo}${sufixo} — já pode ser usado.`,
-              REJECTED: `❌ Modelo REPROVADO pela Meta: ${modelo}${sufixo}${motivo}`,
-              PAUSED: `⏸ Modelo PAUSADO pela Meta: ${modelo}${sufixo}${motivo}`,
-              DISABLED: `🚫 Modelo DESATIVADO pela Meta: ${modelo}${sufixo}${motivo}`,
-              PENDING_DELETION: `🗑 Modelo marcado para EXCLUSÃO: ${modelo}${sufixo}`,
-              FLAGGED: `⚠️ Modelo SINALIZADO pela Meta (qualidade baixa): ${modelo}${sufixo}${motivo}`,
-              IN_APPEAL: `📨 Recurso do modelo em análise: ${modelo}${sufixo}`,
-              PENDING: `⏳ Modelo em análise: ${modelo}${sufixo}`
+              APPROVED: `Modelo APROVADO pela Meta: ${modelo}${sufixo} — já pode ser usado.`,
+              REJECTED: `Modelo REPROVADO pela Meta: ${modelo}${sufixo}${motivo}`,
+              PAUSED: `Modelo PAUSADO pela Meta: ${modelo}${sufixo}${motivo}`,
+              DISABLED: `Modelo DESATIVADO pela Meta: ${modelo}${sufixo}${motivo}`,
+              PENDING_DELETION: `Modelo marcado para EXCLUSÃO: ${modelo}${sufixo}`,
+              FLAGGED: `Modelo SINALIZADO pela Meta (qualidade baixa): ${modelo}${sufixo}${motivo}`,
+              IN_APPEAL: `Recurso do modelo em análise: ${modelo}${sufixo}`,
+              PENDING: `Modelo em análise: ${modelo}${sufixo}`
             };
             txt = mapa[ev] || `ℹ️ Modelo ${modelo}: ${ev || 'atualização'}${sufixo}${motivo}`;
           } else if (change.field === 'template_category_update') {
-            txt = `🏷 Categoria do modelo ${modelo} alterada pela Meta: ${value?.previous_category || '?'} → ${value?.new_category || '?'}${sufixo}`;
+            txt = `Categoria do modelo ${modelo} alterada pela Meta: ${value?.previous_category || '?'} → ${value?.new_category || '?'}${sufixo}`;
           } else {
-            txt = `📶 Qualidade do modelo ${modelo}: ${value?.previous_quality_score || '?'} → ${value?.new_quality_score || '?'}${sufixo}`;
+            txt = `Qualidade do modelo ${modelo}: ${value?.previous_quality_score || '?'} → ${value?.new_quality_score || '?'}${sufixo}`;
           }
           if (txt) addNotice(ownerN, txt, 'tmpl:' + change.field + ':' + wabaId + ':' + tName + ':' + (value?.event || value?.new_category || value?.new_quality_score || ''));
         } catch (e) { console.error('Evento de modelo Meta:', e.message); }
@@ -426,18 +426,18 @@ app.post("/webhook", async (req, res) => {
           if (change.field === 'account_review_update') {
             const d = String(value?.decision || '').toUpperCase();
             txt = d === 'APPROVED'
-              ? `✅ ANÁLISE DA META APROVADA${sufixo} — a conta foi liberada!`
+              ? `ANÁLISE DA META APROVADA${sufixo} — a conta foi liberada!`
               : d === 'REJECTED'
-                ? `❌ ANÁLISE DA META REJEITADA${sufixo} — o recurso foi negado.`
+                ? `ANÁLISE DA META REJEITADA${sufixo} — o recurso foi negado.`
                 : `ℹ️ Atualização da análise da Meta${sufixo}: ${d || 'sem detalhes'}`;
           } else if (change.field === 'account_update') {
             const ev = String(value?.event || '').toUpperCase();
             const mapaEv = {
-              DISABLED_UPDATE: '🚫 Conta DESATIVADA pela Meta',
-              ACCOUNT_RESTRICTION: '⚠️ Conta RESTRINGIDA pela Meta',
-              ACCOUNT_VIOLATION: '⚠️ Violação de política registrada pela Meta',
-              ACCOUNT_DELETED: '🗑 Conta EXCLUÍDA na Meta',
-              VERIFIED_ACCOUNT: '✅ Conta VERIFICADA pela Meta'
+              DISABLED_UPDATE: 'Conta DESATIVADA pela Meta',
+              ACCOUNT_RESTRICTION: 'Conta RESTRINGIDA pela Meta',
+              ACCOUNT_VIOLATION: 'Violação de política registrada pela Meta',
+              ACCOUNT_DELETED: 'Conta EXCLUÍDA na Meta',
+              VERIFIED_ACCOUNT: 'Conta VERIFICADA pela Meta'
             };
             const extra = value?.ban_info?.waba_ban_state ? ` — estado: ${value.ban_info.waba_ban_state}` : '';
             // Eventos técnicos de bastidor (parceiro instalado, termos assinados, número
@@ -448,7 +448,7 @@ app.post("/webhook", async (req, res) => {
             else txt = 'ℹ️ Atualização da conta na Meta: ' + ev + sufixo + extra;
           } else {
             const ev = String(value?.event || '');
-            txt = `📶 Qualidade do número atualizada${sufixo}: ${ev}${value?.current_limit ? ` — limite de envio: ${value.current_limit}` : ''}`;
+            txt = `Qualidade do número atualizada${sufixo}: ${ev}${value?.current_limit ? ` — limite de envio: ${value.current_limit}` : ''}`;
           }
           if (txt) addNotice(ownerN, txt, 'meta:' + change.field + ':' + wabaId + ':' + (value?.decision || value?.event || ''));
         } catch (e) { console.error('Evento de conta Meta:', e.message); }
@@ -463,7 +463,7 @@ app.post("/webhook", async (req, res) => {
             const upd = { status };
             if (status === 'failed') {
               upd.error_info = metaErrorText(st.errors?.[0]);
-              console.error('❌ Entrega falhou:', wamid, upd.error_info);
+              console.error('Entrega falhou:', wamid, upd.error_info);
             }
             _cachePendingStatus(wamid, upd); // guarda caso a msg ainda não esteja salva
             await updateMsgStatus(wamid, upd);
@@ -501,7 +501,7 @@ app.post("/webhook", async (req, res) => {
               await q;
             }
           } catch (_) {} }
-          console.log(`😀 Reação ${emoji||'(removida)'} em ${targetWamid}`);
+          console.log(`Reação ${emoji||'(removida)'} em ${targetWamid}`);
         }
         continue;
       }
@@ -512,7 +512,7 @@ app.post("/webhook", async (req, res) => {
         if (dupe) { console.log("↩️ Webhook duplicado ignorado:", message.id); continue; }
       }
 
-      console.log(`📨 Mensagem de ${name} (${from}) via número ${phoneNumberId}`);
+      console.log(`Mensagem de ${name} (${from}) via número ${phoneNumberId}`);
 
       // Busca account_id + dono (owner) — roteia a mensagem para o usuário certo
       let accountId = null;
@@ -521,21 +521,21 @@ app.post("/webhook", async (req, res) => {
       if (supabase && phoneNumberId) {
         const { data: account, error: accErr } = await supabase
           .from("accounts").select("id, owner, token").eq("phone_number_id", phoneNumberId).maybeSingle();
-        if (accErr) console.error("❌ Erro ao buscar conta:", accErr.message);
+        if (accErr) console.error("Erro ao buscar conta:", accErr.message);
         if (account) {
           accountId = account.id;
           ownerEmail = account.owner || null;
           if (account.token) accountToken = account.token;
-          console.log("✅ Conta encontrada:", accountId, "dono:", ownerEmail);
+          console.log("Conta encontrada:", accountId, "dono:", ownerEmail);
         } else {
-          console.log("⚠️ Nenhuma conta com phone_number_id:", phoneNumberId, "- salvando sem account_id");
+          console.log("Nenhuma conta com phone_number_id:", phoneNumberId, "- salvando sem account_id");
         }
       }
 
       // Unifica a conversa se o contato já existe com/sem o nono dígito
       const resolvedFrom = await resolveExistingPhone(from, ownerEmail);
       if (resolvedFrom !== from) {
-        console.log(`🔗 Número ${from} unificado com contato existente ${resolvedFrom}`);
+        console.log(`Número ${from} unificado com contato existente ${resolvedFrom}`);
         from = resolvedFrom;
       }
 
@@ -585,7 +585,7 @@ app.post("/webhook", async (req, res) => {
         const it = message.interactive;
         content = it?.button_reply?.title || it?.list_reply?.title || it?.nfm_reply?.name || "[Resposta interativa]";
       } else if (type === 'unsupported') {
-        content = '⚠️ Mensagem não suportada pela API — veja no aplicativo do WhatsApp';
+        content = 'Mensagem não suportada pela API — veja no aplicativo do WhatsApp';
       } else {
         content = `[Mensagem do tipo: ${type}]`;
       }
@@ -613,9 +613,9 @@ app.post("/webhook", async (req, res) => {
           .upsert(contactData, { onConflict: "owner,phone" });
 
         if (contactErr) {
-          console.error("❌ Erro ao salvar contato:", contactErr.message, contactErr.details);
+          console.error("Erro ao salvar contato:", contactErr.message, contactErr.details);
         } else {
-          console.log("✅ Contato salvo:", from);
+          console.log("Contato salvo:", from);
         }
 
         // Foto de perfil via motor QR (serve também para contatos da API oficial)
@@ -647,9 +647,9 @@ app.post("/webhook", async (req, res) => {
         if (mediaId && accountToken) arquivaMidiaApi(mediaId, accountToken, mediaMimeType).catch(() => {});
 
         if (msgErr) {
-          console.error("❌ Erro ao salvar mensagem:", msgErr.message, msgErr.details);
+          console.error("Erro ao salvar mensagem:", msgErr.message, msgErr.details);
         } else {
-          console.log("✅ Mensagem salva:", content.substring(0, 50));
+          console.log("Mensagem salva:", content.substring(0, 50));
         }
         // Etiqueta "Encaminhada" (opcional — ignora se a coluna não existir)
         try {
@@ -698,7 +698,7 @@ app.post("/webhook", async (req, res) => {
       } // fim do for (message of value.messages)
     }
   } catch (err) {
-    console.error("❌ Erro no webhook:", err.message);
+    console.error("Erro no webhook:", err.message);
   }
 });
 
@@ -717,7 +717,7 @@ app.post("/auth/whatsapp", async (req, res) => {
       params: tokenParams,
     });
     const userToken = tokenRes.data.access_token;
-    console.log("✅ Token obtido via Embedded Signup");
+    console.log("Token obtido via Embedded Signup");
 
     // 2. Usa debug_token para obter WABA IDs das permissões granulares
     // (não requer business_management — funciona com whatsapp_business_management)
@@ -729,7 +729,7 @@ app.post("/auth/whatsapp", async (req, res) => {
     const granularScopes = debugRes.data.data?.granular_scopes || [];
     const wabaScope = granularScopes.find(s => s.scope === "whatsapp_business_management");
     const wabaIds = wabaScope?.target_ids || [];
-    console.log("✅ WABA IDs encontrados via debug_token:", wabaIds);
+    console.log("WABA IDs encontrados via debug_token:", wabaIds);
 
     const savedAccounts = [];
 
@@ -742,7 +742,7 @@ app.post("/auth/whatsapp", async (req, res) => {
         });
         wabaName = wabaRes.data.name || wabaId;
       } catch (e) {
-        console.log("⚠️ Não foi possível buscar nome do WABA:", e.response?.data?.error?.message);
+        console.log("Não foi possível buscar nome do WABA:", e.response?.data?.error?.message);
       }
 
       // 4. Busca números de telefone do WABA
@@ -750,7 +750,7 @@ app.post("/auth/whatsapp", async (req, res) => {
         params: { access_token: userToken, fields: "id,display_phone_number,verified_name" },
       });
       const phones = phonesRes.data.data || [];
-      console.log(`📞 ${phones.length} número(s) encontrado(s) no WABA ${wabaId}`);
+      console.log(`${phones.length} número(s) encontrado(s) no WABA ${wabaId}`);
 
       for (const phone of phones) {
         // 5. Registra o número na Cloud API (ativa o número de "Pendente" para "Ativo")
@@ -760,9 +760,9 @@ app.post("/auth/whatsapp", async (req, res) => {
             { messaging_product: "whatsapp", pin: process.env.WHATSAPP_PIN || "123456" },
             { headers: { Authorization: `Bearer ${userToken}`, "Content-Type": "application/json" } }
           );
-          console.log("✅ Número registrado na Cloud API:", phone.display_phone_number);
+          console.log("Número registrado na Cloud API:", phone.display_phone_number);
         } catch (e) {
-          console.log("⚠️ Registro do número (pode já estar ativo):", e.response?.data?.error?.message);
+          console.log("Registro do número (pode já estar ativo):", e.response?.data?.error?.message);
         }
 
         // 6. Inscreve WABA no webhook do app
@@ -772,9 +772,9 @@ app.post("/auth/whatsapp", async (req, res) => {
             {},
             { params: { access_token: userToken } }
           );
-          console.log("✅ WABA inscrito no webhook:", wabaId);
+          console.log("WABA inscrito no webhook:", wabaId);
         } catch (e) {
-          console.log("⚠️ Aviso webhook subscribe:", e.response?.data?.error?.message);
+          console.log("Aviso webhook subscribe:", e.response?.data?.error?.message);
         }
 
         // 6. Salva conta no Supabase
@@ -802,9 +802,9 @@ app.post("/auth/whatsapp", async (req, res) => {
             .single();
           if (!error) {
             savedAccounts.push(data);
-            console.log("✅ Conta salva:", accountData.name);
+            console.log("Conta salva:", accountData.name);
           } else {
-            console.error("❌ Erro ao salvar conta:", error.message);
+            console.error("Erro ao salvar conta:", error.message);
           }
         } else {
           savedAccounts.push(accountData);
@@ -820,7 +820,7 @@ app.post("/auth/whatsapp", async (req, res) => {
 
     res.json({ success: true, accounts: savedAccounts });
   } catch (err) {
-    console.error("❌ Erro auth:", err.response?.data || err.message);
+    console.error("Erro auth:", err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao conectar com o Facebook" });
   }
 });
@@ -873,7 +873,7 @@ async function addNotice(owner, text, dedupeKey) {
     list.unshift({ text, ts: now, k: dedupeKey || null, read: false });
     list = list.slice(0, 50);
     await supabase.from('settings').upsert({ key: K, value: JSON.stringify(list), updated_at: new Date().toISOString() });
-    sendPushToOwner(owner || null, { title: '⚠️ VETRA — Aviso', body: text, tag: 'notice' }).catch(() => {});
+    sendPushToOwner(owner || null, { title: 'VETRA — Aviso', body: text, tag: 'notice' }).catch(() => {});
   } catch (e) { console.error('addNotice:', e.message); }
 }
 // Conta voltou → neutraliza o marcador de "desconectada" (permite avisar numa próxima queda)
@@ -953,14 +953,14 @@ async function cloudApiStatus(accId) {
   if (status === 'disconnected' && prev !== 'disconnected') {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
-      if (a) addNotice(a.owner, `🔌 A conta da API oficial "${a.name}" está DESCONECTADA — ${motivo}. Verifique em Contas.`, 'disc:' + accId);
+      if (a) addNotice(a.owner, `A conta da API oficial "${a.name}" está DESCONECTADA — ${motivo}. Verifique em Contas.`, 'disc:' + accId);
     } catch (_) {}
   }
   // Estava DESCONECTADA e VOLTOU → avisa a boa notícia também
   if (status === 'connected' && prev === 'disconnected') {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
-      if (a) addNotice(a.owner, `✅ A conta da API oficial "${a.name}" foi RESTABELECIDA e está conectada novamente!`, 'reconn:' + accId);
+      if (a) addNotice(a.owner, `A conta da API oficial "${a.name}" foi RESTABELECIDA e está conectada novamente!`, 'reconn:' + accId);
     } catch (_) {}
   }
   // Conectada (por qualquer caminho) → libera novo aviso para uma queda futura
@@ -1001,7 +1001,7 @@ async function _limpaMidiasAntigas() {
         offset += 1000 - Math.min(1000, velhos.length); // compensa os removidos na paginação
         if (offset < 0) offset = 0;
       }
-      if (removidas) console.log(`🧹 Limpeza: ${removidas} mídia(s) com +6 meses removida(s) de qr/${p.name}`);
+      if (removidas) console.log(`Limpeza: ${removidas} mídia(s) com +6 meses removida(s) de qr/${p.name}`);
     }
   } catch (e) { console.error('Limpeza de mídias:', e.message); }
 }
@@ -1059,20 +1059,20 @@ app.post("/accounts", async (req, res) => {
         } catch (_) {}
       }
     }
-  } catch (e) { console.log('⚠️ WABA não descoberta:', e.response?.data?.error?.message || e.message); }
+  } catch (e) { console.log('WABA não descoberta:', e.response?.data?.error?.message || e.message); }
   // 3. Registra o número na Cloud API (ativa se pendente; inofensivo se já ativo)
   try {
     await axios.post(`https://graph.facebook.com/v23.0/${phone_number_id}/register`,
       { messaging_product: 'whatsapp', pin: process.env.WHATSAPP_PIN || '123456' },
       { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
-    console.log('✅ Número registrado na Cloud API (manual):', phone_display || phone_number_id);
-  } catch (e) { console.log('⚠️ Registro (pode já estar ativo):', e.response?.data?.error?.message); }
+    console.log('Número registrado na Cloud API (manual):', phone_display || phone_number_id);
+  } catch (e) { console.log('Registro (pode já estar ativo):', e.response?.data?.error?.message); }
   // 4. Inscreve a WABA no webhook do app (SEM isso as mensagens recebidas não chegam)
   if (waba_id) {
     try {
       await axios.post(`https://graph.facebook.com/v23.0/${waba_id}/subscribed_apps`, {}, { params: { access_token: token } });
-      console.log('✅ WABA inscrita no webhook (manual):', waba_id);
-    } catch (e) { console.log('⚠️ Webhook subscribe:', e.response?.data?.error?.message); }
+      console.log('WABA inscrita no webhook (manual):', waba_id);
+    } catch (e) { console.log('Webhook subscribe:', e.response?.data?.error?.message); }
   }
 
   // Conta JÁ existente (ex.: você reenviou o token) = PRESERVA o nome atual.
@@ -1089,7 +1089,7 @@ app.post("/accounts", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   const _avisos = [];
   if (!waba_id) _avisos.push('WABA não localizada — os modelos podem não aparecer');
-  if (_nomePreservado && _nomePreservado !== name) _avisos.push('O nome "' + _nomePreservado + '" foi mantido (use o ✏️ em Contas para trocar)');
+  if (_nomePreservado && _nomePreservado !== name) _avisos.push('O nome "' + _nomePreservado + '" foi mantido (use o em Contas para trocar)');
   res.json({ success: true, data, aviso: _avisos.length ? _avisos.join('. ') : null });
 });
 
@@ -1113,7 +1113,7 @@ app.get('/accounts/:id/meta-diag', async (req, res) => {
     const nome = String(d.name_status || '').toUpperCase();
     const passos = [];
     if (cod && cod !== 'VERIFIED') passos.push('1) VERIFICAR O NÚMERO: no Gerenciador da Meta (WhatsApp > Números), clique no número e conclua a verificação por SMS ou ligação.');
-    if (st === 'PENDING' || st === 'UNVERIFIED') passos.push('2) REGISTRAR na Cloud API: use o botão "⚡ Ativar na Meta" aqui no VETRA (registra o número com um PIN de 6 dígitos).');
+    if (st === 'PENDING' || st === 'UNVERIFIED') passos.push('2) REGISTRAR na Cloud API: use o botão "Ativar na Meta" aqui no VETRA (registra o número com um PIN de 6 dígitos).');
     if (nome && !['APPROVED', 'AVAILABLE_WITHOUT_REVIEW'].includes(nome)) passos.push('3) NOME DE EXIBIÇÃO em análise/rejeitado (' + nome + '): a Meta leva até 48h. O número pode ficar "Pendente" até aprovar.');
     res.json({ tipo: 'api', numero: d.display_phone_number || null, nome_exibicao: d.verified_name || null,
       status: st || null, verificacao: cod || null, nome_status: nome || null, qualidade: d.quality_rating || null, passos });
@@ -1237,7 +1237,7 @@ app.post("/send", async (req, res) => {
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
-  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta — envio para si mesmo não é permitido.' });
+  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta — envio para si mesmo não é permitido.' });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
 
   let phoneNumberId, token, evolutionInstance = null, accountType = 'cloudapi';
@@ -1246,7 +1246,7 @@ app.post("/send", async (req, res) => {
   if (supabase && account_id) {
     const { data: account, error: accErr } = await supabase
       .from("accounts").select("phone_number_id, token, type, evolution_instance").eq("id", account_id).eq("owner", req.owner || ' ').single();
-    if (accErr) console.error("❌ Erro ao buscar conta para envio:", accErr.message);
+    if (accErr) console.error("Erro ao buscar conta para envio:", accErr.message);
     if (account) {
       phoneNumberId = account.phone_number_id;
       token = account.token;
@@ -1260,7 +1260,7 @@ app.post("/send", async (req, res) => {
     phoneNumberId = process.env.PHONE_NUMBER_ID;
     token = process.env.WHATSAPP_TOKEN;
     if (phoneNumberId && token) {
-      console.log("⚠️ Conta não encontrada no banco — usando credenciais das variáveis de ambiente");
+      console.log("Conta não encontrada no banco — usando credenciais das variáveis de ambiente");
     }
   }
 
@@ -1317,15 +1317,15 @@ app.post("/send", async (req, res) => {
         quoted_direction: quoted_direction || null,
       });
       if (msgErr) {
-        console.error("❌ Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
+        console.error("Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
       } else {
         await applyPendingStatus(wamid);
-        console.log("✅ Mensagem enviada salva no banco:", message.substring(0, 50));
+        console.log("Mensagem enviada salva no banco:", message.substring(0, 50));
       }
     }
     res.json({ success: true, data: response.data });
   } catch (err) {
-    console.error("❌ Erro ao enviar:", err.response?.data || err.message);
+    console.error("Erro ao enviar:", err.response?.data || err.message);
     res.status(500).json({ error: "Falha ao enviar mensagem", detail: err.response?.data });
   }
 });
@@ -1353,7 +1353,7 @@ app.post("/react", async (req, res) => {
         await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid);
         return res.json({ success: true, via: 'qr' });
       } catch (e) {
-        console.error('❌ Reação via QR:', e.message);
+        console.error('Reação via QR:', e.message);
         return res.status(500).json({ error: 'Falha ao reagir pelo WhatsApp QR: ' + e.message });
       }
     }
@@ -1370,7 +1370,7 @@ app.post("/react", async (req, res) => {
     if (supabase) await supabase.from("messages").update({ reaction: emoji || null, reaction_by: 'me' }).eq("wamid", wamid);
     res.json({ success: true });
   } catch (err) {
-    console.error("❌ Erro ao reagir:", err.response?.data || err.message);
+    console.error("Erro ao reagir:", err.response?.data || err.message);
     res.status(500).json({ error: "Falha ao reagir", detail: err.response?.data });
   }
 });
@@ -1382,8 +1382,8 @@ let _ffmpeg = null;
 try {
   _ffmpeg = require('fluent-ffmpeg');
   _ffmpeg.setFfmpegPath(require('@ffmpeg-installer/ffmpeg').path);
-  console.log('✅ ffmpeg disponível (conversão de áudio ativa)');
-} catch (e) { console.log('⚠️ ffmpeg não instalado — áudios gravados serão enviados sem conversão'); }
+  console.log('ffmpeg disponível (conversão de áudio ativa)');
+} catch (e) { console.log('ffmpeg não instalado — áudios gravados serão enviados sem conversão'); }
 
 function convertAudioToOpus(buf) {
   return new Promise((resolve, reject) => {
@@ -1503,7 +1503,7 @@ app.post("/send-media", async (req, res) => {
   if (!to || !fileBase64 || !fileName || !mimeType)
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
-  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta.' });
+  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta.' });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
 
   let phoneNumberId, token, accountType = 'cloudapi', evolutionInstance = null;
@@ -1530,7 +1530,7 @@ app.post("/send-media", async (req, res) => {
       if (baseMime.startsWith('audio/')) {
         if (baseMime !== 'audio/ogg') {
           try { fileBuf = await convertAudioToOpus(fileBuf); }
-          catch (e) { console.error('⚠️ Conversão (QR) falhou, enviando original:', e.message); }
+          catch (e) { console.error('Conversão (QR) falhou, enviando original:', e.message); }
         }
         // Envelope de volume (os "pauzinhos" da mensagem de voz)
         const wf = req.body.voice === true ? await computeWaveform(fileBuf) : null;
@@ -1551,7 +1551,7 @@ app.post("/send-media", async (req, res) => {
         let vMime = 'video/mp4';
         if (baseMime !== 'video/mp4') {
           try { fileBuf = await convertVideoToMp4(fileBuf); }
-          catch (ve) { console.error('⚠️ Conversão de vídeo falhou, enviando original:', ve.message); vMime = baseMime; }
+          catch (ve) { console.error('Conversão de vídeo falhou, enviando original:', ve.message); vMime = baseMime; }
         }
         sent = await sock.sendMessage(jid, { video: fileBuf, mimetype: vMime, ...(mCaption ? { caption: mCaption } : {}) });
         msgType = 'video'; qrSentMime = vMime; content = mCaption || `[Vídeo: ${fileName}]`;
@@ -1586,11 +1586,11 @@ app.post("/send-media", async (req, res) => {
             await supabase.from('messages').update({ waveform: JSON.stringify(Array.from(req._wfOut)) }).eq('wamid', wamid).eq('phone', to);
         } catch (_) {}
       }
-      console.log(`📤 Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
+      console.log(`Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
       // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
       return res.json({ success: true, via: 'qr', media_id: mediaPathOut || null });
     } catch (e) {
-      console.error('❌ Mídia via QR:', e.message);
+      console.error('Mídia via QR:', e.message);
       return res.status(500).json({ error: 'Falha ao enviar pelo WhatsApp QR: ' + e.message });
     }
   }
@@ -1612,9 +1612,9 @@ app.post("/send-media", async (req, res) => {
         fileBuf = await convertAudioToOpus(fileBuf);
         sendMime = "audio/ogg";
         sendName = fileName.replace(/\.[^.]+$/, "") + ".ogg";
-        console.log(`🎙️ Áudio convertido para OGG/Opus (${fileBuf.length} bytes)`);
+        console.log(`Áudio convertido para OGG/Opus (${fileBuf.length} bytes)`);
       } catch (convErr) {
-        console.error("⚠️ Conversão de áudio falhou, enviando original:", convErr.message);
+        console.error("Conversão de áudio falhou, enviando original:", convErr.message);
       }
     }
 
@@ -1634,7 +1634,7 @@ app.post("/send-media", async (req, res) => {
       { headers: { ...form.getHeaders(), Authorization: `Bearer ${token}` } }
     );
     const mediaId = uploadRes.data.id;
-    console.log("✅ Mídia enviada para Meta, id:", mediaId);
+    console.log("Mídia enviada para Meta, id:", mediaId);
 
     // 2. Determina o tipo de mensagem WhatsApp
     let msgType = "document";
@@ -1683,7 +1683,7 @@ app.post("/send-media", async (req, res) => {
     // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
     res.json({ success: true, media_id: (typeof mediaId !== 'undefined' && mediaId) || null });
   } catch (err) {
-    console.error("❌ Erro ao enviar mídia:", err.response?.data || err.message);
+    console.error("Erro ao enviar mídia:", err.response?.data || err.message);
     res.status(500).json({ error: "Falha ao enviar mídia", detail: err.response?.data });
   }
 });
@@ -1734,12 +1734,12 @@ async function arquivaMidiaApi(mediaId, token, mime) {
     const tipo = mime || metaRes.data?.mime_type || bin.headers['content-type'] || 'application/octet-stream';
     const { error } = await supabase.storage.from('wa-media')
       .upload(caminho, Buffer.from(bin.data), { contentType: tipo, upsert: true });
-    if (error) { _cofreUltimoErro = mediaId + ': ' + error.message; console.error('🗄️ Arquivo 6 meses falhou:', mediaId, error.message); }
-    else { _cofreUltimoOk = caminho + ' @ ' + new Date().toISOString(); console.log('🗄️ Mídia guardada por 6 meses:', caminho); }
+    if (error) { _cofreUltimoErro = mediaId + ': ' + error.message; console.error('Arquivo 6 meses falhou:', mediaId, error.message); }
+    else { _cofreUltimoOk = caminho + ' @ ' + new Date().toISOString(); console.log('Mídia guardada por 6 meses:', caminho); }
   } catch (e) {
     const mm = e.response?.data?.error?.message || e.message || String(e.response?.status || '');
     _cofreUltimoErro = mediaId + ': ' + mm;
-    console.error('🗄️ Arquivo 6 meses falhou:', mediaId, mm);
+    console.error('Arquivo 6 meses falhou:', mediaId, mm);
   } finally { _arquivando.delete(caminho); }
 }
 
@@ -1764,8 +1764,8 @@ async function _limpaCopiasApi() {
       if (itens.length < 100) break;
       pag++;
     }
-    if (apagados) console.log(`🧹 Cópias com mais de 6 meses apagadas: ${apagados}`);
-  } catch (e) { console.error('🧹 Faxina das cópias:', e.message); }
+    if (apagados) console.log(`Cópias com mais de 6 meses apagadas: ${apagados}`);
+  } catch (e) { console.error('Faxina das cópias:', e.message); }
 }
 // ══════════════════════════════════════════════════════════════════════════
 // 📦 CONTROLE DE ESPAÇO DO STORAGE
@@ -1868,7 +1868,7 @@ async function _podaPorEspaco() {
     }
     const alvo = teto * COFRE_ALVO_PCT;
     const usados = await _midiaUsadaNoChat();
-    if (!usados.ok) { console.error('📦 Poda adiada: não consegui ler as mensagens (não apago às cegas)'); return { erro: 'mensagens indisponíveis' }; }
+    if (!usados.ok) { console.error('Poda adiada: não consegui ler as mensagens (não apago às cegas)'); return { erro: 'mensagens indisponíveis' }; }
     const cand = mapa.arquivos.filter(a => a.grupo !== 'bot' && a.grupo !== 'qr/avatars'); // esses ficam sempre
     const orfaos = cand.filter(a => !usados.set.has(a.caminho)).sort((a, b) => a.criado - b.criado);
     const emUso  = cand.filter(a =>  usados.set.has(a.caminho)).sort((a, b) => a.criado - b.criado);
@@ -1878,7 +1878,7 @@ async function _podaPorEspaco() {
     const lote = [];
     for (const a of fila) {
       if (previsto <= alvo) break;
-      if (!_avisouUso && usados.set.has(a.caminho)) { _avisouUso = true; console.warn('📦 ATENÇÃO: órfãos não bastaram — poda vai alcançar arquivos usados no chat (mais antigos primeiro)'); }
+      if (!_avisouUso && usados.set.has(a.caminho)) { _avisouUso = true; console.warn('ATENÇÃO: órfãos não bastaram — poda vai alcançar arquivos usados no chat (mais antigos primeiro)'); }
       lote.push(a);
       previsto -= a.bytes;
     }
@@ -1886,7 +1886,7 @@ async function _podaPorEspaco() {
     for (let i = 0; i < lote.length; i += 100) {
       const parte = lote.slice(i, i + 100);
       const { error } = await supabase.storage.from('wa-media').remove(parte.map(a => a.caminho));
-      if (error) { console.error('📦 Poda falhou:', error.message); break; }
+      if (error) { console.error('Poda falhou:', error.message); break; }
       apagados += parte.length;
       liberado += parte.reduce((s, a) => s + a.bytes, 0);
     }
@@ -1894,10 +1894,10 @@ async function _podaPorEspaco() {
     _cofreCheio = restante > teto;
     _espacoCache = { mb: +(restante / 1048576).toFixed(1), grupos: mapa.grupos, ts: Date.now() };
     _ultimaPoda = { quando: new Date().toISOString(), apagados, antes_mb: mapa.mb, depois_mb: _espacoCache.mb };
-    console.log(`📦 Poda por espaço: ${apagados} arquivo(s) apagados — ${mapa.mb} MB → ${_espacoCache.mb} MB (teto ${COFRE_TETO_MB} MB)`);
+    console.log(`Poda por espaço: ${apagados} arquivo(s) apagados — ${mapa.mb} MB → ${_espacoCache.mb} MB (teto ${COFRE_TETO_MB} MB)`);
     return _ultimaPoda;
   } catch (e) {
-    console.error('📦 Poda por espaço:', e.message);
+    console.error('Poda por espaço:', e.message);
     return { erro: e.message };
   }
 }
@@ -1986,7 +1986,7 @@ app.get('/storage-emergencia', async (req, res) => {
       bytes += parte.reduce((s, a) => s + a.bytes, 0);
     }
     _cofreCheio = false;
-    console.log(`🚨 Emergência: ${apagados} arquivo(s) de ${pasta} apagados (${Math.round(bytes / 1048576)} MB)`);
+    console.log(`Emergência: ${apagados} arquivo(s) de ${pasta} apagados (${Math.round(bytes / 1048576)} MB)`);
     res.json({ ok: true, pasta, apagados, liberado_mb: +(bytes / 1048576).toFixed(1) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2025,7 +2025,7 @@ app.get('/storage-orfaos', async (req, res) => {
       apagados += parte.length;
     }
     _cofreCheio = false;
-    console.log(`🧹 Órfãos apagados: ${apagados} (${mb} MB)`);
+    console.log(`Órfãos apagados: ${apagados} (${mb} MB)`);
     res.json({ ok: true, modo: 'apagou', apagados, liberado_mb: mb, mantidos_no_chat: usados.size });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2131,7 +2131,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
       res.setHeader('Content-Length', total);
       return res.status(200).end(buf);
     } catch (e) {
-      console.error('❌ Mídia QR:', e.message);
+      console.error('Mídia QR:', e.message);
       return res.status(500).json({ error: 'Falha ao carregar mídia' });
     }
   }
@@ -2177,7 +2177,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
                 const h2 = { Authorization: `Bearer ${a.token}`, "User-Agent": "WhatsApp/2.0" };
                 if (req.headers.range && download !== "1") h2.Range = req.headers.range;
                 up = await axios.get(url2, { headers: h2, responseType: "stream", timeout: 30000, validateStatus: s => s === 200 || s === 206 });
-                console.log(`🔁 Mídia ${mediaId}: baixada com o token da conta ${a.id} (a conta pedida não servia)`);
+                console.log(`Mídia ${mediaId}: baixada com o token da conta ${a.id} (a conta pedida não servia)`);
                 break;
               } catch (_) {}
             }
@@ -2207,7 +2207,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
 
     up.data.pipe(res);
     up.data.on("error", (e) => {
-      console.error("❌ Stream de mídia interrompido:", e.message);
+      console.error("Stream de mídia interrompido:", e.message);
       try { res.destroy(); } catch (_) {}
     });
     // Se o navegador cancelar (fechou o vídeo, pulou trecho), corta o download da Meta
@@ -2215,7 +2215,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   } catch (err) {
     const st = err.response?.status;
     const msgMeta = String(err.response?.data?.error?.message || err.message || '');
-    console.error("❌ Erro ao baixar mídia:", mediaId, st || msgMeta);
+    console.error("Erro ao baixar mídia:", mediaId, st || msgMeta);
     const naoAchou = st === 404 || /does not exist|Unsupported get request|cannot be loaded/i.test(msgMeta);
     if (!res.headersSent) res.status(naoAchou ? 410 : 500).json({
       error: naoAchou
@@ -2312,7 +2312,7 @@ app.post('/transcribe', async (req, res) => {
   try {
     const bruto = await _bytesDaMidia(msg);
     let mp3 = bruto, ehMp3 = false;
-    try { mp3 = await _paraMp3(bruto); ehMp3 = (mp3 !== bruto); } catch (e) { console.warn('📝 conversão mp3 falhou, mandando original:', e.message); }
+    try { mp3 = await _paraMp3(bruto); ehMp3 = (mp3 !== bruto); } catch (e) { console.warn('conversão mp3 falhou, mandando original:', e.message); }
     const texto = await _transcreverBuffer(mp3, ehMp3, mime);
     if (!texto) return res.json({ ok: true, transcript: '', vazio: true });
     const { error: upErr } = await supabase.from('messages').update({ transcript: texto }).eq('id', id);
@@ -2323,7 +2323,7 @@ app.post('/transcribe', async (req, res) => {
     res.json({ ok: true, transcript: texto });
   } catch (e) {
     const m = e.response && e.response.data && e.response.data.error ? (e.response.data.error.message || JSON.stringify(e.response.data.error)) : e.message;
-    console.error('📝 transcrição:', m);
+    console.error('transcrição:', m);
     res.status(500).json({ error: 'Não consegui transcrever: ' + m });
   } finally { _transcrevendo.delete(String(id)); }
 });
@@ -2524,7 +2524,7 @@ app.post('/contacts/unify-duplicates', async (req, res) => {
         } catch (e) { erros.push(dup.phone + ': ' + e.message); }
       }
     }
-    console.log(`🔗 Unificação (${OW}): ${unificados} contato(s) unificados, ${msgsMovidas} mensagens movidas`);
+    console.log(`Unificação (${OW}): ${unificados} contato(s) unificados, ${msgsMovidas} mensagens movidas`);
     res.json({ ok: true, unificados, mensagens_movidas: msgsMovidas, erros });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2690,7 +2690,7 @@ app.post("/contacts/import", async (req, res) => {
   if (!toInsert.length) return res.status(400).json({ error: "Nenhum contato válido encontrado" });
   const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "owner,phone" });
   if (error) return res.status(500).json({ error: error.message });
-  console.log(`✅ ${toInsert.length} contatos importados`);
+  console.log(`${toInsert.length} contatos importados`);
   res.json({ success: true, count: toInsert.length });
 });
 
@@ -2766,7 +2766,7 @@ app.post("/import/lead", async (req, res) => {
   const n8nOwner = (String(req.query.owner||'').trim()) || (!Array.isArray(req.body) && req.body.owner) || 'elianecezaroliveira@gmail.com';
   if (!_n8nAuthOk(req, n8nOwner)) return res.status(401).json(_n8nAuthErro);
   const r = await _importarLeads(items, n8nOwner);
-  console.log(`📥 n8n importou ${r.imported} lead(s)` + (r.errors.length ? `, ${r.errors.length} erro(s)` : ""));
+  console.log(`n8n importou ${r.imported} lead(s)` + (r.errors.length ? `, ${r.errors.length} erro(s)` : ""));
   res.json({ success: true, imported: r.imported, errors: r.errors });
 });
 
@@ -2860,7 +2860,7 @@ async function _dripEtapasDoDono(owner) {
   const { data, error } = await supabase.from('pipeline_stages').select('id').eq('owner', owner);
   // Falha na consulta: NÃO guarda lista vazia (isso desligava a proteção de etapa
   // apagada por 60s). Mantém a lista anterior; se não houver, devolve null.
-  if (error || !Array.isArray(data)) { console.error('⏳ não consegui ler as etapas do gotejamento:', (error && error.message) || 'resposta vazia'); return c ? c.set : null; }
+  if (error || !Array.isArray(data)) { console.error('não consegui ler as etapas do gotejamento:', (error && error.message) || 'resposta vazia'); return c ? c.set : null; }
   const set = new Set(data.map(x => String(x.id)));
   _dripStagesCache[owner] = { set, ts: Date.now() };
   return set;
@@ -2887,7 +2887,7 @@ async function _dripTick() {
           if (r.manual || r.agendado) {
             r.manual = false; r.agendado = false; r.ativo = false; r._desligarManual = true; r._desligarAgendado = true; mudou = true;
             r.last = { quando: new Date().toISOString(), erro: 'Etapa da regra foi apagada — gotejamento desligado' };
-            try { addNotice(owner, `⏳ O gotejamento "${r.nome || r.id}" foi DESLIGADO: uma das etapas dele foi apagada.`, 'drip-etapa:' + r.id); } catch (_) {}
+            try { addNotice(owner, `O gotejamento "${r.nome || r.id}" foi DESLIGADO: uma das etapas dele foi apagada.`, 'drip-etapa:' + r.id); } catch (_) {}
           }
           continue;
         }
@@ -2919,7 +2919,7 @@ async function _dripTick() {
           const ligadaAgora = !!rf.manual || (!!rf.agendado && _dripDentroDaJanela(r));
           if (!ligadaAgora) { mudou = true; continue; } // DESLIGADA no banco: não move nada
           if (rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; continue; }
-        } catch (e) { console.error('⏳ leitura de segurança do gotejamento:', e.message); continue; }
+        } catch (e) { console.error('leitura de segurança do gotejamento:', e.message); continue; }
         // 1) agenda o PRÓXIMO e grava JÁ (antes de mover) — se cair no meio, não repete
         const { minS, maxS } = _dripMinMax(r); // já dividido pela quantidade de números
         const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
@@ -2958,10 +2958,10 @@ async function _dripTick() {
         try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
         r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false; r._tocada = true;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
-        console.log(`⏳ Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
+        console.log(`Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
       }
       if (mudou) await _dripSalvaProgresso(owner, regras);
-    } catch (e) { console.error('⏳ drip:', e.message); }
+    } catch (e) { console.error('drip:', e.message); }
     finally { _dripLock.delete(owner); }
   }
 }
@@ -2975,10 +2975,10 @@ setTimeout(async () => {
       const antigas = JSON.parse(_settings['drip_rules'] || '[]');
       if (Array.isArray(antigas) && antigas.length) {
         await _dripSalva(OWNER_LEGADO, antigas);
-        console.log('⏳ Regras de gotejamento antigas migradas para a conta principal:', antigas.length);
+        console.log('Regras de gotejamento antigas migradas para a conta principal:', antigas.length);
       }
     }
-  } catch (e) { console.error('⏳ migração das regras antigas:', e.message); }
+  } catch (e) { console.error('migração das regras antigas:', e.message); }
 }, 20000);
 setTimeout(() => { _dripTick(); setInterval(_dripTick, 2000); }, 30000);
 
@@ -3251,7 +3251,7 @@ app.get('/sheets/preview', async (req, res) => {
       vistos.add(phone);
       if (!st && phone.length >= 8) semEtapa++;
       const ex = existentes.get(phone);
-      return { linha: i + 2, name: l.name || '', phone, id: extId, etapa: st ? st.name : (extId ? '⚠️ ID não encontrado' : '(sem etapa)'),
+      return { linha: i + 2, name: l.name || '', phone, id: extId, etapa: st ? st.name : (extId ? 'ID não encontrado' : '(sem etapa)'),
         situacao, etapa_atual: ex ? (stNome[ex.stage_id] || '') : '' };
     });
     res.json({ total: linhas.length, novos, ja_existem: jaExistem, invalidos, sem_etapa: semEtapa,
@@ -3335,7 +3335,7 @@ app.post("/update/lead", async (req, res) => {
     if (prev?.stage_id !== stage_id) { try { await fireStageBots(phone, stage_id, n8nOwner); } catch(e) { console.error('fireStageBots (n8n):', e.message); } }
   }
 
-  console.log(`🔁 n8n atualizou etapa de ${updated} lead(s)` + (errors.length ? `, ${errors.length} erro(s)` : ""));
+  console.log(`n8n atualizou etapa de ${updated} lead(s)` + (errors.length ? `, ${errors.length} erro(s)` : ""));
   res.json({ success: true, updated, errors });
 });
 
@@ -3437,7 +3437,7 @@ app.post("/notes", async (req, res) => {
       const pasta = 'notas/' + Buffer.from(String(req.owner || 'x')).toString('hex').slice(0, 24);
       mediaId = `${pasta}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const { error: upErr } = await supabase.storage.from('wa-media').upload(mediaId, buf, { contentType: mediaMime, upsert: false });
-      if (upErr) { console.error('❌ Anexo da nota:', upErr.message); return res.status(500).json({ error: 'Não consegui guardar o arquivo da nota: ' + upErr.message }); }
+      if (upErr) { console.error('Anexo da nota:', upErr.message); return res.status(500).json({ error: 'Não consegui guardar o arquivo da nota: ' + upErr.message }); }
     } catch (e) { return res.status(400).json({ error: 'Arquivo inválido' }); }
   }
   const { data, error } = await supabase.from("messages").insert({
@@ -3530,7 +3530,7 @@ app.get("/templates", async (req, res) => {
     });
     res.json(response.data.data || []);
   } catch (err) {
-    console.error("❌ Erro ao listar templates:", err.response?.data || err.message);
+    console.error("Erro ao listar templates:", err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao listar templates" });
   }
 });
@@ -3550,10 +3550,10 @@ app.post("/templates", async (req, res) => {
       { name, category, language, components },
       { headers: { Authorization: `Bearer ${account.token}`, "Content-Type": "application/json" } }
     );
-    console.log("✅ Template criado:", name);
+    console.log("Template criado:", name);
     res.json({ success: true, data: response.data });
   } catch (err) {
-    console.error("❌ Erro ao criar template:", err.response?.data || err.message);
+    console.error("Erro ao criar template:", err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao criar template" });
   }
 });
@@ -3574,11 +3574,11 @@ app.delete("/templates/:template_id", async (req, res) => {
     const params = { name, access_token: account.token };
     if (hsm_id) params.hsm_id = hsm_id; // exclui o template específico (recomendado pela Meta)
     await axios.delete(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, { params });
-    console.log("🗑️ Template excluído:", name);
+    console.log("Template excluído:", name);
     res.json({ success: true });
   } catch (err) {
     const metaErr = err.response?.data?.error;
-    console.error("❌ Erro ao deletar template:", metaErr || err.message);
+    console.error("Erro ao deletar template:", metaErr || err.message);
     // Devolve a mensagem detalhada da Meta (código/subcódigo) para diagnóstico
     const msg = metaErr
       ? `${metaErr.message || 'erro'}${metaErr.code ? ' (código ' + metaErr.code + (metaErr.error_subcode ? '/' + metaErr.error_subcode : '') + ')' : ''}`
@@ -3593,7 +3593,7 @@ app.post("/send-template", async (req, res) => {
   if (!to || !account_id || !template_name)
     return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
-  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta.' });
+  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta.' });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { data: account, error: accErr } = await supabase
@@ -3625,13 +3625,13 @@ app.post("/send-template", async (req, res) => {
       status: tplWamid ? 'sent' : 'pending', wamid: tplWamid, owner: req.owner || null,
     });
     await applyPendingStatus(tplWamid);
-    console.log("✅ Template enviado:", template_name, "→", to, "wamid:", tplWamid);
+    console.log("Template enviado:", template_name, "→", to, "wamid:", tplWamid);
     res.json({ success: true, data: response.data });
   } catch (err) {
     const e = err.response?.data?.error || {};
     const msg = e.error_user_msg || e.message || err.message || "Erro ao enviar template";
     const detail = e.error_user_title || e.error_data?.details || "";
-    console.error("❌ Erro ao enviar template:", err.response?.data || err.message);
+    console.error("Erro ao enviar template:", err.response?.data || err.message);
     res.status(500).json({ error: msg, detail, code: e.code || null });
   }
 });
@@ -3673,7 +3673,7 @@ setTimeout(async () => {
           .eq('owner', 'vendetta.freedon@gmail.com')
           .or('name.ilike.SIAPE3,name.ilike.SIAPE 3');
         await supabase.from('settings').upsert({ key: K, value: 'ok', updated_at: new Date().toISOString() });
-        console.log('🆔 SIAPE3 (vendetta) → 104721840');
+        console.log('SIAPE3 (vendetta) → 104721840');
       }
     } catch (_) {}
     const { data: st } = await supabase.from('pipeline_stages').select('id').is('external_id', null);
@@ -3682,7 +3682,7 @@ setTimeout(async () => {
         .update({ external_id: String(Math.floor(10000000 + Math.random() * 90000000)) })
         .eq('id', s.id).is('external_id', null);
     }
-    if (st && st.length) console.log(`🆔 ${st.length} etapa(s) ganharam ID externo automático`);
+    if (st && st.length) console.log(`${st.length} etapa(s) ganharam ID externo automático`);
   } catch (_) {}
 }, 20000);
 
@@ -3735,7 +3735,7 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
       if (String(r.de) !== String(req.params.id) && String(r.para) !== String(req.params.id)) continue;
       if (r.manual || r.agendado) { r.manual = false; r.agendado = false; r.ativo = false; mexeu = true; }
     }
-    if (mexeu) { await _dripSalva(req.owner, regras); addNotice(req.owner, `⏳ Gotejamento(s) que usavam a etapa "${st?.name || ''}" foram desligados.`, 'drip-del:' + req.params.id); }
+    if (mexeu) { await _dripSalva(req.owner, regras); addNotice(req.owner, `Gotejamento(s) que usavam a etapa "${st?.name || ''}" foram desligados.`, 'drip-del:' + req.params.id); }
     delete _dripStagesCache[req.owner];
   } catch (e) { console.error('drip pós-exclusão de etapa:', e.message); }
   res.json({ success: true, leads_movidos: (leads || []).length });
@@ -3765,7 +3765,7 @@ app.post('/pipeline/stages/restore', async (req, res) => {
   }
   await _stageTrashSalva(req.owner, lixo.filter(x => x !== item));
   try { delete _dripStagesCache[req.owner]; } catch (_) {} // a etapa voltou: o gotejamento a enxerga na hora
-  console.log(`♻️ Coluna restaurada: ${st.name} (${devolvidos} leads de volta)`);
+  console.log(`Coluna restaurada: ${st.name} (${devolvidos} leads de volta)`);
   res.json({ ok: true, stage: st, leads_devolvidos: devolvidos });
 });
 // 🩹 Recuperar coluna apagada ANTES da lixeira existir: acha ids de etapa que bots,
@@ -3912,7 +3912,7 @@ app.post('/typing', async (req, res) => {
           messaging_product: 'whatsapp', status: 'read', message_id: lastIn.wamid,
           typing_indicator: { type: 'text' }
         }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } })
-          .catch(e => { recusa = e.response?.data?.error?.message || e.message; console.log('⌨️ Meta recusou o "digitando…":', recusa); });
+          .catch(e => { recusa = e.response?.data?.error?.message || e.message; console.log('Meta recusou o "digitando…":', recusa); });
         return res.json({ success: !recusa, via: 'cloud', motivo: recusa || undefined });
       }
     }
@@ -4052,7 +4052,7 @@ app.post('/message-revoke', async (req, res) => {
     const sock = _waSocks[inst];
     const jid = await waResolveJid(sock, phone);
     await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: true, id: wamid } });
-    await supabase.from('messages').update({ content: '🚫 Mensagem apagada', type: 'text' }).eq('wamid', wamid).eq('phone', phone);
+    await supabase.from('messages').update({ content: 'Mensagem apagada', type: 'text' }).eq('wamid', wamid).eq('phone', phone);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4321,7 +4321,7 @@ app.delete("/contacts/bulk-delete", async (req, res) => {
     for (const r of (rows || [])) lixo.unshift({ contact: r, deleted_at: agora });
     await _leadTrashSalva(req.owner, lixo);
   } catch (e) { console.error('lixeira de leads:', e.message); }
-  console.log(`🗑️ ${phones.length} lead(s) excluídos (na lixeira por 30 dias)`);
+  console.log(`${phones.length} lead(s) excluídos (na lixeira por 30 dias)`);
   res.json({ success: true, na_lixeira: (rows || []).length });
 });
 app.get('/contacts/trash', async (req, res) => {
@@ -4408,7 +4408,7 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
       phone, content, type: type || 'text', direction: 'outbound', timestamp: ts,
       account_id: accountId || null, status: 'failed', error_info: fullErr, owner: owner || null
     });
-    const prev = ('⚠️ ' + content).slice(0, 80);
+    const prev = String(content || '').slice(0, 80);
     await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
   } catch(e) { console.error('recordBotFail:', e.message); }
 }
@@ -4472,7 +4472,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
     const tam = (chk.data && chk.data.byteLength) || 0;
     if (!tam) throw new Error('arquivo vazio');
   } catch (e) {
-    console.error('❌ Foto do bot inacessível:', imgUrl, e.message);
+    console.error('Foto do bot inacessível:', imgUrl, e.message);
     await _recordBotFail(phone, legenda || '[Imagem]', 'A foto deste passo não pôde ser baixada pelo WhatsApp (link fora do ar). Abra o bot, clique no passo e envie a foto de novo.', usedAcctId, owner, 'image');
     return null;
   }
@@ -4503,12 +4503,12 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
     }
   } else {
     // SEM número configurado no nó = NÃO ENVIA (bloqueio total, por segurança)
-    await _recordBotFail(phone, text, '⛔ Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "📱 Enviar pelo número".', accountId || null, owner, 'text');
+    await _recordBotFail(phone, text, 'Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "Enviar pelo número".', accountId || null, owner, 'text');
     return null;
   }
   // 🚫 TRAVA ANTI-AUTOENVIO: bot nunca envia para o número da própria conta
   if (await _isSelfSend(phone, usedAcctId)) {
-    await _recordBotFail(phone, text, '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta (contato de teste no meio do disparo?).', usedAcctId, owner, 'text');
+    await _recordBotFail(phone, text, 'Bloqueado: o destino é o PRÓPRIO número desta conta (contato de teste no meio do disparo?).', usedAcctId, owner, 'text');
     return null;
   }
   const phoneNumberId = acct.phone_number_id, token = acct.token;
@@ -4516,7 +4516,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
   if (imgUrl) {
     try { return await sendBotFoto(phone, acct, usedAcctId, imgUrl, text, owner); }
     catch (e) {
-      console.error('❌ Bot foto:', e.response?.data || e.message);
+      console.error('Bot foto:', e.response?.data || e.message);
       await _recordBotFail(phone, text || '[Imagem]', 'Falha ao enviar a foto do bot: ' + (metaErrorText(e.response?.data?.error) || e.message || ''), usedAcctId, owner, 'text');
       return null;
     }
@@ -4534,7 +4534,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
       }
       return wamid || true;
     } catch (e) {
-      console.error('❌ Bot sendMsg (QR):', e.message);
+      console.error('Bot sendMsg (QR):', e.message);
       await _recordBotFail(phone, text, 'Falha no envio pelo QR Code: ' + (e.message || 'WhatsApp desconectado'), usedAcctId, owner, 'text');
       return null;
     }
@@ -4559,7 +4559,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
     }
     return wamid;
   } catch(e) {
-    console.error('❌ Bot sendMsg:', e.response?.data||e.message);
+    console.error('Bot sendMsg:', e.response?.data||e.message);
     await _recordBotFail(phone, text, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio'), usedAcctId, owner, 'text');
     return null;
   }
@@ -4591,7 +4591,7 @@ async function botGetAcct(accountId, owner) {
       const { data: list } = await q;
       const alt = (list || []).find(a => a.phone_number_id && a.token);
       if (alt) {
-        if (accountId) console.warn(`⚠️ Bot: conta ${accountId} não existe mais/não é API oficial — usando a conta oficial ${alt.id} do dono no lugar.`);
+        if (accountId) console.warn(`Bot: conta ${accountId} não existe mais/não é API oficial — usando a conta oficial ${alt.id} do dono no lugar.`);
         return alt;
       }
     } catch (e) { console.error('botGetAcct fallback:', e.message); }
@@ -4644,12 +4644,12 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   } else {
     // SEM número configurado no nó = NÃO ENVIA (bloqueio total, por segurança).
     // Edite o nó "Enviar mensagem" e escolha o número.
-    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, '⛔ Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "📱 Enviar pelo número".', accountId || null, owner, 'template');
+    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Envio BLOQUEADO: este passo do bot não tem número configurado. Abra o bot, clique no nó "Enviar mensagem" e escolha o número em "Enviar pelo número".', accountId || null, owner, 'template');
     return null;
   }
   // 🚫 TRAVA ANTI-AUTOENVIO: bot nunca envia modelo para o número da própria conta
   if (await _isSelfSend(phone, usedAcctId)) {
-    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, '🚫 Bloqueado: o destino é o PRÓPRIO número desta conta (contato de teste no meio do disparo?).', usedAcctId, owner, 'template');
+    await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'Bloqueado: o destino é o PRÓPRIO número desta conta (contato de teste no meio do disparo?).', usedAcctId, owner, 'template');
     return null;
   }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
@@ -4680,7 +4680,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
     }
     return true;
   } catch(e) {
-    console.error('❌ Bot template:', e.response?.data || e.message);
+    console.error('Bot template:', e.response?.data || e.message);
     const shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
     await _recordBotFail(phone, shown, metaErrorText(e.response?.data?.error) || (e.message || 'Falha no envio do modelo'), usedAcctId, owner, 'template');
     return null;
@@ -4761,7 +4761,7 @@ async function processNode(run, depth=0) {
     if (!run.account_id) run.account_id = _runsTravados.get(String(run.id));
   }
   if (depth > 30) { // fluxo em círculo: encerra (antes ficava "rodando" para sempre)
-    console.error('🤖 Bot com muitos passos seguidos — execução encerrada:', run && run.id);
+    console.error('Bot com muitos passos seguidos — execução encerrada:', run && run.id);
     try { await stopRun(run.id, 'stopped'); } catch (_) {}
     return;
   }
@@ -4866,7 +4866,7 @@ async function processNode(run, depth=0) {
       const iCerto = branches.findIndex(b => String(b && b.account_id) === String(run.account_id));
       branchIdx = iCerto >= 0 ? iCerto : 0;
       chosen = run.account_id;
-      console.log(`🔒 Rodízio ignorado: bot disparado na conversa usa o número dela (${run.account_id})`);
+      console.log(`Rodízio ignorado: bot disparado na conversa usa o número dela (${run.account_id})`);
       const nxtT = await getNextNodeId(nodeId, String(branchIdx));
       if (nxtT) { await supabase.from('bot_runs').update({ current_node_id:nxtT, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run, current_node_id:nxtT, account_id:chosen}, depth+1); }
       else await stopRun(runId,'completed');
@@ -5092,7 +5092,7 @@ async function fireStageBots(phone, stageId, owner, depth = 0) {
     const { data: ct } = await cq.maybeSingle();
     const leadAcct = ct?.account_id || null;
     for (const bot of bots) {
-      console.log(`🤖 Gatilho de etapa: bot "${bot.name}" para ${phone}`);
+      console.log(`Gatilho de etapa: bot "${bot.name}" para ${phone}`);
       // Prioriza a conta do LEAD (o número com que ele já conversa) — a conta gravada
       // no bot pode ter sido excluída ou ser de outro número
       await startBot(bot.id, phone, leadAcct || bot.account_id, owner || bot.owner);
@@ -5107,7 +5107,7 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
   await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() }).eq('contact_phone',phone).eq('bot_id',botId).in('status',['running','waiting_reply','paused']);
   const { data:startNodes } = await supabase.from('bot_nodes').select('id').eq('bot_id',botId).eq('type','start').limit(1);
   const startNode = startNodes && startNodes[0];
-  if (!startNode) { console.error('❌ Bot sem nó start:', botId); return null; }
+  if (!startNode) { console.error('Bot sem nó start:', botId); return null; }
   // Disparo manual do chat sem número informado: usa o número da PRÓPRIA conversa
   let contaTravada = (seedAccount && accountId) ? accountId : null;
   if (seedAccount && !contaTravada) {
@@ -5122,7 +5122,7 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
     current_node_id:startNode.id, status:'running', owner:ownerEmail||null,
     created_at:new Date().toISOString(), updated_at:new Date().toISOString()
   }).select().single();
-  if (error) { console.error('❌ Bot run insert:', error.message); return null; }
+  if (error) { console.error('Bot run insert:', error.message); return null; }
   // 🔒 Marca que o número veio da CONVERSA: nem o rodízio pode trocar
   if (seedAccount && contaTravada) { run._travaConta = true; _runsTravados.set(String(run.id), String(contaTravada)); }
   // Disparo manual do chat: devolve já (a tela mostra "bot ativo" na hora) e o
@@ -5140,7 +5140,7 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
     const cutoff = new Date(Date.now() - 48*3600000).toISOString();
     await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() })
       .in('status',['running','waiting_reply','paused']).lt('updated_at', cutoff);
-    console.log('🧹 Faxina de bots fantasmas concluída');
+    console.log('Faxina de bots fantasmas concluída');
   } catch (_) {}
 })();
 
@@ -5178,9 +5178,9 @@ setInterval(async () => {
     const nxt = await getNextNodeId(run.current_node_id, '__timeout__') || await getNextNodeId(run.current_node_id, '__other__');
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, status:'running', pause_until:null, updated_at:now }).eq('id',run.id); await processNode({...run,current_node_id:nxt,status:'running'}); }
     else { await stopRun(run.id,'completed'); }
-    } catch (e) { console.error('⏰ retomada de uma execução:', e.message); await _devolve(); }
+    } catch (e) { console.error('retomada de uma execução:', e.message); await _devolve(); }
   }
-  } catch (e) { console.error('⏰ retomada de bots:', e.message); }
+  } catch (e) { console.error('retomada de bots:', e.message); }
   finally { _retomaOcupado = false; }
 }, 30000);
 
@@ -5294,7 +5294,7 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
   let m = null;
   if (_faqAiOn(owner)) {
     try { m = await matchFaqLLM(phone, text, owner); }
-    catch (e) { console.error('🤖 IA classificador falhou, usando texto:', e.response?.data?.error?.message || e.message); m = await matchFaq(text, owner); }
+    catch (e) { console.error('IA classificador falhou, usando texto:', e.response?.data?.error?.message || e.message); m = await matchFaq(text, owner); }
   } else {
     m = await matchFaq(text, owner);
   }
@@ -5303,7 +5303,7 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
   // "só 1x por cliente/pergunta": já respondeu esse FAQ para esse contato?
   const { data: already } = await supabase.from('faq_replies')
     .select('id').eq('owner', owner || null).eq('phone', phone).eq('faq_id', m.faq.id).maybeSingle();
-  if (already) { console.log(`🤖 FAQ #${m.faq.id} já respondido a ${phone} — ignorado`); return false; }
+  if (already) { console.log(`FAQ #${m.faq.id} já respondido a ${phone} — ignorado`); return false; }
 
   // descobre a conta de WhatsApp certa (número do lead), se não veio
   let acct = accountId;
@@ -5318,7 +5318,7 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
   // mais mensagens durante o atraso). Se o envio falhar depois, a reserva é removida.
   const { error: resErr } = await supabase.from('faq_replies')
     .insert({ owner: owner || null, phone, faq_id: m.faq.id });
-  if (resErr) { console.log(`🤖 FAQ #${m.faq.id} já respondido a ${phone} — ignorado`); return false; }
+  if (resErr) { console.log(`FAQ #${m.faq.id} já respondido a ${phone} — ignorado`); return false; }
 
   // Atraso humanizado antes de enviar. Padrão 25s; ajustável via settings 'faq_delay_seconds'.
   const delaySec = parseInt(_cfg('faq_delay_seconds', owner), 10);
@@ -5330,16 +5330,16 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
         // envio falhou: remove a reserva para permitir nova tentativa numa próxima mensagem
         await supabase.from('faq_replies').delete()
           .eq('owner', owner || null).eq('phone', phone).eq('faq_id', m.faq.id);
-        console.error('🤖 FAQ: falha ao enviar resposta a', phone, '(sem conta/token ou fora da janela 24h)');
+        console.error('FAQ: falha ao enviar resposta a', phone, '(sem conta/token ou fora da janela 24h)');
         return;
       }
-      console.log(`🤖 FAQ #${m.faq.id} respondido a ${phone} (score ${m.score.toFixed(2)}, após ${delayMs/1000}s)`);
+      console.log(`FAQ #${m.faq.id} respondido a ${phone} (score ${m.score.toFixed(2)}, após ${delayMs/1000}s)`);
     } catch (e) {
       try {
         await supabase.from('faq_replies').delete()
           .eq('owner', owner || null).eq('phone', phone).eq('faq_id', m.faq.id);
       } catch (_) {}
-      console.error('🤖 FAQ: erro no envio atrasado a', phone, e.message);
+      console.error('FAQ: erro no envio atrasado a', phone, e.message);
     }
   }, delayMs);
 
@@ -5544,7 +5544,7 @@ async function handleWrongPerson(phone, text, owner, accountId) {
   // 1x por contato (reserva antes do atraso; índice único evita duplicidade)
   const { error: resErr } = await supabase.from('faq_replies')
     .insert({ owner: owner || null, phone, faq_id: WRONGPERSON_FAQ_ID });
-  if (resErr) { console.log('🤖 Contato errado já tratado para', phone, '— ignorado'); return true; }
+  if (resErr) { console.log('Contato errado já tratado para', phone, '— ignorado'); return true; }
 
   let acct = accountId;
   if (!acct) {
@@ -5565,17 +5565,17 @@ async function handleWrongPerson(phone, text, owner, accountId) {
       if (!wamid) {
         await supabase.from('faq_replies').delete()
           .eq('owner', owner || null).eq('phone', phone).eq('faq_id', WRONGPERSON_FAQ_ID);
-        console.error('🤖 Contato errado: falha ao enviar a', phone, '(sem conta/token ou fora da janela 24h)');
+        console.error('Contato errado: falha ao enviar a', phone, '(sem conta/token ou fora da janela 24h)');
         return;
       }
       await addTagToContact(phone, owner, tag);
-      console.log(`🤖 Contato errado tratado: ${phone} (tag "${tag}", após ${delayMs/1000}s)`);
+      console.log(`Contato errado tratado: ${phone} (tag "${tag}", após ${delayMs/1000}s)`);
     } catch (e) {
       try {
         await supabase.from('faq_replies').delete()
           .eq('owner', owner || null).eq('phone', phone).eq('faq_id', WRONGPERSON_FAQ_ID);
       } catch (_) {}
-      console.error('🤖 Contato errado: erro no envio a', phone, e.message);
+      console.error('Contato errado: erro no envio a', phone, e.message);
     }
   }, delayMs);
 
@@ -5801,7 +5801,7 @@ app.post('/bots/:id/start-bulk', async (req,res) => {
       } catch(e){ skipped++; console.error('start-bulk:', c.phone, e.message); }
       await new Promise(r=>setTimeout(r, 200)); // ~5/seg
     }
-    console.log(`📢 Disparo em massa (selecionados) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${valid.length}`);
+    console.log(`Disparo em massa (selecionados) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${valid.length}`);
   })().catch(e=>console.error('Disparo em massa falhou:', e.message));
 });
 
@@ -5837,7 +5837,7 @@ app.post('/bots/:id/start-open-tasks', async (req,res) => {
       } catch(e){ skipped++; console.error('start-open-tasks:', phone, e.message); }
       await new Promise(r=>setTimeout(r, 200)); // ~5/seg — respeita limites do WhatsApp
     }
-    console.log(`📢 Disparo em massa (tarefas abertas) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${phones.length}`);
+    console.log(`Disparo em massa (tarefas abertas) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${phones.length}`);
   })().catch(e=>console.error('Disparo em massa falhou:', e.message));
 });
 app.get('/bot-runs/contact/:phone', async (req,res) => {
@@ -5948,7 +5948,7 @@ setInterval(async () => {
       const { count } = await tq;
       if (!count) continue;
       await sendPushToOwner(ownerVal, {
-        title: '✅ Tarefas em aberto',
+        title: 'Tarefas em aberto',
         body: `Você tem ${count} tarefa${count > 1 ? 's' : ''} em aberto no VETRA`,
         tag: 'task-reminder'
       });
@@ -5967,14 +5967,14 @@ async function loadSettings() {
   try {
     const { data } = await supabase.from('settings').select('key, value');
     for (const row of data || []) _settings[row.key] = row.value;
-    console.log('✅ Settings carregados:', Object.keys(_settings).join(', ') || '(nenhum)');
+    console.log('Settings carregados:', Object.keys(_settings).join(', ') || '(nenhum)');
   } catch(e) { console.error('Settings load error:', e.message); }
 }
 loadSettings();
 setInterval(loadSettings, 5 * 60 * 1000); // recarrega settings (ex.: novos membros da equipe) sem precisar de redeploy
 // Aviso claro se a configuração antiga de "todos na mesma conta" ainda estiver no banco
 setTimeout(() => {
-  if (_settings['owner_default']) console.warn('⚠️ A configuração antiga "owner_default" existe no banco mas está IGNORADA — cada e-mail agora é uma conta separada. Use a Equipe (Configurações) para compartilhar de propósito.');
+  if (_settings['owner_default']) console.warn('A configuração antiga "owner_default" existe no banco mas está IGNORADA — cada e-mail agora é uma conta separada. Use a Equipe (Configurações) para compartilhar de propósito.');
 }, 30000);
 
 // 🔒 SEPARAÇÃO POR CONTA: estas chaves eram GLOBAIS (a configuração de uma conta
@@ -6028,7 +6028,7 @@ app.post('/equipe', async (req, res) => {
   } catch (_) {}
   mapa[email] = String(req.owner).toLowerCase();
   await _equipeSalva(mapa);
-  console.log('👥 Equipe: ' + email + ' agora entra na conta de ' + req.owner);
+  console.log('Equipe: ' + email + ' agora entra na conta de ' + req.owner);
   res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
 });
 app.delete('/equipe/:email', async (req, res) => {
@@ -6040,7 +6040,7 @@ app.delete('/equipe/:email', async (req, res) => {
     return res.status(403).json({ error: 'Este e-mail não faz parte da sua conta.' });
   delete mapa[email];
   await _equipeSalva(mapa);
-  console.log('👥 Equipe: ' + email + ' saiu da conta de ' + req.owner);
+  console.log('Equipe: ' + email + ' saiu da conta de ' + req.owner);
   res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
 });
 
@@ -6073,7 +6073,7 @@ app.put('/settings/:key', async (req, res) => {
 // NOTIFICAÇÕES PUSH (Web Push / PWA)
 // ═══════════════════════════════════════
 let webpush = null;
-try { webpush = require('web-push'); } catch (e) { console.log('⚠️ web-push não instalado — notificações push desativadas'); }
+try { webpush = require('web-push'); } catch (e) { console.log('web-push não instalado — notificações push desativadas'); }
 
 let _vapid = null;
 async function initPush() {
@@ -6091,10 +6091,10 @@ async function initPush() {
         privateKey: privateKey.export({ format: 'jwk' }).d,
       };
       await supabase.from('settings').upsert({ key: 'vapid_keys', value: JSON.stringify(_vapid), updated_at: new Date().toISOString() });
-      console.log('🔑 Chaves VAPID geradas e salvas nos settings');
+      console.log('Chaves VAPID geradas e salvas nos settings');
     }
     webpush.setVapidDetails('mailto:solucoesvalorize@gmail.com', _vapid.publicKey, _vapid.privateKey);
-    console.log('✅ Web Push pronto');
+    console.log('Web Push pronto');
   } catch (e) { console.error('Push init error:', e.message); }
 }
 initPush();
@@ -6136,7 +6136,7 @@ app.post('/push/test', async (req, res) => {
     for (const s of subs || []) {
       try {
         await webpush.sendNotification(s.subscription,
-          JSON.stringify({ title: 'VETRA', body: '🔔 Notificações funcionando!', tag: 'push-test' }), { TTL: 300 });
+          JSON.stringify({ title: 'VETRA', body: 'Notificações funcionando!', tag: 'push-test' }), { TTL: 300 });
         results.push({ ok: true });
       } catch (e) {
         results.push({ ok: false, status: e.statusCode || null, msg: String(e.body || e.message || '').substring(0, 150) });
@@ -6155,7 +6155,7 @@ async function sendPushToOwner(owner, payload) {
   // 🔒 SEM DONO = não envia. Antes, avisos "sem dono" iam para TODOS os aparelhos
   // cadastrados sem dono (de contas diferentes) — era o que fazia o contador de
   // uma conta aparecer/sumir por causa da outra.
-  if (!owner) { console.warn('🔕 Push ignorado: mensagem sem dono definido'); return; }
+  if (!owner) { console.warn('Push ignorado: mensagem sem dono definido'); return; }
   try {
     // Total de MENSAGENS não lidas DESTE dono → número no ícone do app
     try {
@@ -6173,7 +6173,7 @@ async function sendPushToOwner(owner, payload) {
       } catch (e) {
         if (e.statusCode === 404 || e.statusCode === 410) {
           await supabase.from('push_subscriptions').delete().eq('endpoint', s.endpoint);
-          console.log('🧹 Inscrição push expirada removida');
+          console.log('Inscrição push expirada removida');
         } else {
           console.error('Push send error:', e.statusCode || e.message);
         }
@@ -6191,7 +6191,7 @@ app.post('/n8n/test', async (req, res) => {
       event: 'test',
       phone: '5500000000000',
       name: 'Teste MeuCRM',
-      content: 'Esta é uma mensagem de teste enviada pelo MeuCRM ✅',
+      content: 'Esta é uma mensagem de teste enviada pelo MeuCRM ',
       type: 'text',
       timestamp: new Date().toISOString(),
       account_id: null,
@@ -6238,8 +6238,8 @@ if (WA_EMBEDDED) {
       const _p = require('path');
       process.env.PATH = (process.env.PATH || '') + _p.delimiter + _p.dirname(require('@ffmpeg-installer/ffmpeg').path);
     } catch (_) {}
-    console.log('✅ Motor de WhatsApp QR embutido (Baileys) carregado');
-  } catch (e) { console.log('⚠️ Baileys não instalado — conexão por QR indisponível:', e.message); }
+    console.log('Motor de WhatsApp QR embutido (Baileys) carregado');
+  } catch (e) { console.log('Baileys não instalado — conexão por QR indisponível:', e.message); }
 }
 
 const _waSocks = {}, _waState = {}, _waPhone = {}, _waErr = {};
@@ -6274,7 +6274,7 @@ async function waCleanupInstance(inst) {
   delete _waSocks[inst]; delete _waState[inst]; delete _waPhone[inst];
   delete _waErr[inst]; delete qrCache[inst]; delete _waQrRetries[inst]; delete _waCreatedAt[inst]; delete _waRegistered[inst]; delete _waPairing[inst];
   try { if (supabase) await supabase.from('wa_sessions').delete().eq('instance', inst); } catch (_) {}
-  console.log(`🧹 Instância não pareada encerrada: ${inst}`);
+  console.log(`Instância não pareada encerrada: ${inst}`);
 }
 
 // Diagnóstico do motor embutido (para depurar sem acesso aos logs)
@@ -6450,7 +6450,7 @@ async function waStart(instanceName) {
   sock.ev.on('connection.update', (u) => {
     const { connection, qr, lastDisconnect } = u;
     if (qr && _qrcode) {
-      console.log(`📲 QR emitido para ${instanceName}`);
+      console.log(`QR emitido para ${instanceName}`);
       _qrcode.toDataURL(qr).then(url => { qrCache[instanceName] = url; }).catch(e => { _waErr[instanceName] = 'qrcode: ' + e.message; });
     }
     if (connection === 'open') {
@@ -6467,7 +6467,7 @@ async function waStart(instanceName) {
       } catch (_) {} })();
       _waReconnDelay[instanceName] = 4000; // conexão ok — volta à espera mínima
       _waPhone[instanceName] = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
-      console.log(`✅ WhatsApp QR conectado: ${instanceName} (${_waPhone[instanceName]})`);
+      console.log(`WhatsApp QR conectado: ${instanceName} (${_waPhone[instanceName]})`);
     }
     if (connection === 'close') {
       _waState[instanceName] = 'close';
@@ -6482,13 +6482,13 @@ async function waStart(instanceName) {
         if (_waQrRetries[instanceName] > 3) { waCleanupInstance(instanceName); return; }
       }
       if (code === _baileys.DisconnectReason.loggedOut) {
-        console.log(`🔌 ${instanceName}: sessão encerrada (logout no celular)`);
+        console.log(`${instanceName}: sessão encerrada (logout no celular)`);
         delete _waSocks[instanceName];
         supabase.from('wa_sessions').delete().eq('instance', instanceName).then(() => {}, () => {});
         // Avisa a dona: número QR desconectado de vez
         (async () => { try {
           const { data: a } = await supabase.from('accounts').select('name, owner').eq('evolution_instance', instanceName).maybeSingle();
-          if (a) addNotice(a.owner, `🔌 O número QR "${a.name}" foi DESCONECTADO (sessão encerrada no celular). Use o botão Reconectar em Contas.`, 'disc:' + instanceName);
+          if (a) addNotice(a.owner, `O número QR "${a.name}" foi DESCONECTADO (sessão encerrada no celular). Use o botão Reconectar em Contas.`, 'disc:' + instanceName);
         } catch (_) {} })();
       } else if (_waSocks[instanceName] === sock) {
         // 515 (restartRequired) chega LOGO APÓS escanear o QR: o WhatsApp exige
@@ -6511,7 +6511,7 @@ async function waStart(instanceName) {
           if (_waRegistered[instanceName] && waitMs >= 64000) {
             (async () => { try {
               const { data: a } = await supabase.from('accounts').select('name, owner').eq('evolution_instance', instanceName).maybeSingle();
-              if (a) addNotice(a.owner, `🔌 O número QR "${a.name}" está DESCONECTADO (sem conseguir reconectar). Verifique o celular ou use Reconectar em Contas.`, 'disc:' + instanceName);
+              if (a) addNotice(a.owner, `O número QR "${a.name}" está DESCONECTADO (sem conseguir reconectar). Verifique o celular ou use Reconectar em Contas.`, 'disc:' + instanceName);
             } catch (_) {} })();
           }
         }
@@ -6595,9 +6595,9 @@ async function waStart(instanceName) {
         const _fl = mm && mm.fileLength;
         const _tamQr = !_fl ? 0 : (typeof _fl.toNumber === 'function' ? _fl.toNumber() : (Number(_fl) || 0));
         if (mm && _tamQr > COFRE_ARQ_MAX_MB * 1048576) {
-          console.log(`📦 Mídia QR de ${Math.round(_tamQr / 1048576)} MB não guardada (limite ${COFRE_ARQ_MAX_MB} MB)`);
+          console.log(`Mídia QR de ${Math.round(_tamQr / 1048576)} MB não guardada (limite ${COFRE_ARQ_MAX_MB} MB)`);
         } else if (mm && supabase && _cofreCheio) {
-          console.log('📦 Cofre no limite — mídia QR não guardada');
+          console.log('Cofre no limite — mídia QR não guardada');
         } else if (mm && supabase) {
           const buf = await _baileys.downloadMediaMessage(m, 'buffer', {}, {
             logger: _pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
@@ -6698,7 +6698,7 @@ async function waFetchAvatar(instanceName, phone, owner) {
       .upload(p, Buffer.from(img.data), { contentType: 'image/jpeg', upsert: true });
     if (upErr) return;
     await supabase.from('contacts').update({ avatar: p }).eq('phone', phone).eq('owner', owner || ' ');
-    console.log(`🖼️ Foto de perfil salva: ${phone}`);
+    console.log(`Foto de perfil salva: ${phone}`);
   } catch (_) {}
 }
 
@@ -6722,7 +6722,7 @@ async function initEmbeddedWa() {
   // Garante o "cofre" de mídias das contas QR (ignora se já existir)
   try {
     const { error: bErr } = await supabase.storage.createBucket('wa-media', { public: false });
-    if (!bErr) console.log('🗂️ Bucket wa-media criado');
+    if (!bErr) console.log('Bucket wa-media criado');
   } catch (_) {}
   try {
     const { data } = await supabase.from('accounts').select('evolution_instance').eq('type', 'evolution');
@@ -6764,7 +6764,7 @@ async function initEmbeddedWa() {
         await waFetchAvatar(inst, r.phone, r.owner);
         await new Promise(rs => setTimeout(rs, 400)); // ritmo suave, sem parecer robô
       }
-      console.log(`🖼️ Varredura de fotos concluída (${(rows || []).length} contatos verificados)`);
+      console.log(`Varredura de fotos concluída (${(rows || []).length} contatos verificados)`);
     } catch (e) { console.error('Varredura de fotos:', e.message); }
     // Repete a cada 6 horas — pega fotos de contatos novos gastando o mínimo
     setTimeout(_avatarSweep, 6 * 3600000);
@@ -6819,7 +6819,7 @@ app.post('/evolution/connect', async (req, res) => {
         const status = inst.instance?.connectionStatus || inst.connectionStatus;
         if (name && name.startsWith('meucrm_') && status !== 'open') {
           await axios.delete(`${EVOLUTION_URL}/instance/delete/${name}`, { headers: evoHdr(), timeout: 8000 }).catch(() => {});
-          console.log('🗑️ Instância antiga removida:', name);
+          console.log('Instância antiga removida:', name);
         }
       }
     } catch(cleanErr) { console.warn('Cleanup warn:', cleanErr.message); }
@@ -6846,7 +6846,7 @@ app.post('/evolution/connect', async (req, res) => {
     // Se não veio, faz APENAS algumas tentativas rápidas (não trava a requisição).
     // O QR também chega de forma assíncrona via webhook (qrCache) e pelo polling do frontend.
     if (!qr) {
-      console.log(`⏳ QR não veio na criação, tentando rápido via /instance/connect...`);
+      console.log(`QR não veio na criação, tentando rápido via /instance/connect...`);
       for (let i = 0; i < 3; i++) {
         await new Promise(r => setTimeout(r, 2000)); // 3 tentativas x 2s = 6s no máximo
         try {
@@ -6856,7 +6856,7 @@ app.post('/evolution/connect', async (req, res) => {
           );
           console.log(`QR attempt ${i+1}:`, JSON.stringify(qrData).substring(0, 200));
           qr = qrData?.base64 || qrData?.qrcode?.base64 || null;
-          if (qr) { console.log(`✅ QR obtido na tentativa ${i+1}`); break; }
+          if (qr) { console.log(`QR obtido na tentativa ${i+1}`); break; }
         } catch(qrErr) {
           console.warn(`QR attempt ${i+1} error:`, qrErr.response?.status, qrErr.message);
         }
@@ -6959,7 +6959,7 @@ app.post('/accounts/:id/reconnect-qr', async (req, res) => {
     await waStart(inst);
     let qr = null;
     for (let i = 0; i < 16 && !qr; i++) { await new Promise(r => setTimeout(r, 500)); qr = qrCache[inst] || null; }
-    console.log(`🔄 Reconexão de QR iniciada para ${inst} — QR: ${qr ? 'SIM' : 'via polling'}`);
+    console.log(`Reconexão de QR iniciada para ${inst} — QR: ${qr ? 'SIM' : 'via polling'}`);
     res.json({ success: true, instance: inst, qr });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -6980,7 +6980,7 @@ app.post('/evolution/save-account', async (req, res) => {
     .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '', owner: req.owner || null }, { onConflict: 'phone_number_id' })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
-  console.log('✅ Conta Evolution salva:', name);
+  console.log('Conta Evolution salva:', name);
   res.json({ success: true, data });
 });
 
@@ -7028,11 +7028,11 @@ app.post('/evolution-webhook', async (req, res) => {
   const loopback = /^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(ipRaw);
   const segredo = process.env.EVOLUTION_WEBHOOK_SECRET;
   const okSecret = segredo && String(req.headers['x-webhook-secret'] || req.query.secret || '') === segredo;
-  if (!loopback && !okSecret) { console.warn('🔒 evolution-webhook recusado de', ipRaw); return res.sendStatus(401); }
+  if (!loopback && !okSecret) { console.warn('evolution-webhook recusado de', ipRaw); return res.sendStatus(401); }
   res.sendStatus(200);
   try {
     const { event, instance: instanceName, data } = req.body;
-    console.log('📩 Evolution webhook:', event, instanceName);
+    console.log('Evolution webhook:', event, instanceName);
 
     if (event === 'messages.upsert') {
       if (!data) return;
@@ -7118,7 +7118,7 @@ app.post('/evolution-webhook', async (req, res) => {
             if (realC) await supabase.from('contacts').delete().eq('id', lidC.id);  // já existe com o número certo — remove o duplicado @lid
             else await supabase.from('contacts').update({ phone }).eq('id', lidC.id); // corrige o número do contato
             await supabase.from('messages').update({ phone }).eq('phone', data.lidJid); // histórico acompanha
-            console.log(`🔁 Contato @lid migrado para o número real: ${data.lidJid} → ${phone}`);
+            console.log(`Contato @lid migrado para o número real: ${data.lidJid} → ${phone}`);
           }
         } catch (e) { console.error('Migração @lid:', e.message); }
       }
@@ -7159,7 +7159,7 @@ app.post('/evolution-webhook', async (req, res) => {
         // no CRM (mensagens enviadas pelo próprio CRM não passam por aqui — dedupe acima)
         if (fromMe) { contactData.unread_count = 0; contactData.first_unread_at = null; }
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
-        if (cErr) console.error('❌ Evolution: erro ao salvar contato:', cErr.message);
+        if (cErr) console.error('Evolution: erro ao salvar contato:', cErr.message);
 
         // Foto de perfil do cliente (busca em segundo plano, só se ainda não tiver)
         if (!fromMe) waFetchAvatar(instanceName, phone, ownerEmail).catch(() => {});
@@ -7172,7 +7172,7 @@ app.post('/evolution-webhook', async (req, res) => {
         if (ownerEmail) msgData.owner = ownerEmail;
         if (data.mediaPath) { msgData.media_id = data.mediaPath; msgData.media_mime_type = data.mediaMime || null; }
         const { error: mErr } = await supabase.from('messages').insert(msgData);
-        if (mErr) console.error('❌ Evolution: erro ao salvar mensagem:', mErr.message);
+        if (mErr) console.error('Evolution: erro ao salvar mensagem:', mErr.message);
         // Extras opcionais (não quebram se as colunas não existirem no banco)
         try {
           if (data._wfJson && wamid) await supabase.from('messages').update({ waveform: data._wfJson }).eq('wamid', wamid).eq('phone', phone);
@@ -7200,10 +7200,10 @@ app.post('/evolution-webhook', async (req, res) => {
       const b64 = data?.qrcode?.base64 || data?.base64 || null;
       if (b64) {
         qrCache[instanceName] = b64.startsWith('data:') ? b64 : 'data:image/png;base64,' + b64;
-        console.log(`📲 QR cacheado para ${instanceName}`);
+        console.log(`QR cacheado para ${instanceName}`);
       }
     } else if (event === 'connection.update') {
-      console.log(`🔌 Evolution ${instanceName}: ${data?.state}`);
+      console.log(`Evolution ${instanceName}: ${data?.state}`);
       // Ao conectar (ou desconectar), o QR antigo não serve mais
       if (data?.state === 'open' || data?.state === 'close') delete qrCache[instanceName];
     }
@@ -7212,4 +7212,4 @@ app.post('/evolution-webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 MeuCRM na porta ${PORT}`));
+app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
