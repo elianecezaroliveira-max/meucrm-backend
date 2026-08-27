@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 229;
+const SERVER_VER = 230;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2078,7 +2078,12 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   // de lá — funciona mesmo depois que a Meta apaga (30 dias) e é mais rápido.
   // A checagem agora é DIRETA (baixa a cópia): a busca por lista falhava às
   // vezes e o arquivo guardado era ignorado — parecia "sumido" antes da hora.
-  let _servirDe = mediaId.startsWith('qr/') ? mediaId : null;
+  // 🔒 Anexo de NOTA INTERNA: só o dono da nota vê
+  if (String(mediaId).startsWith('notas/')) {
+    const marca = Buffer.from(String(req.owner || '')).toString('hex').slice(0, 24);
+    if (!req.owner || String(mediaId).split('/')[1] !== marca) return res.status(403).json({ error: 'Nota de outra conta' });
+  }
+  let _servirDe = (mediaId.startsWith('qr/') || mediaId.startsWith('notas/')) ? mediaId : null;
   let _blobCopia = null;
   if (!_servirDe && supabase) {
     try {
@@ -3412,13 +3417,32 @@ app.get('/bot-media/:arquivo', async (req, res) => {
 // ── 📝 NOTA INTERNA: fica no chat só para o dono (NUNCA vai para o lead) ──
 app.post("/notes", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { phone, content, account_id } = req.body || {};
+  if (!_exigeLogin(req, res)) return;
+  const { phone, content, account_id, arquivo, mime, filename } = req.body || {};
   const txt = String(content || '').trim();
-  if (!phone || !txt) return res.status(400).json({ error: "Telefone e texto são obrigatórios" });
+  if (!phone) return res.status(400).json({ error: "Telefone é obrigatório" });
+  if (!txt && !arquivo) return res.status(400).json({ error: "Escreva algo ou anexe um arquivo" });
+  // 📎 Anexo da nota: fica no NOSSO cofre, numa pasta separada. Nunca passa
+  // pelo WhatsApp — é só para você e sua equipe verem dentro do VETRA.
+  let mediaId = null, mediaMime = null;
+  if (arquivo) {
+    try {
+      const buf = Buffer.from(String(arquivo).replace(/^data:[^,]+,/, ''), 'base64');
+      if (buf.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'Arquivo muito grande (máx. 12 MB)' });
+      mediaMime = String(mime || 'application/octet-stream').split(';')[0].toLowerCase();
+      const ext = (String(filename || '').match(/\.([a-z0-9]{1,6})$/i) || [])[1] || (mediaMime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '');
+      const pasta = 'notas/' + Buffer.from(String(req.owner || 'x')).toString('hex').slice(0, 24);
+      mediaId = `${pasta}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const { error: upErr } = await supabase.storage.from('wa-media').upload(mediaId, buf, { contentType: mediaMime, upsert: false });
+      if (upErr) return res.status(500).json({ error: 'Não consegui guardar o arquivo da nota: ' + upErr.message });
+    } catch (e) { return res.status(400).json({ error: 'Arquivo inválido' }); }
+  }
   const { data, error } = await supabase.from("messages").insert({
-    phone: String(phone), content: txt, type: 'note', direction: 'outbound',
+    phone: String(phone), content: txt || (mediaMime && mediaMime.startsWith('image/') ? '[Foto]' : '[Arquivo]'),
+    type: 'note', direction: 'outbound',
     timestamp: new Date().toISOString(), account_id: account_id || null,
     owner: req.owner || null, status: null,
+    media_id: mediaId, media_mime_type: mediaMime,
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true, data });
