@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 228;
+const SERVER_VER = 229;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2785,11 +2785,12 @@ async function _dripSalva(owner, regras) {
 async function _dripSalvaProgresso(owner, regrasDoTick) {
   const atuais = _dripRegras(owner);
   for (const r of regrasDoTick) {
+    if (!r._tocada && !r._desligarManual && !r._desligarAgendado) continue; // regra que este tick nem encostou
     const a = atuais.find(x => x.id === r.id);
     if (!a) continue;
-    if (r.manual === false && a.manual) a.manual = false;
-    // Só desliga o Automático quando FOI O ROBÔ que decidiu (etapa apagada) — antes,
-    // clicar em "Automático: ligado" durante um tick era desfeito sem aviso
+    // O robô só desliga o que ELE mesmo decidiu desligar (fila acabou / etapa apagada).
+    // Antes, qualquer tick apagava um ▶ Iniciar que você tivesse acabado de clicar.
+    if (r._desligarManual) a.manual = false;
     if (r._desligarAgendado) { a.agendado = false; a.ativo = false; }
     // 🛑 Você mexeu na regra enquanto o robô movia (Parar/zerar/editar): a SUA
     // alteração vence no que é CONFIGURAÇÃO (contador, ciclo).
@@ -2876,7 +2877,7 @@ async function _dripTick() {
         // Etapa apagada (origem ou destino): a regra PARA sozinha e avisa
         if (etapas && etapas.size && (!etapas.has(String(r.de)) || !etapas.has(String(r.para)))) {
           if (r.manual || r.agendado) {
-            r.manual = false; r.agendado = false; r.ativo = false; r._desligarAgendado = true; mudou = true;
+            r.manual = false; r.agendado = false; r.ativo = false; r._desligarManual = true; r._desligarAgendado = true; mudou = true;
             r.last = { quando: new Date().toISOString(), erro: 'Etapa da regra foi apagada — gotejamento desligado' };
             try { addNotice(owner, `⏳ O gotejamento "${r.nome || r.id}" foi DESLIGADO: uma das etapas dele foi apagada.`, 'drip-etapa:' + r.id); } catch (_) {}
           }
@@ -2915,7 +2916,15 @@ async function _dripTick() {
         const { minS, maxS } = _dripMinMax(r); // já dividido pela quantidade de números
         const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
         r.next_at = new Date(Date.now() + espera * 1000).toISOString();
+        r._tocada = true;
         await _dripSalvaProgresso(owner, regras);
+        // (4) POSSE: confere que o horário gravado é o NOSSO. Se outro servidor
+        // (deploy com duas instâncias) gravou primeiro, este tick desiste do lead.
+        try {
+          const { data: conf } = await supabase.from('settings').select('value').eq('key', 'drip_rules::' + owner).maybeSingle();
+          const rc = conf && conf.value ? (JSON.parse(conf.value) || []).find(x => x.id === r.id) : null;
+          if (!rc || rc.next_at !== r.next_at) { r._tocada = false; continue; }
+        } catch (_) { r._tocada = false; continue; }
         // 2) pega UM lead da etapa de origem
         const { data: leads } = await supabase.from('contacts').select('phone, name')
           .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
@@ -2926,20 +2935,20 @@ async function _dripTick() {
           // volta ao estado PARADA — sem "progresso pendente" (era isso que fazia
           // aparecer Retomar/Parar quando entravam leads novos pela planilha).
           r.last = { quando: new Date().toISOString(), vazio: true, total_ciclo: r.movidos || 0 };
-          r.ciclo_fechado = true;
-          if (r.manual) r.manual = false;
+          r.ciclo_fechado = true; r._tocada = true;
+          if (r.manual) { r.manual = false; r._desligarManual = true; }
           continue;
         }
         // 3) move (só se ainda estiver na etapa de origem — evita mover quem você acabou de arrastar à mão)
         const { data: mv, error } = await supabase.from('contacts').update({ stage_id: r.para })
           .eq('phone', lead.phone).eq('owner', owner).eq('stage_id', r.de).select('phone');
-        if (error) { r.last = { quando: new Date().toISOString(), erro: error.message }; continue; }
+        if (error) { r.last = { quando: new Date().toISOString(), erro: error.message }; r._tocada = true; continue; }
         // O lead saiu da etapa entre a busca e o movimento (você arrastou à mão, ou
         // outra regra levou). NÃO é "fila vazia": marca como pulado para não derrubar
         // a trava de intervalo nem encerrar uma fila que varou a madrugada.
-        if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), pulado: true }; continue; }
+        if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), pulado: true }; r._tocada = true; continue; }
         try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
-        r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false;
+        r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false; r._tocada = true;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
         console.log(`⏳ Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
       }
@@ -2949,7 +2958,21 @@ async function _dripTick() {
   }
 }
 // Confere a cada 2 s → o intervalo real fica entre o mínimo e o máximo (+ até 2 s)
-setTimeout(() => { _dripTick(); setInterval(_dripTick, 2000); }, 60000);
+// Regras gravadas na chave ANTIGA (sem a conta): passam para a conta principal,
+// senão apareciam na tela mas nunca rodavam
+setTimeout(async () => {
+  try {
+    if (!supabase) return;
+    if (_settings['drip_rules'] && !_settings['drip_rules::' + OWNER_LEGADO]) {
+      const antigas = JSON.parse(_settings['drip_rules'] || '[]');
+      if (Array.isArray(antigas) && antigas.length) {
+        await _dripSalva(OWNER_LEGADO, antigas);
+        console.log('⏳ Regras de gotejamento antigas migradas para a conta principal:', antigas.length);
+      }
+    }
+  } catch (e) { console.error('⏳ migração das regras antigas:', e.message); }
+}, 20000);
+setTimeout(() => { _dripTick(); setInterval(_dripTick, 2000); }, 30000);
 
 app.get('/drip', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -3003,7 +3026,7 @@ app.put('/drip', async (req, res) => {
     if (Array.isArray(sts)) idsValidos = new Set(sts.map(x => String(x.id)));
   } catch (_) {}
   const _hhmm = v => (/^([01]?\d|2[0-3]):[0-5]\d$/.test(String(v || '')) ? String(v) : '');
-  const limpas = novas.map(r => {
+  const limpas = novas.filter(r => r && typeof r === 'object' && !Array.isArray(r)).map(r => {
     const a = antigas.find(x => x.id === r.id) || {};
     const minN = Math.max(1, parseInt(r.min_seg, 10) || 210), maxN = Math.max(minN, Math.max(1, parseInt(r.max_seg, 10) || 300));
     const numN = (() => { const n = parseInt(r.numeros, 10); return (n >= 1 && n <= 20) ? n : ((a.numeros >= 1 && a.numeros <= 20) ? a.numeros : 1); })();
