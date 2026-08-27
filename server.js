@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 226;
+const SERVER_VER = 227;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2792,7 +2792,9 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
     if (Number(a.reset_seq || 0) !== Number(r.reset_seq || 0)) { if (r.manual === false && a.manual) a.manual = false; continue; }
     a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; a.ciclo_fechado = !!r.ciclo_fechado;
     if (r.manual === false && a.manual) a.manual = false;
-    if (r.agendado === false && a.agendado) { a.agendado = false; a.ativo = false; }
+    // Só desliga o Automático quando FOI O ROBÔ que decidiu (etapa apagada) — antes,
+    // clicar em "Automático: ligado" durante um tick era desfeito sem aviso
+    if (r._desligarAgendado) { a.agendado = false; a.ativo = false; }
   }
   await _dripSalva(owner, atuais);
 }
@@ -2838,8 +2840,11 @@ const _dripStagesCache = {};
 async function _dripEtapasDoDono(owner) {
   const c = _dripStagesCache[owner];
   if (c && Date.now() - c.ts < 60000) return c.set;
-  const { data } = await supabase.from('pipeline_stages').select('id').eq('owner', owner);
-  const set = new Set((data || []).map(x => String(x.id)));
+  const { data, error } = await supabase.from('pipeline_stages').select('id').eq('owner', owner);
+  // Falha na consulta: NÃO guarda lista vazia (isso desligava a proteção de etapa
+  // apagada por 60s). Mantém a lista anterior; se não houver, devolve null.
+  if (error || !Array.isArray(data)) return c ? c.set : null;
+  const set = new Set(data.map(x => String(x.id)));
   _dripStagesCache[owner] = { set, ts: Date.now() };
   return set;
 }
@@ -2858,9 +2863,9 @@ async function _dripTick() {
       for (const r of regras) {
         if (!r.de || !r.para || r.de === r.para) continue;
         // Etapa apagada (origem ou destino): a regra PARA sozinha e avisa
-        if (etapas.size && (!etapas.has(String(r.de)) || !etapas.has(String(r.para)))) {
+        if (etapas && etapas.size && (!etapas.has(String(r.de)) || !etapas.has(String(r.para)))) {
           if (r.manual || r.agendado) {
-            r.manual = false; r.agendado = false; r.ativo = false; mudou = true;
+            r.manual = false; r.agendado = false; r.ativo = false; r._desligarAgendado = true; mudou = true;
             r.last = { quando: new Date().toISOString(), erro: 'Etapa da regra foi apagada — gotejamento desligado' };
             try { addNotice(owner, `⏳ O gotejamento "${r.nome || r.id}" foi DESLIGADO: uma das etapas dele foi apagada.`, 'drip-etapa:' + r.id); } catch (_) {}
           }
@@ -2918,7 +2923,10 @@ async function _dripTick() {
         const { data: mv, error } = await supabase.from('contacts').update({ stage_id: r.para })
           .eq('phone', lead.phone).eq('owner', owner).eq('stage_id', r.de).select('phone');
         if (error) { r.last = { quando: new Date().toISOString(), erro: error.message }; continue; }
-        if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), vazio: true }; continue; }
+        // O lead saiu da etapa entre a busca e o movimento (você arrastou à mão, ou
+        // outra regra levou). NÃO é "fila vazia": marca como pulado para não derrubar
+        // a trava de intervalo nem encerrar uma fila que varou a madrugada.
+        if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), pulado: true }; continue; }
         try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
         r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
@@ -2958,10 +2966,19 @@ app.put('/drip', async (req, res) => {
   // ligar/desligar podia RESSUSCITAR o estado antigo de outra regra.)
   const umaSo = req.body && req.body.regra && req.body.regra.id ? req.body.regra : null;
   const guardadas = _dripRegras(req.owner);
+  // Remover UMA regra pelo id (sem reenviar a lista inteira, que podia estar velha)
+  const removerId = req.body && req.body.remover ? String(req.body.remover) : null;
+  if (removerId) {
+    const restantes = guardadas.filter(x => String(x.id) !== removerId);
+    await _dripSalva(req.owner, restantes);
+    return res.json({ ok: true, regras: restantes });
+  }
   const novas = umaSo
     ? guardadas.map(x => (String(x.id) === String(umaSo.id) ? Object.assign({}, x, umaSo) : x))
     : (Array.isArray(req.body && req.body.regras) ? req.body.regras : null);
-  if (umaSo && !guardadas.some(x => String(x.id) === String(umaSo.id))) novas.push(umaSo);
+  // Regra já removida (em outra aba/aparelho): NÃO ressuscita — só avisa
+  if (umaSo && !guardadas.some(x => String(x.id) === String(umaSo.id)))
+    return res.status(404).json({ error: 'Esta regra foi removida. Atualize a tela.' });
   if (!novas) return res.status(400).json({ error: 'regras[] obrigatório' });
   if (novas.length > 50) return res.status(400).json({ error: 'Máximo de 50 regras.' });
   const antigas = guardadas;
@@ -2979,15 +2996,19 @@ app.put('/drip', async (req, res) => {
     // Mudou o intervalo (ou a quantidade de números) → o PRÓXIMO já obedece o novo
     let nextAt = a.next_at || null;
     if (a.id && (Number(a.min_seg) !== minN || Number(a.max_seg) !== maxN || Number(a.numeros || 1) !== numN)) {
-      const base = (a.last && a.last.quando && !a.last.vazio) ? new Date(a.last.quando).getTime() : null;
+      // Base = último movimento real; se não houver, conta a partir de AGORA.
+      // (Antes ficava null e o próximo lead saía no tick seguinte, sem intervalo.)
+      const base = (a.last && a.last.quando && !a.last.vazio) ? new Date(a.last.quando).getTime() : Date.now();
       const mm = _dripMinMax({ min_seg: minN, max_seg: maxN, numeros: numN });
-      nextAt = base ? new Date(base + (Math.floor(Math.random() * (mm.maxS - mm.minS + 1)) + mm.minS) * 1000).toISOString() : null;
+      const alvo = base + (Math.floor(Math.random() * (mm.maxS - mm.minS + 1)) + mm.minS) * 1000;
+      nextAt = new Date(Math.max(alvo, Date.now() + Math.min(mm.minS, 5) * 1000)).toISOString();
     }
     return {
       id: String(r.id || ('drip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7))),
       nome: String(r.nome || '').slice(0, 60),
       de: String(r.de || ''), para: String(r.para || ''),
-      reset_seq: Number(a.reset_seq || 0) + (r.zerar_movidos ? 1 : 0),
+      // reset_seq muda a cada alteração SUA que o robô não pode desfazer
+      reset_seq: Number(a.reset_seq || 0) + ((r.zerar_movidos || Number(a.min_seg) !== minN || Number(a.max_seg) !== maxN || Number(a.numeros || 1) !== numN || String(a.de || '') !== String(r.de || '') || String(a.para || '') !== String(r.para || '')) ? 1 : 0),
       // ciclo_fechado: a fila acabou e o ciclo terminou (some o "progresso pendente")
       ciclo_fechado: r.zerar_movidos ? false : (r.ciclo_fechado !== undefined ? !!r.ciclo_fechado : !!a.ciclo_fechado),
       min_seg: minN, max_seg: maxN, numeros: numN,
@@ -3000,7 +3021,15 @@ app.put('/drip', async (req, res) => {
       parado_ate: (r.parado_ate && !isNaN(Date.parse(r.parado_ate)) && Date.parse(r.parado_ate) > Date.now()) ? new Date(r.parado_ate).toISOString() : null,
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
     };
-  }).filter(r => r.de && r.para && r.de !== r.para && (!idsValidos || (idsValidos.has(r.de) && idsValidos.has(r.para))));
+  }).filter(r => {
+    if (!r.de || !r.para || r.de === r.para) return false;
+    // Etapa que não existe mais: só recusa a regra que está sendo criada/alterada
+    // agora. As demais continuam salvas (desligadas) para poderem ser recuperadas.
+    const tocada = umaSo ? String(r.id) === String(umaSo.id) : true;
+    const eraConhecida = antigas.some(x => String(x.id) === String(r.id));
+    if (idsValidos && tocada && !(idsValidos.has(r.de) && idsValidos.has(r.para))) return !eraConhecida ? false : true;
+    return true;
+  });
   await _dripSalva(req.owner, limpas);
   res.json({ ok: true, regras: limpas });
 });
