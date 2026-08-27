@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 227;
+const SERVER_VER = 228;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2787,14 +2787,25 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
   for (const r of regrasDoTick) {
     const a = atuais.find(x => x.id === r.id);
     if (!a) continue;
-    // 🛑 Você mexeu na regra enquanto o robô movia (Parar/zerar/editar): a SUA
-    // alteração vence — o robô não regrava o contador nem o "último movido".
-    if (Number(a.reset_seq || 0) !== Number(r.reset_seq || 0)) { if (r.manual === false && a.manual) a.manual = false; continue; }
-    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; a.ciclo_fechado = !!r.ciclo_fechado;
     if (r.manual === false && a.manual) a.manual = false;
     // Só desliga o Automático quando FOI O ROBÔ que decidiu (etapa apagada) — antes,
     // clicar em "Automático: ligado" durante um tick era desfeito sem aviso
     if (r._desligarAgendado) { a.agendado = false; a.ativo = false; }
+    // 🛑 Você mexeu na regra enquanto o robô movia (Parar/zerar/editar): a SUA
+    // alteração vence no que é CONFIGURAÇÃO (contador, ciclo).
+    if (Number(a.reset_seq || 0) !== Number(r.reset_seq || 0)) {
+      // Mas o que ACONTECEU de verdade tem de ficar registrado: se um lead foi
+      // movido agora, o horário dele é gravado e o próximo fica o MAIS TARDE
+      // entre os dois cálculos. (Sem isso, dois leads podiam sair com 5s.)
+      if (r.last && r.last.phone) {
+        a.last = r.last;
+        const t1 = a.next_at ? new Date(a.next_at).getTime() : 0;
+        const t2 = r.next_at ? new Date(r.next_at).getTime() : 0;
+        a.next_at = new Date(Math.max(t1, t2) || Date.now()).toISOString();
+      }
+      continue;
+    }
+    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; a.ciclo_fechado = !!r.ciclo_fechado;
   }
   await _dripSalva(owner, atuais);
 }
@@ -2843,7 +2854,7 @@ async function _dripEtapasDoDono(owner) {
   const { data, error } = await supabase.from('pipeline_stages').select('id').eq('owner', owner);
   // Falha na consulta: NÃO guarda lista vazia (isso desligava a proteção de etapa
   // apagada por 60s). Mantém a lista anterior; se não houver, devolve null.
-  if (error || !Array.isArray(data)) return c ? c.set : null;
+  if (error || !Array.isArray(data)) { console.error('⏳ não consegui ler as etapas do gotejamento:', (error && error.message) || 'resposta vazia'); return c ? c.set : null; }
   const set = new Set(data.map(x => String(x.id)));
   _dripStagesCache[owner] = { set, ts: Date.now() };
   return set;
@@ -2968,6 +2979,8 @@ app.put('/drip', async (req, res) => {
   const guardadas = _dripRegras(req.owner);
   // Remover UMA regra pelo id (sem reenviar a lista inteira, que podia estar velha)
   const removerId = req.body && req.body.remover ? String(req.body.remover) : null;
+  // Criar UMA regra nova sem reenviar a lista (uma lista velha podia apagar as outras)
+  const nova = req.body && req.body.nova ? req.body.nova : null;
   if (removerId) {
     const restantes = guardadas.filter(x => String(x.id) !== removerId);
     await _dripSalva(req.owner, restantes);
@@ -2975,7 +2988,8 @@ app.put('/drip', async (req, res) => {
   }
   const novas = umaSo
     ? guardadas.map(x => (String(x.id) === String(umaSo.id) ? Object.assign({}, x, umaSo) : x))
-    : (Array.isArray(req.body && req.body.regras) ? req.body.regras : null);
+    : (nova ? guardadas.concat([Object.assign({}, nova, { id: undefined })])
+            : (Array.isArray(req.body && req.body.regras) ? req.body.regras : null));
   // Regra já removida (em outra aba/aparelho): NÃO ressuscita — só avisa
   if (umaSo && !guardadas.some(x => String(x.id) === String(umaSo.id)))
     return res.status(404).json({ error: 'Esta regra foi removida. Atualize a tela.' });
@@ -3001,7 +3015,8 @@ app.put('/drip', async (req, res) => {
       const base = (a.last && a.last.quando && !a.last.vazio) ? new Date(a.last.quando).getTime() : Date.now();
       const mm = _dripMinMax({ min_seg: minN, max_seg: maxN, numeros: numN });
       const alvo = base + (Math.floor(Math.random() * (mm.maxS - mm.minS + 1)) + mm.minS) * 1000;
-      nextAt = new Date(Math.max(alvo, Date.now() + Math.min(mm.minS, 5) * 1000)).toISOString();
+      // Se o alvo já passou, conta um intervalo mínimo INTEIRO a partir de agora
+      nextAt = new Date(Math.max(alvo, Date.now() + mm.minS * 1000)).toISOString();
     }
     return {
       id: String(r.id || ('drip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7))),
@@ -3021,17 +3036,24 @@ app.put('/drip', async (req, res) => {
       parado_ate: (r.parado_ate && !isNaN(Date.parse(r.parado_ate)) && Date.parse(r.parado_ate) > Date.now()) ? new Date(r.parado_ate).toISOString() : null,
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
     };
-  }).filter(r => {
-    if (!r.de || !r.para || r.de === r.para) return false;
+  });
+  const recusadas = [];
+  const limpas2 = limpas.filter(r => {
+    if (!r.de || !r.para || r.de === r.para) { recusadas.push('origem e destino inválidos'); return false; }
     // Etapa que não existe mais: só recusa a regra que está sendo criada/alterada
     // agora. As demais continuam salvas (desligadas) para poderem ser recuperadas.
     const tocada = umaSo ? String(r.id) === String(umaSo.id) : true;
     const eraConhecida = antigas.some(x => String(x.id) === String(r.id));
-    if (idsValidos && tocada && !(idsValidos.has(r.de) && idsValidos.has(r.para))) return !eraConhecida ? false : true;
+    if (idsValidos && tocada && !(idsValidos.has(r.de) && idsValidos.has(r.para))) {
+      if (!eraConhecida) { recusadas.push('a etapa escolhida não existe mais'); return false; }
+      return true;
+    }
     return true;
   });
-  await _dripSalva(req.owner, limpas);
-  res.json({ ok: true, regras: limpas });
+  if (recusadas.length && limpas2.length < limpas.length && !umaSo && !removerId)
+    return res.status(400).json({ error: 'Não consegui salvar: ' + recusadas[0] + '.' });
+  await _dripSalva(req.owner, limpas2);
+  res.json({ ok: true, regras: limpas2 });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
