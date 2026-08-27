@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 225;
+const SERVER_VER = 226;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2790,7 +2790,7 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
     // 🛑 Você mexeu na regra enquanto o robô movia (Parar/zerar/editar): a SUA
     // alteração vence — o robô não regrava o contador nem o "último movido".
     if (Number(a.reset_seq || 0) !== Number(r.reset_seq || 0)) { if (r.manual === false && a.manual) a.manual = false; continue; }
-    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos;
+    a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; a.ciclo_fechado = !!r.ciclo_fechado;
     if (r.manual === false && a.manual) a.manual = false;
     if (r.agendado === false && a.agendado) { a.agendado = false; a.ativo = false; }
   }
@@ -2905,14 +2905,22 @@ async function _dripTick() {
           .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
         const lead = leads && leads[0];
         mudou = true;
-        if (!lead) { r.last = { quando: new Date().toISOString(), vazio: true }; if (r.manual) { r.manual = false; } continue; }
+        if (!lead) {
+          // Fila acabou: o ciclo fecha. O total movido vira histórico e a regra
+          // volta ao estado PARADA — sem "progresso pendente" (era isso que fazia
+          // aparecer Retomar/Parar quando entravam leads novos pela planilha).
+          r.last = { quando: new Date().toISOString(), vazio: true, total_ciclo: r.movidos || 0 };
+          r.ciclo_fechado = true;
+          if (r.manual) r.manual = false;
+          continue;
+        }
         // 3) move (só se ainda estiver na etapa de origem — evita mover quem você acabou de arrastar à mão)
         const { data: mv, error } = await supabase.from('contacts').update({ stage_id: r.para })
           .eq('phone', lead.phone).eq('owner', owner).eq('stage_id', r.de).select('phone');
         if (error) { r.last = { quando: new Date().toISOString(), erro: error.message }; continue; }
         if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), vazio: true }; continue; }
         try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
-        r.movidos = (r.movidos || 0) + 1;
+        r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
         console.log(`⏳ Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
       }
@@ -2980,6 +2988,8 @@ app.put('/drip', async (req, res) => {
       nome: String(r.nome || '').slice(0, 60),
       de: String(r.de || ''), para: String(r.para || ''),
       reset_seq: Number(a.reset_seq || 0) + (r.zerar_movidos ? 1 : 0),
+      // ciclo_fechado: a fila acabou e o ciclo terminou (some o "progresso pendente")
+      ciclo_fechado: r.zerar_movidos ? false : (r.ciclo_fechado !== undefined ? !!r.ciclo_fechado : !!a.ciclo_fechado),
       min_seg: minN, max_seg: maxN, numeros: numN,
       manual: !!r.manual,
       agendado: (r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo),
