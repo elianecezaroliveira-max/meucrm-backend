@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 231;
+const SERVER_VER = 232;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2072,7 +2072,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     if (donoDoArquivo && quemPede && String(donoDoArquivo).toLowerCase() !== String(quemPede).toLowerCase())
       return res.status(403).json({ error: 'Arquivo de outra conta' });
   }
-  if (!token && !String(mediaId).startsWith('qr/')) return res.status(400).json({ error: "Token não encontrado" });
+  if (!token && !/^(qr|notas|bot)\//.test(String(mediaId))) return res.status(400).json({ error: "Token não encontrado" });
 
   // 🗄️ Cópia própria (6 meses): se o arquivo já está no NOSSO Storage, serve
   // de lá — funciona mesmo depois que a Meta apaga (30 dias) e é mais rápido.
@@ -2083,7 +2083,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     const marca = Buffer.from(String(req.owner || '')).toString('hex').slice(0, 24);
     if (!req.owner || String(mediaId).split('/')[1] !== marca) return res.status(403).json({ error: 'Nota de outra conta' });
   }
-  let _servirDe = (mediaId.startsWith('qr/') || mediaId.startsWith('notas/')) ? mediaId : null;
+  let _servirDe = (mediaId.startsWith('qr/') || mediaId.startsWith('notas/') || mediaId.startsWith('bot/')) ? mediaId : null;
   let _blobCopia = null;
   if (!_servirDe && supabase) {
     try {
@@ -4442,15 +4442,40 @@ async function _acctPadraoDoLead(phone, owner) {
 async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
   const ts = new Date().toISOString();
   const prev = legenda ? (legenda.length > 80 ? legenda.slice(0, 80) + '…' : legenda) : '[Imagem]';
+  // Caminho da foto no NOSSO cofre (o link é .../bot-media/<arquivo>): guardar isso
+  // faz a imagem APARECER na conversa do CRM, em vez do texto "[Imagem]"
+  let _mediaPath = null, _mediaMime = null;
+  try {
+    const mm = String(imgUrl || '').match(/\/bot-media\/([^?#]+)/);
+    if (mm) {
+      _mediaPath = 'bot/' + decodeURIComponent(mm[1]).replace(/^bot\//, '');
+      const ext = (_mediaPath.split('.').pop() || '').toLowerCase();
+      _mediaMime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif'
+        : ext === 'mp4' ? 'video/mp4' : 'image/jpeg';
+    }
+  } catch (_) {}
   const salva = async (wamid) => {
     if (!supabase) return;
     await supabase.from('messages').insert({
-      phone, content: legenda || '[Imagem]', type: 'image', direction: 'outbound',
+      phone, content: legenda || '[Imagem]',
+      type: (_mediaMime && _mediaMime.startsWith('video/')) ? 'video' : 'image',
+      direction: 'outbound',
       timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: wamid || null,
-      owner: owner || null,
+      owner: owner || null, media_id: _mediaPath, media_mime_type: _mediaMime,
     });
     await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
   };
+  // 🔎 O WhatsApp baixa a foto pelo link. Se o link não abrir, o envio "vai" mas
+  // chega sem imagem — então conferimos ANTES e avisamos com clareza.
+  try {
+    const chk = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 8000, maxContentLength: 20 * 1024 * 1024, validateStatus: c => c === 200 });
+    const tam = (chk.data && chk.data.byteLength) || 0;
+    if (!tam) throw new Error('arquivo vazio');
+  } catch (e) {
+    console.error('❌ Foto do bot inacessível:', imgUrl, e.message);
+    await _recordBotFail(phone, legenda || '[Imagem]', 'A foto deste passo não pôde ser baixada pelo WhatsApp (link fora do ar). Abra o bot, clique no passo e envie a foto de novo.', usedAcctId, owner, 'image');
+    return null;
+  }
   if (acct.evolution_instance) { // QR Code
     const r = await waSendRaw(acct.evolution_instance, phone, { image: { url: imgUrl }, caption: legenda || undefined });
     const wamid = r?.key?.id || null;
