@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 230;
+const SERVER_VER = 231;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2865,6 +2865,9 @@ async function _dripEtapasDoDono(owner) {
   _dripStagesCache[owner] = { set, ts: Date.now() };
   return set;
 }
+// Execuções disparadas À MÃO dentro de uma conversa: o número da conversa fica
+// travado até o fim do fluxo (mesmo depois de uma pausa longa)
+const _runsTravados = new Map();
 const _dripLock = new Set();
 async function _dripTick() {
   if (!supabase) return;
@@ -4721,11 +4724,17 @@ async function getNextNodeId(fromNodeId, edgeLabel) {
 }
 
 async function stopRun(runId, status='completed') {
+  try { _runsTravados.delete(String(runId)); } catch (_) {}
   if (supabase) await supabase.from('bot_runs').update({ status, updated_at:new Date().toISOString() }).eq('id', runId);
 }
 
 async function processNode(run, depth=0) {
   if (!supabase) return;
+  // Recupera a trava do número quando a execução volta do banco (após uma pausa)
+  if (!run._travaConta && run.id && _runsTravados.has(String(run.id))) {
+    run._travaConta = true;
+    if (!run.account_id) run.account_id = _runsTravados.get(String(run.id));
+  }
   if (depth > 30) { // fluxo em círculo: encerra (antes ficava "rodando" para sempre)
     console.error('🤖 Bot com muitos passos seguidos — execução encerrada:', run && run.id);
     try { await stopRun(run.id, 'stopped'); } catch (_) {}
@@ -4753,8 +4762,10 @@ async function processNode(run, depth=0) {
     // Sem número em lugar nenhum? NÃO bloqueia mais: escolhe sozinho o número
     // certo para este lead (o da última conversa dele, o do cadastro ou, em
     // último caso, o primeiro número do dono) — antes o disparo parava com erro.
-    const nodeAcct = cfg.account_id || run.account_id || await _acctPadraoDoLead(phone, botOwner);
-    if (cfg.account_id && run.account_id !== cfg.account_id) {
+    // Disparo manual dentro da conversa: manda SEMPRE pelo número dela
+    const nodeAcct = (run._travaConta && run.account_id) ? run.account_id
+      : (cfg.account_id || run.account_id || await _acctPadraoDoLead(phone, botOwner));
+    if (!run._travaConta && cfg.account_id && run.account_id !== cfg.account_id) {
       try { await supabase.from('bot_runs').update({ account_id: cfg.account_id, updated_at: new Date().toISOString() }).eq('id', runId); } catch (_) {}
       run.account_id = cfg.account_id; // os próximos passos herdam este número
     }
@@ -4824,6 +4835,18 @@ async function processNode(run, depth=0) {
   } else if (node.type === 'round_robin') {
     const branches = cfg.branches || [];
     let chosen = acctId, branchIdx = 0;
+    // 🔒 Disparo manual de dentro da conversa: o número da conversa VENCE o rodízio.
+    // (Antes o rodízio trocava o número — e ainda mudava o número do lead no cadastro.)
+    if (run._travaConta && run.account_id && branches.length) {
+      const iCerto = branches.findIndex(b => String(b && b.account_id) === String(run.account_id));
+      branchIdx = iCerto >= 0 ? iCerto : 0;
+      chosen = run.account_id;
+      console.log(`🔒 Rodízio ignorado: bot disparado na conversa usa o número dela (${run.account_id})`);
+      const nxtT = await getNextNodeId(nodeId, String(branchIdx));
+      if (nxtT) { await supabase.from('bot_runs').update({ current_node_id:nxtT, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run, current_node_id:nxtT, account_id:chosen}, depth+1); }
+      else await stopRun(runId,'completed');
+      return;
+    }
     if (branches.length) {
       const key = 'rr_' + nodeId;
       // Rodízio À PROVA DE CONCORRÊNCIA: incrementa o contador de forma ATÔMICA no banco.
@@ -5060,16 +5083,23 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
   const { data:startNodes } = await supabase.from('bot_nodes').select('id').eq('bot_id',botId).eq('type','start').limit(1);
   const startNode = startNodes && startNodes[0];
   if (!startNode) { console.error('❌ Bot sem nó start:', botId); return null; }
+  // Disparo manual do chat sem número informado: usa o número da PRÓPRIA conversa
+  let contaTravada = (seedAccount && accountId) ? accountId : null;
+  if (seedAccount && !contaTravada) {
+    try { contaTravada = await _acctPadraoDoLead(phone, ownerEmail); } catch (_) {}
+  }
   const { data:run, error } = await supabase.from('bot_runs').insert({
     // account_id começa VAZIO de propósito: o número usado nos envios vem SÓ dos
     // nós configurados ou do Round Robin — nunca de uma conta implícita do lead.
     // EXCEÇÃO (seedAccount): disparo MANUAL de dentro do chat — usa o número da
     // própria conversa (o "Enviar de" que está na tela), escolha explícita da usuária.
-    bot_id:botId, contact_phone:phone, account_id:(seedAccount && accountId) ? accountId : null,
+    bot_id:botId, contact_phone:phone, account_id: contaTravada,
     current_node_id:startNode.id, status:'running', owner:ownerEmail||null,
     created_at:new Date().toISOString(), updated_at:new Date().toISOString()
   }).select().single();
   if (error) { console.error('❌ Bot run insert:', error.message); return null; }
+  // 🔒 Marca que o número veio da CONVERSA: nem o rodízio pode trocar
+  if (seedAccount && contaTravada) { run._travaConta = true; _runsTravados.set(String(run.id), String(contaTravada)); }
   // Disparo manual do chat: devolve já (a tela mostra "bot ativo" na hora) e o
   // primeiro passo roda em seguida — sem o botão ficar travado esperando o envio
   if (emSegundoPlano) { processNode(run).catch(e => console.error('processNode bg:', e.message)); return run; }
