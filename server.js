@@ -33,14 +33,14 @@ async function resolveOwner(req) {
   try {
     const r = await axios.get(`${SUPABASE_URL}/auth/v1/user`, { headers: { Authorization: 'Bearer ' + tok, apikey: SUPABASE_ANON } });
     let email = (r.data?.email || '').toLowerCase() || null;
-    // Cofre compartilhado: todo e-mail autenticado enxerga o cofre principal.
-    // 1) 'owner_aliases' mapeia e-mails específicos; 2) 'owner_default' vale para
-    // todos os demais — assim novos membros só precisam entrar na lista de login.
+    // 🔒 CADA E-MAIL É UMA CONTA SEPARADA. Só entra na conta de outra pessoa quem
+    // estiver na lista de EQUIPE (owner_aliases), adicionada de propósito pela dona
+    // da conta. O antigo "todos caem na conta principal" (owner_default) NÃO existe
+    // mais — era o que fazia um cliente enxergar (e disparar) a conta de outro.
     if (email) {
       try {
         const aliases = JSON.parse(_settings['owner_aliases'] || '{}');
         if (aliases[email]) email = String(aliases[email]).toLowerCase();
-        else if (_settings['owner_default']) email = String(_settings['owner_default']).toLowerCase();
       } catch (_) {}
       _tokenOwner[tok] = { email, ts: Date.now() };
     }
@@ -80,13 +80,17 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("✅ VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 224;
+const SERVER_VER = 225;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
-  let apelidos = 0;
-  try { apelidos = Object.keys(JSON.parse(_settings['owner_aliases'] || '{}')).length; } catch (_) {}
-  return { login_compartilhado: !!_settings['owner_default'], apelidos_de_login: apelidos };
+  let equipe = 0;
+  try { equipe = Object.keys(JSON.parse(_settings['owner_aliases'] || '{}')).length; } catch (_) {}
+  return {
+    login_compartilhado: false, // NUNCA mais: cada e-mail é uma conta
+    config_antiga_no_banco: !!_settings['owner_default'], // se true, está ignorada
+    membros_de_equipe: equipe
+  };
 }
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
@@ -5805,6 +5809,10 @@ async function loadSettings() {
 }
 loadSettings();
 setInterval(loadSettings, 5 * 60 * 1000); // recarrega settings (ex.: novos membros da equipe) sem precisar de redeploy
+// Aviso claro se a configuração antiga de "todos na mesma conta" ainda estiver no banco
+setTimeout(() => {
+  if (_settings['owner_default']) console.warn('⚠️ A configuração antiga "owner_default" existe no banco mas está IGNORADA — cada e-mail agora é uma conta separada. Use a Equipe (Configurações) para compartilhar de propósito.');
+}, 30000);
 
 // 🔒 SEPARAÇÃO POR CONTA: estas chaves eram GLOBAIS (a configuração de uma conta
 // valia para a outra). Agora cada dona tem a sua (chave::email). Os valores
@@ -5827,6 +5835,51 @@ function _cfg(key, owner) {
   if (v !== undefined && v !== null) return v;
   return own === OWNER_LEGADO ? _settings[key] : undefined;
 }
+
+// ── 👥 EQUIPE: e-mails que entram na MINHA conta (e veem os mesmos dados) ──
+function _equipeMapa() { try { return JSON.parse(_settings['owner_aliases'] || '{}') || {}; } catch (_) { return {}; } }
+async function _equipeSalva(mapa) {
+  await supabase.from('settings').upsert({ key: 'owner_aliases', value: JSON.stringify(mapa), updated_at: new Date().toISOString() });
+  _settings['owner_aliases'] = JSON.stringify(mapa);
+  for (const t in _tokenOwner) delete _tokenOwner[t]; // vale na hora (sem esperar 5 min)
+}
+app.get('/equipe', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const mapa = _equipeMapa();
+  const meus = Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase());
+  res.json({ dono: req.owner, membros: meus });
+});
+app.post('/equipe', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'E-mail inválido.' });
+  if (email === String(req.owner).toLowerCase()) return res.status(400).json({ error: 'Este é o seu próprio e-mail.' });
+  const mapa = _equipeMapa();
+  const donoAtual = mapa[email];
+  if (donoAtual && String(donoAtual).toLowerCase() !== String(req.owner).toLowerCase())
+    return res.status(409).json({ error: 'Este e-mail já faz parte de outra conta.' });
+  // Não engole uma conta que já tem dados próprios
+  try {
+    const { count } = await supabase.from('contacts').select('phone', { count: 'exact', head: true }).eq('owner', email);
+    if (count && count > 0) return res.status(409).json({ error: 'Este e-mail já tem uma conta com dados próprios no VETRA. Ele precisa entrar com a conta dele.' });
+  } catch (_) {}
+  mapa[email] = String(req.owner).toLowerCase();
+  await _equipeSalva(mapa);
+  console.log('👥 Equipe: ' + email + ' agora entra na conta de ' + req.owner);
+  res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
+});
+app.delete('/equipe/:email', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const email = _decSeguro(req.params.email).trim().toLowerCase();
+  const mapa = _equipeMapa();
+  if (!mapa[email]) return res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
+  if (String(mapa[email]).toLowerCase() !== String(req.owner).toLowerCase())
+    return res.status(403).json({ error: 'Este e-mail não faz parte da sua conta.' });
+  delete mapa[email];
+  await _equipeSalva(mapa);
+  console.log('👥 Equipe: ' + email + ' saiu da conta de ' + req.owner);
+  res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
+});
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
 const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|.*token.*|.*secret.*)$/i;
