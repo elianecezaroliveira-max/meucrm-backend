@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 241;
+const SERVER_VER = 242;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5920,8 +5920,90 @@ app.get('/tags/manage', async (req, res) => {
   const counts = {};
   (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) counts[t] = (counts[t] || 0) + 1; }));
   _tagCatalog(req.owner).forEach(t => { if (!(t in counts)) counts[t] = 0; });
-  const out = Object.keys(counts).sort((a, b) => a.localeCompare(b)).map(name => ({ name, count: counts[name] }));
+  const cores = _tagCores(req.owner);
+  const out = Object.keys(counts).sort((a, b) => a.localeCompare(b)).map(name => ({ name, count: counts[name], cor: cores[name] ?? null }));
   res.json(out);
+});
+
+// Cor escolhida para cada etiqueta (índice 0..5) — guardada por conta
+function _tagCores(owner) {
+  try { const o = JSON.parse(_cfg('tag_cores', owner) || '{}'); return (o && typeof o === 'object') ? o : {}; }
+  catch (_) { return {}; }
+}
+app.put('/tags/cor', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const name = String(req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'nome obrigatório' });
+  const cor = req.body?.cor;
+  const mapa = _tagCores(req.owner);
+  if (cor == null || cor === '') delete mapa[name];
+  else mapa[name] = Math.max(0, Math.min(5, parseInt(cor, 10) || 0));
+  const k = 'tag_cores::' + (req.owner || ' ');
+  await supabase.from('settings').upsert({ key: k, value: JSON.stringify(mapa), updated_at: new Date().toISOString() });
+  _settings[k] = JSON.stringify(mapa);
+  res.json({ ok: true });
+});
+
+// RENOMEAR (também serve para JUNTAR: se o novo nome já existir, os leads se
+// fundem sem duplicar). Atualiza leads, catálogo, cores, automações e bots.
+app.put('/tags/manage', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const de = String(req.body?.de || '').trim();
+  const para = String(req.body?.para || '').trim();
+  if (!de || !para) return res.status(400).json({ error: 'informe o nome atual e o novo' });
+  if (de === para) return res.json({ ok: true, leads: 0 });
+  const OW = req.owner || ' ';
+  let leads = 0;
+  try {
+    const { data } = await supabase.from('contacts').select('phone, tags').eq('owner', OW);
+    for (const c of data || []) {
+      const tags = c.tags || [];
+      if (!tags.includes(de)) continue;
+      const novas = [...new Set(tags.map(t => (t === de ? para : t)))];
+      await supabase.from('contacts').update({ tags: novas }).eq('phone', c.phone).eq('owner', OW);
+      leads++;
+    }
+    // catálogo
+    const cat = _tagCatalog(req.owner).map(t => (t === de ? para : t));
+    await _saveTagCatalog(cat, req.owner);
+    // cor escolhida acompanha o nome
+    const cores = _tagCores(req.owner);
+    if (cores[de] != null) { cores[para] = cores[de]; delete cores[de]; }
+    const kc = 'tag_cores::' + OW;
+    await supabase.from('settings').upsert({ key: kc, value: JSON.stringify(cores), updated_at: new Date().toISOString() });
+    _settings[kc] = JSON.stringify(cores);
+    // automações por etapa (adicionar/remover/condição)
+    try {
+      const K = 'stage_actions::' + OW;
+      const { data: sa } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+      if (sa?.value) {
+        let cfg = typeof sa.value === 'string' ? JSON.parse(sa.value) : sa.value;
+        let mexeu = false;
+        for (const et in cfg) for (const a of (cfg[et] || [])) {
+          if (Array.isArray(a.add)    && a.add.includes(de))    { a.add    = [...new Set(a.add.map(t => t === de ? para : t))]; mexeu = true; }
+          if (Array.isArray(a.remove) && a.remove.includes(de)) { a.remove = [...new Set(a.remove.map(t => t === de ? para : t))]; mexeu = true; }
+          if (a.cond_tag === de) { a.cond_tag = para; mexeu = true; }
+        }
+        if (mexeu) await supabase.from('settings').upsert({ key: K, value: JSON.stringify(cfg), updated_at: new Date().toISOString() });
+      }
+    } catch (e) { console.error('renomear tag (automações):', e.message); }
+    // passos de bot que usam a etiqueta
+    try {
+      const { data: nodes } = req.owner
+        ? (await supabase.from('bot_nodes').select('id, type, config').eq('owner', req.owner).in('type', ['tags', 'condition']))
+        : { data: [] };
+      for (const n of nodes || []) {
+        let c = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {});
+        let mexeu = false;
+        if (Array.isArray(c.add)    && c.add.includes(de))    { c.add    = [...new Set(c.add.map(t => t === de ? para : t))]; mexeu = true; }
+        if (Array.isArray(c.remove) && c.remove.includes(de)) { c.remove = [...new Set(c.remove.map(t => t === de ? para : t))]; mexeu = true; }
+        if (c.tag === de) { c.tag = para; mexeu = true; }
+        if (mexeu) await supabase.from('bot_nodes').update({ config: c }).eq('id', n.id);
+      }
+      _botGraphLimpa();
+    } catch (e) { console.error('renomear tag (bots):', e.message); }
+    res.json({ ok: true, leads });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Cria/cadastra uma tag no catálogo
@@ -6362,7 +6444,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
