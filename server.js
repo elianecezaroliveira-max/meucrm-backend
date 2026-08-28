@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 239;
+const SERVER_VER = 240;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5219,6 +5219,110 @@ async function handleBotReply(phone, text, owner) {
 // Tipos: task (criar tarefa), complete_task (concluir), tags (editar), move_stage
 // (mudar etapa, com proteção contra loop), create_lead (criar lead fixo).
 // NENHUMA delas envia mensagem ao cliente.
+// REGISTRO DA AUTOMAÇÃO: guarda o que foi feito (últimos 300), para você saber
+// por que um lead mudou de etapa, ganhou etiqueta ou virou tarefa sozinho.
+async function _logAuto(owner, item) {
+  if (!supabase) return;
+  try {
+    const K = 'auto_log::' + (owner || ' ');
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+    if (!Array.isArray(lista)) lista = [];
+    lista.unshift({ ts: new Date().toISOString(), ...item });
+    lista = lista.slice(0, 300);
+    await supabase.from('settings').upsert({ key: K, value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+  } catch (e) { console.error('registro da automação:', e.message); }
+}
+app.get('/automation-log', async (req, res) => {
+  if (!supabase) return res.json([]);
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const { data } = await supabase.from('settings').select('value').eq('key', 'auto_log::' + req.owner).maybeSingle();
+  let v = []; try { v = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  res.json(Array.isArray(v) ? v : []);
+});
+app.delete('/automation-log', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  await supabase.from('settings').upsert({ key: 'auto_log::' + req.owner, value: '[]', updated_at: new Date().toISOString() });
+  res.json({ success: true });
+});
+
+// AÇÕES COM ESPERA: ficam guardadas e saem na hora certa (ciclo de 30s abaixo)
+async function _acoesPendLer(owner) {
+  if (!supabase) return [];
+  const { data } = await supabase.from('settings').select('value').eq('key', 'acoes_agendadas::' + (owner || ' ')).maybeSingle();
+  try { const v = data?.value ? JSON.parse(data.value) : []; return Array.isArray(v) ? v : []; } catch (_) { return []; }
+}
+async function _acoesPendSalvar(owner, lista) {
+  await supabase.from('settings').upsert({ key: 'acoes_agendadas::' + (owner || ' '), value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+}
+let _acoesRodando = false;
+setInterval(async () => {
+  if (!supabase || _acoesRodando) return;
+  _acoesRodando = true;
+  try {
+    const { data } = await supabase.from('settings').select('key, value').like('key', 'acoes_agendadas::%');
+    for (const linha of (data || [])) {
+      let lista = []; try { lista = JSON.parse(linha.value || '[]'); } catch (_) { continue; }
+      if (!Array.isArray(lista) || !lista.length) continue;
+      const agora = Date.now();
+      const vencidas = lista.filter(x => new Date(x.at).getTime() <= agora);
+      if (!vencidas.length) continue;
+      const restam = lista.filter(x => new Date(x.at).getTime() > agora);
+      const donoBruto = linha.key.slice('acoes_agendadas::'.length);
+      const dono = donoBruto === ' ' ? null : donoBruto;
+      // grava PRIMEIRO: queda do servidor no meio não repete a ação
+      await _acoesPendSalvar(dono, restam);
+      for (const it of vencidas) {
+        try { await _execAcaoEtapa(it.acao, it.phone, it.stage_id, dono, 1); }
+        catch (e) { console.error('ação com espera falhou:', e.message); }
+      }
+    }
+  } catch (e) { console.error('ciclo das ações com espera:', e.message); }
+  finally { _acoesRodando = false; }
+}, 30000);
+
+// Executa UMA ação de etapa (usada na hora e também pelas ações com espera)
+async function _execAcaoEtapa(a, phone, stageId, owner, depth = 0) {
+  if (!supabase || !a) return;
+  const OW = owner || ' ';
+  const { data: ctInfo } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
+  const nomeLead = ctInfo?.name || phone;
+  try {
+        if (a.type === 'task' && a.title) {
+          const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
+          const title = applyVars(a.title, ct?.name || phone, phone);
+          const due = a.due_hours ? new Date(Date.now() + Number(a.due_hours) * 3600000).toISOString() : null;
+          await supabase.from('tasks').insert({ phone, title, due_at: due, owner: owner || null, created_at: new Date().toISOString() });
+          await _logAuto(owner, { phone, nome: nomeLead, stage_id: stageId, tipo: 'task', texto: 'Tarefa criada: ' + title });
+        } else if (a.type === 'complete_task') {
+          let q = supabase.from('tasks').update({ done: true }).eq('phone', phone).eq('done', false).eq('owner', OW);
+          if (a.title_filter) q = q.ilike('title', '%' + a.title_filter + '%');
+          await q;
+          await _logAuto(owner, { phone, nome: nomeLead, stage_id: stageId, tipo: 'complete_task', texto: 'Tarefas concluídas' + (a.title_filter ? ' com "' + a.title_filter + '"' : '') });
+        } else if (a.type === 'tags') {
+          const { data: ct } = await supabase.from('contacts').select('tags').eq('phone', phone).eq('owner', OW).maybeSingle();
+          let tags = Array.isArray(ct?.tags) ? ct.tags.slice() : [];
+          (a.add || []).forEach(t => { if (t && !tags.includes(t)) tags.push(t); });
+          if (a.remove && a.remove.length) tags = tags.filter(t => !a.remove.includes(t));
+          await supabase.from('contacts').update({ tags }).eq('phone', phone).eq('owner', OW);
+          await _logAuto(owner, { phone, nome: nomeLead, stage_id: stageId, tipo: 'tags', texto: 'Etiquetas: ' + ((a.add||[]).map(t=>'+'+t).join(' ') + ' ' + (a.remove||[]).map(t=>'−'+t).join(' ')).trim() });
+        } else if (a.type === 'move_stage' && a.stage_id && a.stage_id !== stageId) {
+          await supabase.from('contacts').update({ stage_id: a.stage_id }).eq('phone', phone).eq('owner', OW);
+          await _logAuto(owner, { phone, nome: nomeLead, stage_id: stageId, tipo: 'move_stage', texto: 'Lead movido de etapa pela automação', para: a.stage_id });
+          await fireStageBots(phone, a.stage_id, owner, depth + 1); // encadeia com limite
+        } else if (a.type === 'create_lead' && a.phone) {
+          const np = String(a.phone).replace(/\D/g, '');
+          if (np) {
+            await supabase.from('contacts').upsert(
+              { phone: np, name: a.name || np, stage_id: a.lead_stage_id || null, owner: owner || null },
+              { onConflict: 'owner,phone' });
+            await _logAuto(owner, { phone, nome: nomeLead, stage_id: stageId, tipo: 'create_lead', texto: 'Lead criado: ' + (a.name || np) });
+          }
+        }
+  } catch (e) { console.error('Ação de etapa falhou:', a.type, e.message); }
+}
+
 async function runStageActions(phone, stageId, owner, depth = 0) {
   if (!supabase || depth > 3) return; // proteção contra correntes infinitas de "mudar etapa"
   try {
@@ -5226,33 +5330,31 @@ async function runStageActions(phone, stageId, owner, depth = 0) {
     if (!data || !data.value) return;
     let cfg; try { cfg = typeof data.value === 'string' ? JSON.parse(data.value) : data.value; } catch (_) { return; }
     const actions = (cfg && cfg[stageId]) || [];
+    if (!actions.length) return;
     const OW = owner || ' ';
+    // Etiquetas do lead: lidas UMA vez, para as regras com condição
+    let tagsLead = [];
+    try {
+      const { data: ct } = await supabase.from('contacts').select('tags').eq('phone', phone).eq('owner', OW).maybeSingle();
+      tagsLead = (ct?.tags || []).map(t => String(t).trim().toLowerCase());
+    } catch (_) {}
     for (const a of actions) {
       try {
-        if (a.type === 'task' && a.title) {
-          const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
-          const title = applyVars(a.title, ct?.name || phone, phone);
-          const due = a.due_hours ? new Date(Date.now() + Number(a.due_hours) * 3600000).toISOString() : null;
-          await supabase.from('tasks').insert({ phone, title, due_at: due, owner: owner || null, created_at: new Date().toISOString() });
-        } else if (a.type === 'complete_task') {
-          let q = supabase.from('tasks').update({ done: true }).eq('phone', phone).eq('done', false).eq('owner', OW);
-          if (a.title_filter) q = q.ilike('title', '%' + a.title_filter + '%');
-          await q;
-        } else if (a.type === 'tags') {
-          const { data: ct } = await supabase.from('contacts').select('tags').eq('phone', phone).eq('owner', OW).maybeSingle();
-          let tags = Array.isArray(ct?.tags) ? ct.tags.slice() : [];
-          (a.add || []).forEach(t => { if (t && !tags.includes(t)) tags.push(t); });
-          if (a.remove && a.remove.length) tags = tags.filter(t => !a.remove.includes(t));
-          await supabase.from('contacts').update({ tags }).eq('phone', phone).eq('owner', OW);
-        } else if (a.type === 'move_stage' && a.stage_id && a.stage_id !== stageId) {
-          await supabase.from('contacts').update({ stage_id: a.stage_id }).eq('phone', phone).eq('owner', OW);
-          await fireStageBots(phone, a.stage_id, owner, depth + 1); // encadeia com limite
-        } else if (a.type === 'create_lead' && a.phone) {
-          const np = String(a.phone).replace(/\D/g, '');
-          if (np) await supabase.from('contacts').upsert(
-            { phone: np, name: a.name || np, stage_id: a.lead_stage_id || null, owner: owner || null },
-            { onConflict: 'owner,phone' });
+        if (a.ativo === false) continue;                     // regra desligada
+        if (a.cond_tag) {                                    // condição de etiqueta
+          const tem = tagsLead.includes(String(a.cond_tag).trim().toLowerCase());
+          if (a.cond_negar ? tem : !tem) continue;
         }
+        const espera = Number(a.delay_min) || 0;
+        if (espera > 0) {
+          const pend = await _acoesPendLer(owner);
+          pend.push({ id: 'ac' + Date.now().toString(36) + Math.random().toString(36).slice(2,6),
+                      phone, stage_id: stageId, acao: a,
+                      at: new Date(Date.now() + espera * 60000).toISOString() });
+          await _acoesPendSalvar(owner, pend.slice(-500));
+          continue;
+        }
+        await _execAcaoEtapa(a, phone, stageId, owner, depth);
       } catch (e) { console.error('Ação de etapa falhou:', a.type, e.message); }
     }
   } catch (e) { console.error('runStageActions:', e.message); }
@@ -6242,7 +6344,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
