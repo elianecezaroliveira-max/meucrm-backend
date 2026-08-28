@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 237;
+const SERVER_VER = 238;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3560,7 +3560,9 @@ app.put('/messages/:id/star', async (req, res) => {
 });
 // Mensagens FAVORITADAS (a estrela) — de todas as conversas do dono, mais
 // recentes primeiro, já com o nome do lead para a tela de favoritas.
-app.get('/messages/starred', async (req, res) => {
+// O endereço é /starred (e NÃO /messages/starred): "/messages/:phone" já existe
+// e capturava "starred" como se fosse um número de telefone.
+app.get('/starred', async (req, res) => {
   if (!supabase) return res.json([]);
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
   const { data, error } = await supabase.from('messages')
