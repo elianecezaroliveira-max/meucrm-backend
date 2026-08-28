@@ -41,7 +41,10 @@ async function resolveOwner(req) {
     if (email) {
       try {
         const aliases = JSON.parse(_settings['owner_aliases'] || '{}');
-        if (aliases[email]) email = String(aliases[email]).toLowerCase();
+        if (aliases[email]) {
+          _marcaAcessoEquipe(String(aliases[email]).toLowerCase(), email);
+          email = String(aliases[email]).toLowerCase();
+        }
       } catch (_) {}
       _tokenOwner[tok] = { email, bruto, ts: Date.now() };
     }
@@ -83,7 +86,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 244;
+const SERVER_VER = 245;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6129,6 +6132,76 @@ app.delete('/tags/manage', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── CONSUMO DA CONTA (mensagens, leads, tarefas e espaço) ──
+app.get('/uso-conta', async (req, res) => {
+  if (!supabase) return res.json({});
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  try {
+    const agoraBrt = new Date(Date.now() - 3 * 3600000);
+    const iniMesBrt = new Date(Date.UTC(agoraBrt.getUTCFullYear(), agoraBrt.getUTCMonth(), 1));
+    const mesISO = new Date(iniMesBrt.getTime() + 3 * 3600000).toISOString();
+    const iniDiaBrt = new Date(Date.UTC(agoraBrt.getUTCFullYear(), agoraBrt.getUTCMonth(), agoraBrt.getUTCDate()));
+    const diaISO = new Date(iniDiaBrt.getTime() + 3 * 3600000).toISOString();
+    const conta = (q) => q.then(r => r.count || 0).catch(() => 0);
+    const [enviadasMes, enviadasHoje, recebidasMes, leads, tarefas] = await Promise.all([
+      conta(supabase.from('messages').select('id', { count: 'exact', head: true }).eq('owner', req.owner).eq('direction', 'outbound').gte('timestamp', mesISO)),
+      conta(supabase.from('messages').select('id', { count: 'exact', head: true }).eq('owner', req.owner).eq('direction', 'outbound').gte('timestamp', diaISO)),
+      conta(supabase.from('messages').select('id', { count: 'exact', head: true }).eq('owner', req.owner).eq('direction', 'inbound').gte('timestamp', mesISO)),
+      conta(supabase.from('contacts').select('phone', { count: 'exact', head: true }).eq('owner', req.owner)),
+      conta(supabase.from('tasks').select('id', { count: 'exact', head: true }).eq('owner', req.owner).eq('done', false))
+    ]);
+    let cofre = null;
+    try { const m = await _mapaStorage(); cofre = { mb: m.mb, teto_mb: COFRE_TETO_MB, pct: Math.round((m.bytes / (COFRE_TETO_MB * 1048576)) * 100) }; } catch (_) {}
+    res.json({ enviadas_mes: enviadasMes, enviadas_hoje: enviadasHoje, recebidas_mes: recebidasMes, leads, tarefas_abertas: tarefas, cofre });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── BACKUP: baixa tudo o que é configuração (não leva conversas nem leads) ──
+const _BK_CHAVES = ['quick_replies', 'tag_catalog', 'tag_cores', 'stage_actions', 'drip_rules', 'sheets_sync'];
+app.get('/backup', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  try {
+    const out = { vetra: 'backup', versao: SERVER_VER, dono: req.owner, quando: new Date().toISOString(), settings: {}, bots: [], etapas: [], faqs: [] };
+    for (const k of _BK_CHAVES) {
+      const { data } = await supabase.from('settings').select('value').eq('key', k + '::' + req.owner).maybeSingle();
+      if (data?.value) out.settings[k] = data.value;
+    }
+    const { data: etapas } = await supabase.from('pipeline_stages').select('*').eq('owner', req.owner);
+    out.etapas = etapas || [];
+    const { data: faqs } = await supabase.from('faqs').select('*').eq('owner', req.owner);
+    out.faqs = faqs || [];
+    const { data: bots } = await supabase.from('bots').select('*').eq('owner', req.owner);
+    for (const b of (bots || [])) {
+      const { data: nos } = await supabase.from('bot_nodes').select('*').eq('bot_id', b.id);
+      const { data: lig } = await supabase.from('bot_edges').select('*').eq('bot_id', b.id);
+      out.bots.push({ bot: b, nos: nos || [], ligacoes: lig || [] });
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Restaura SÓ as configurações (respostas rápidas, etiquetas, automações,
+// gotejamento e planilha). Bots e etapas ficam no arquivo, mas não são
+// sobrescritos aqui — mexer neles às cegas quebraria o que está rodando.
+app.post('/backup/restaurar', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const bk = req.body || {};
+  if (bk.vetra !== 'backup' || !bk.settings) return res.status(400).json({ error: 'Arquivo de backup inválido' });
+  const feitos = [];
+  try {
+    for (const k of _BK_CHAVES) {
+      if (bk.settings[k] == null) continue;
+      const val = typeof bk.settings[k] === 'string' ? bk.settings[k] : JSON.stringify(bk.settings[k]);
+      const chave = k + '::' + req.owner;
+      await supabase.from('settings').upsert({ key: chave, value: val, updated_at: new Date().toISOString() });
+      _settings[chave] = val;
+      feitos.push(k);
+    }
+    res.json({ success: true, restaurados: feitos });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── CRUD de Bots ──
 app.get('/bots', async (req,res) => {
   if (!supabase) return res.json([]);
@@ -6503,11 +6576,32 @@ async function _equipeSalva(mapa) {
   _settings['owner_aliases'] = JSON.stringify(mapa);
   for (const t in _tokenOwner) delete _tokenOwner[t]; // vale na hora (sem esperar 5 min)
 }
+// Guarda quando cada pessoa da equipe entrou (no máximo 1 gravação a cada 10 min)
+const _acessoUlt = {};
+async function _marcaAcessoEquipe(dono, email) {
+  try {
+    if (!supabase || !dono || !email) return;
+    const ch = dono + '|' + email;
+    if (Date.now() - (_acessoUlt[ch] || 0) < 600000) return;
+    _acessoUlt[ch] = Date.now();
+    const K = 'equipe_acesso::' + dono;
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    let mapa = {}; try { mapa = data?.value ? JSON.parse(data.value) : {}; } catch (_) {}
+    mapa[email] = new Date().toISOString();
+    await supabase.from('settings').upsert({ key: K, value: JSON.stringify(mapa), updated_at: new Date().toISOString() });
+  } catch (_) {}
+}
+
 app.get('/equipe', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   const mapa = _equipeMapa();
   const meus = Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase());
-  res.json({ dono: req.owner, membros: meus });
+  let acessos = {};
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'equipe_acesso::' + req.owner).maybeSingle();
+    acessos = data?.value ? JSON.parse(data.value) : {};
+  } catch (_) {}
+  res.json({ dono: req.owner, membros: meus, acessos });
 });
 app.post('/equipe', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
@@ -6542,7 +6636,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
