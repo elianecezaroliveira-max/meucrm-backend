@@ -29,10 +29,11 @@ async function resolveOwner(req) {
   const tok = a.startsWith('Bearer ') ? a.slice(7) : null;
   if (!tok || !SUPABASE_URL) return null;
   const c = _tokenOwner[tok];
-  if (c && Date.now() - c.ts < 300000) return c.email;
+  if (c && Date.now() - c.ts < 300000) { req._usuario = c.bruto || c.email; return c.email; }
   try {
     const r = await axios.get(`${SUPABASE_URL}/auth/v1/user`, { headers: { Authorization: 'Bearer ' + tok, apikey: SUPABASE_ANON } });
     let email = (r.data?.email || '').toLowerCase() || null;
+    const bruto = email; // quem REALMENTE está logado (pode ser alguém da equipe)
     // 🔒 CADA E-MAIL É UMA CONTA SEPARADA. Só entra na conta de outra pessoa quem
     // estiver na lista de EQUIPE (owner_aliases), adicionada de propósito pela dona
     // da conta. O antigo "todos caem na conta principal" (owner_default) NÃO existe
@@ -42,13 +43,15 @@ async function resolveOwner(req) {
         const aliases = JSON.parse(_settings['owner_aliases'] || '{}');
         if (aliases[email]) email = String(aliases[email]).toLowerCase();
       } catch (_) {}
-      _tokenOwner[tok] = { email, ts: Date.now() };
+      _tokenOwner[tok] = { email, bruto, ts: Date.now() };
     }
+    req._usuario = bruto;
     return email;
   } catch (e) { return null; }
 }
 app.use(async (req, res, next) => {
   try { req.owner = await resolveOwner(req); } catch (_) { req.owner = null; }
+  req.usuario = req._usuario || null; // quem da EQUIPE está usando o CRM agora
   // Integração externa: token de LONGA DURAÇÃO no cabeçalho X-Api-Token
   // identifica o dono (para n8n, Zapier, planilhas e outras ferramentas)
   if (!req.owner) {
@@ -80,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 235;
+const SERVER_VER = 236;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -850,6 +853,27 @@ app.get("/accounts", async (req, res) => {
   res.json(out);
 });
 
+// ── AUTOR DA MENSAGEM (quem da equipe enviou) ───────────────────────────────
+// A coluna "sent_by" pode não existir no banco de quem ainda não rodou o SQL.
+// Nesse caso o campo simplesmente não é enviado e nada quebra.
+let _temSentBy = null;
+async function _colunaSentBy() {
+  if (_temSentBy !== null) return _temSentBy;
+  if (!supabase) return (_temSentBy = false);
+  try {
+    const { error } = await supabase.from('messages').select('sent_by').limit(1);
+    _temSentBy = !error;
+  } catch (_) { _temSentBy = false; }
+  if (!_temSentBy) console.log('Coluna sent_by ausente — o autor das mensagens não será gravado.');
+  return _temSentBy;
+}
+async function _comAutor(dados, req) {
+  try {
+    if (req && req.usuario && await _colunaSentBy()) return { ...dados, sent_by: req.usuario };
+  } catch (_) {}
+  return dados;
+}
+
 // ── CENTRAL DE AVISOS: registra eventos importantes (ex.: número desconectado)
 // e manda push. Guardado em settings (notices::<dono>), últimos 50, sem repetir
 // o mesmo aviso em menos de 1 hora.
@@ -1300,7 +1324,7 @@ app.post("/send", async (req, res) => {
         const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
         // Inclui owner — sem ele a mensagem não aparece no CRM (o GET /messages filtra por owner)
         await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
-        await supabase.from('messages').insert({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, status: wamid ? 'sent' : 'pending', wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null });
+        await supabase.from('messages').insert(await _comAutor({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, status: wamid ? 'sent' : 'pending', wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null }, req));
       }
       return res.json({ success: true, via: 'evolution' });
     } catch(e) {
@@ -1332,7 +1356,7 @@ app.post("/send", async (req, res) => {
         { onConflict: "owner,phone" }
       );
       const wamid = response.data?.messages?.[0]?.id || null;
-      const { error: msgErr } = await supabase.from("messages").insert({
+      const { error: msgErr } = await supabase.from("messages").insert(await _comAutor({
         phone: to, content: message, type: "text", direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
         // Com o id do WhatsApp em mãos, a mensagem JÁ SAIU → nasce como "enviada"
@@ -1341,7 +1365,7 @@ app.post("/send", async (req, res) => {
         quoted_id: quoted_id || null,
         quoted_content: quoted_content || null,
         quoted_direction: quoted_direction || null,
-      });
+      }, req));
       if (msgErr) {
         console.error("Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
       } else {
@@ -1601,11 +1625,11 @@ app.post("/send-media", async (req, res) => {
           { phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null,
             last_message_preview: content, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
           { onConflict: 'owner,phone' });
-        await supabase.from('messages').insert({
+        await supabase.from('messages').insert(await _comAutor({
           phone: to, content, type: msgType, direction: 'outbound',
           timestamp: new Date().toISOString(), account_id: account_id || null,
           status: 'sent', wamid, owner: req.owner || null,
-          media_id: mediaPathOut, media_mime_type: mediaPathOut ? outMime : null });
+          media_id: mediaPathOut, media_mime_type: mediaPathOut ? outMime : null }, req));
         // Onda REAL da mensagem de voz (opcional — ignora se a coluna não existir)
         try {
           if (req._wfOut && req._wfOut.length && wamid)
@@ -1695,13 +1719,13 @@ app.post("/send-media", async (req, res) => {
           last_message_preview: content, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
         { onConflict: "owner,phone" }
       );
-      await supabase.from("messages").insert({
+      await supabase.from("messages").insert(await _comAutor({
         phone: to, content,
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
         status: mediaWamid ? 'sent' : 'pending', wamid: mediaWamid, owner: req.owner || null,
         media_id: mediaId, media_mime_type: sendMime, // permite exibir a mídia no CRM
-      });
+      }, req));
       await applyPendingStatus(mediaWamid);
     }
     // 🗄️ Guarda uma cópia do que EU enviei por 6 meses (a Meta apaga em ~30 dias)
@@ -3534,6 +3558,25 @@ app.put('/messages/:id/star', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
+// Mensagens FAVORITADAS (a estrela) — de todas as conversas do dono, mais
+// recentes primeiro, já com o nome do lead para a tela de favoritas.
+app.get('/messages/starred', async (req, res) => {
+  if (!supabase) return res.json([]);
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const { data, error } = await supabase.from('messages')
+    .select('id, phone, content, type, direction, timestamp, media_id, media_mime_type, account_id')
+    .eq('owner', req.owner).eq('starred', true)
+    .order('timestamp', { ascending: false }).limit(300);
+  if (error) return res.status(500).json({ error: error.message });
+  const fones = [...new Set((data || []).map(m => m.phone))];
+  const nomes = {};
+  if (fones.length) {
+    const { data: cs } = await supabase.from('contacts').select('phone, name')
+      .eq('owner', req.owner).in('phone', fones);
+    (cs || []).forEach(c => { nomes[c.phone] = c.name; });
+  }
+  res.json((data || []).map(m => ({ ...m, contact_name: nomes[m.phone] || m.phone })));
+});
 app.put('/messages/:id/pin', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('messages').update({ pinned: !!req.body.pinned })
@@ -3645,11 +3688,11 @@ app.post("/send-template", async (req, res) => {
       { onConflict: "owner,phone" }
     );
     const tplWamid = response.data?.messages?.[0]?.id || null;
-    await supabase.from("messages").insert({
+    await supabase.from("messages").insert(await _comAutor({
       phone: to, content: shownText, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
       status: tplWamid ? 'sent' : 'pending', wamid: tplWamid, owner: req.owner || null,
-    });
+    }, req));
     await applyPendingStatus(tplWamid);
     console.log("Template enviado:", template_name, "→", to, "wamid:", tplWamid);
     res.json({ success: true, data: response.data });
@@ -3982,7 +4025,7 @@ async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
   if (!supabase) return;
   const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
   await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
-  await supabase.from('messages').insert({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, status: wamid ? 'sent' : 'pending', wamid: wamid || null, owner: req.owner || null });
+  await supabase.from('messages').insert(await _comAutor({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, status: wamid ? 'sent' : 'pending', wamid: wamid || null, owner: req.owner || null }, req));
 }
 
 // 📍 Enviar localização (QR e API oficial)
