@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 242;
+const SERVER_VER = 243;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -832,7 +832,7 @@ app.post("/auth/whatsapp", async (req, res) => {
 app.get("/accounts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase
-    .from("accounts").select("id, name, phone_number_id, phone_display, type, evolution_instance, created_at")
+    .from("accounts").select("id, name, phone_number_id, phone_display, waba_id, type, evolution_instance, created_at")
     .eq("owner", req.owner || ' ')
     .order("created_at", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
@@ -845,8 +845,10 @@ app.get("/accounts", async (req, res) => {
       status = _waState[acc.evolution_instance] === 'open' ? 'connected' : 'disconnected';
     } else if (acc.phone_number_id) {
       status = await cloudApiStatus(acc.id);
-      const mot = _acctStatusCache[acc.id]?.motivo;
-      if (status === 'disconnected' && mot) return { ...acc, status, status_motivo: mot };
+      const ca = _acctStatusCache[acc.id] || {};
+      const extra = { qualidade: ca.qualidade || null, limite: ca.limite || null };
+      if (status === 'disconnected' && ca.motivo) return { ...acc, status, status_motivo: ca.motivo, ...extra };
+      return { ...acc, status, ...extra };
     }
     return { ...acc, status };
   }));
@@ -942,6 +944,7 @@ async function cloudApiStatus(accId) {
   if (c && Date.now() - c.ts < 5 * 60000) return c.status;
   const anterior = c?.status;
   let status = 'disconnected', motivo = 'token inválido ou expirado', instavel = false;
+  let qualidade = c?.qualidade || null, limite = c?.limite || null;
   try {
     const { data: a } = await supabase.from('accounts').select('phone_number_id, token, evolution_instance').eq('id', accId).maybeSingle();
     // BLINDAGEM: conta QR nunca é avaliada como API (mesmo com credencial de resquício)
@@ -954,9 +957,11 @@ async function cloudApiStatus(accId) {
       // Pergunta o ESTADO REAL do número (não só se o token responde): a Meta pode
       // ter DESATIVADO/RESTRINGIDO o número mesmo com o token funcionando.
       const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}`,
-        { params: { access_token: a.token, fields: 'id,status,quality_rating,name_status,code_verification_status' }, timeout: 8000 });
+        { params: { access_token: a.token, fields: 'id,status,quality_rating,name_status,code_verification_status,messaging_limit_tier' }, timeout: 8000 });
       const st = String(r.data?.status || '').toUpperCase();
       _acctFalhas[accId] = 0; // a Meta respondeu: o que vier daqui é confiável
+      qualidade = r.data?.quality_rating || null;
+      limite    = r.data?.messaging_limit_tier || null;
       if (r.data?.id && (st === 'CONNECTED' || st === '')) status = 'connected';
       else if (r.data?.id) {
         status = 'disconnected';
@@ -995,7 +1000,7 @@ async function cloudApiStatus(accId) {
   // Instabilidade: mantém o que já se sabia, não avisa nada e tenta de novo em 1 min
   if (instavel) {
     const st = anterior || 'connected';
-    _acctStatusCache[accId] = { status: st, ts: Date.now() - 4 * 60000, motivo: c?.motivo };
+    _acctStatusCache[accId] = { status: st, ts: Date.now() - 4 * 60000, motivo: c?.motivo, qualidade, limite };
     return st;
   }
   // Mudou para DESCONECTADA (inclusive na primeira checagem após reiniciar) → avisa
@@ -1020,7 +1025,7 @@ async function cloudApiStatus(accId) {
       if (a2) clearNoticeDisc(a2.owner, 'disc:' + accId);
     } catch (_) {}
   }
-  _acctStatusCache[accId] = { status, ts: Date.now(), motivo };
+  _acctStatusCache[accId] = { status, ts: Date.now(), motivo, qualidade, limite };
   return status;
 }
 
@@ -1072,6 +1077,56 @@ setInterval(async () => {
     }
   } catch (_) {}
 }, 15 * 60000);
+
+// Quantas mensagens SAÍRAM por número (hoje e nos últimos 7 dias, horário de Brasília)
+app.get('/accounts/uso', async (req, res) => {
+  if (!supabase) return res.json({});
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  try {
+    const agoraBrt = new Date(Date.now() - 3 * 3600000);
+    const inicioHojeBrt = new Date(Date.UTC(agoraBrt.getUTCFullYear(), agoraBrt.getUTCMonth(), agoraBrt.getUTCDate()));
+    const hojeISO = new Date(inicioHojeBrt.getTime() + 3 * 3600000).toISOString();
+    const semanaISO = new Date(Date.now() - 7 * 86400000).toISOString();
+    const { data } = await supabase.from('messages').select('account_id, timestamp')
+      .eq('owner', req.owner).eq('direction', 'outbound').gte('timestamp', semanaISO).limit(20000);
+    const out = {};
+    for (const m of (data || [])) {
+      const k = m.account_id || 'sem';
+      if (!out[k]) out[k] = { hoje: 0, semana: 0 };
+      out[k].semana++;
+      if (m.timestamp >= hojeISO) out[k].hoje++;
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// O que depende deste número (para avisar antes de excluir)
+app.get('/accounts/:id/dependencias', async (req, res) => {
+  if (!supabase) return res.json({ conversas: 0, mensagens: 0, bots: [] });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const id = req.params.id;
+  try {
+    const { count: conversas } = await supabase.from('contacts')
+      .select('phone', { count: 'exact', head: true }).eq('owner', req.owner).eq('account_id', id);
+    const { count: mensagens } = await supabase.from('messages')
+      .select('id', { count: 'exact', head: true }).eq('owner', req.owner).eq('account_id', id);
+    // bots que enviam por este número (passo de mensagem ou opção do rodízio)
+    const bots = [];
+    const { data: nodes } = await supabase.from('bot_nodes').select('bot_id, config').eq('owner', req.owner);
+    const ids = new Set();
+    for (const n of (nodes || [])) {
+      let c = {}; try { c = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); } catch (_) {}
+      const usa = String(c.account_id || '') === String(id)
+        || (Array.isArray(c.branches) && c.branches.some(b => String(b && b.account_id) === String(id)));
+      if (usa) ids.add(n.bot_id);
+    }
+    if (ids.size) {
+      const { data: bs } = await supabase.from('bots').select('id, name').in('id', [...ids]).eq('owner', req.owner);
+      (bs || []).forEach(b => bots.push(b.name));
+    }
+    res.json({ conversas: conversas || 0, mensagens: mensagens || 0, bots });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── Adicionar conta manualmente ──
 // Faz o MESMO ritual do fluxo do Facebook: número visível, WABA (modelos!),
