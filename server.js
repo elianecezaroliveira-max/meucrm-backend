@@ -80,7 +80,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 234;
+const SERVER_VER = 235;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -909,10 +909,15 @@ app.put('/notices/read', async (req, res) => {
 // Status da conta da API oficial (checa o token na Meta, com cache de 5 min
 // para não gastar recursos do Railway a cada carregamento)
 const _acctStatusCache = {};
+// Falhas SEGUIDAS por conta. Uma falha isolada (timeout, 5xx da Meta, queda de
+// rede do servidor) NÃO é desconexão — sem isso o CRM avisava "DESCONECTADA"
+// e, 15 min depois, "RESTABELECIDA", sem nada ter mudado de verdade.
+const _acctFalhas = {};
 async function cloudApiStatus(accId) {
   const c = _acctStatusCache[accId];
   if (c && Date.now() - c.ts < 5 * 60000) return c.status;
-  let status = 'disconnected', motivo = 'token inválido ou expirado';
+  const anterior = c?.status;
+  let status = 'disconnected', motivo = 'token inválido ou expirado', instavel = false;
   try {
     const { data: a } = await supabase.from('accounts').select('phone_number_id, token, evolution_instance').eq('id', accId).maybeSingle();
     // BLINDAGEM: conta QR nunca é avaliada como API (mesmo com credencial de resquício)
@@ -927,6 +932,7 @@ async function cloudApiStatus(accId) {
       const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}`,
         { params: { access_token: a.token, fields: 'id,status,quality_rating,name_status,code_verification_status' }, timeout: 8000 });
       const st = String(r.data?.status || '').toUpperCase();
+      _acctFalhas[accId] = 0; // a Meta respondeu: o que vier daqui é confiável
       if (r.data?.id && (st === 'CONNECTED' || st === '')) status = 'connected';
       else if (r.data?.id) {
         status = 'disconnected';
@@ -942,14 +948,34 @@ async function cloudApiStatus(accId) {
         };
         motivo = mapa[st] || ('estado na Meta: ' + st);
       }
-    } else motivo = 'faltam credenciais (Phone Number ID/Token) no CRM';
+    } else { _acctFalhas[accId] = 0; motivo = 'faltam credenciais (Phone Number ID/Token) no CRM'; }
   } catch (e) {
-    status = 'disconnected';
-    const m = e.response?.data?.error?.message;
-    if (m) motivo = m;
+    const http = e.response?.status;
+    const err  = e.response?.data?.error || {};
+    const cod  = Number(err.code);
+    const msg  = err.message || '';
+    // Token realmente revogado/expirado/sem permissão (a Meta respondeu dizendo isso)
+    const credencialRuim = cod === 190 || cod === 102 || cod === 10 ||
+                           (cod >= 200 && cod <= 299) || http === 401 || http === 403;
+    const n = (_acctFalhas[accId] = (_acctFalhas[accId] || 0) + 1);
+    if (credencialRuim && n >= 2) {
+      status = 'disconnected';
+      motivo = msg || 'token inválido ou expirado';
+    } else if (!credencialRuim && n >= 6) {
+      status = 'disconnected';
+      motivo = 'não consegui falar com a Meta (' + (msg || e.code || e.message || 'sem resposta') + ')';
+    } else {
+      instavel = true; // 1ª falha, ou instabilidade passageira: não alarma ninguém
+    }
+  }
+  // Instabilidade: mantém o que já se sabia, não avisa nada e tenta de novo em 1 min
+  if (instavel) {
+    const st = anterior || 'connected';
+    _acctStatusCache[accId] = { status: st, ts: Date.now() - 4 * 60000, motivo: c?.motivo };
+    return st;
   }
   // Mudou para DESCONECTADA (inclusive na primeira checagem após reiniciar) → avisa
-  const prev = _acctStatusCache[accId]?.status;
+  const prev = anterior;
   if (status === 'disconnected' && prev !== 'disconnected') {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
