@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 240;
+const SERVER_VER = 241;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3679,13 +3679,31 @@ app.get("/templates", async (req, res) => {
   if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
   try {
     const response = await axios.get(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, {
-      params: { access_token: account.token, fields: "id,name,status,category,language,components", limit: 100 },
+      params: { access_token: account.token, fields: "id,name,status,category,language,components,rejected_reason,quality_score", limit: 100 },
     });
     res.json(response.data.data || []);
   } catch (err) {
     console.error("Erro ao listar templates:", err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao listar templates" });
   }
+});
+
+// Modelos escondidos no CRM (a Meta às vezes recusa apagar; então o VETRA só
+// esconde). Guardar na conta faz o "excluir" valer em todos os aparelhos.
+app.get('/tmpl-ocultos', async (req, res) => {
+  if (!supabase) return res.json([]);
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const { data } = await supabase.from('settings').select('value').eq('key', 'tmpl_ocultos::' + req.owner).maybeSingle();
+  let v = []; try { v = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  res.json(Array.isArray(v) ? v : []);
+});
+app.put('/tmpl-ocultos', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).slice(0, 500) : [];
+  const { error } = await supabase.from('settings').upsert({ key: 'tmpl_ocultos::' + req.owner, value: JSON.stringify(ids), updated_at: new Date().toISOString() });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 // ── Criar template ──
