@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 236;
+const SERVER_VER = 237;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3577,6 +3577,88 @@ app.get('/messages/starred', async (req, res) => {
   }
   res.json((data || []).map(m => ({ ...m, contact_name: nomes[m.phone] || m.phone })));
 });
+// ── MENSAGENS AGENDADAS ─────────────────────────────────────────────────────
+// Ficam guardadas em settings (agendadas::<dono>) e saem sozinhas na hora certa.
+const _AG_CHAVE = o => 'agendadas::' + (o || ' ');
+async function _agLer(owner) {
+  if (!supabase) return [];
+  const { data } = await supabase.from('settings').select('value').eq('key', _AG_CHAVE(owner)).maybeSingle();
+  try { const v = data?.value ? JSON.parse(data.value) : []; return Array.isArray(v) ? v : []; } catch (_) { return []; }
+}
+async function _agSalvar(owner, lista) {
+  await supabase.from('settings').upsert({ key: _AG_CHAVE(owner), value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+}
+app.get('/scheduled', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const lista = await _agLer(req.owner);
+  res.json(lista.sort((a, b) => new Date(a.at) - new Date(b.at)));
+});
+app.post('/scheduled', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const to = String(req.body?.to || '').replace(/\D/g, '');
+  const message = String(req.body?.message || '').trim();
+  const account_id = req.body?.account_id || null;
+  const quando = new Date(req.body?.at || '').getTime();
+  if (!to || !message) return res.status(400).json({ error: 'Informe a conversa e o texto da mensagem' });
+  if (!isFinite(quando)) return res.status(400).json({ error: 'Data e hora inválidas' });
+  if (quando < Date.now() + 30000) return res.status(400).json({ error: 'Escolha um horário pelo menos 1 minuto à frente' });
+  if (quando > Date.now() + 400 * 86400000) return res.status(400).json({ error: 'Horário muito distante (máximo 1 ano)' });
+  if (!account_id) return res.status(400).json({ error: 'Escolha por qual número a mensagem vai sair' });
+  const { data: a } = await supabase.from('accounts').select('id').eq('id', account_id).eq('owner', req.owner).maybeSingle();
+  if (!a) return res.status(400).json({ error: 'Esse número não é desta conta' });
+  const lista = await _agLer(req.owner);
+  if (lista.length >= 200) return res.status(400).json({ error: 'Limite de 200 mensagens agendadas ao mesmo tempo' });
+  const item = {
+    id: 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+    phone: to, text: message, account_id,
+    at: new Date(quando).toISOString(),
+    criada_em: new Date().toISOString(), por: req.usuario || null
+  };
+  lista.push(item);
+  await _agSalvar(req.owner, lista);
+  res.json({ success: true, item });
+});
+app.delete('/scheduled/:id', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const lista = await _agLer(req.owner);
+  const nova = lista.filter(x => String(x.id) !== String(req.params.id));
+  if (nova.length === lista.length) return res.status(404).json({ error: 'Agendamento não encontrado' });
+  await _agSalvar(req.owner, nova);
+  res.json({ success: true });
+});
+// Motor: a cada 30s manda o que já venceu. A lista é gravada ANTES do envio,
+// para que uma queda do servidor no meio nunca mande a mesma mensagem duas vezes.
+let _agRodando = false;
+setInterval(async () => {
+  if (!supabase || _agRodando) return;
+  _agRodando = true;
+  try {
+    const { data } = await supabase.from('settings').select('key, value').like('key', 'agendadas::%');
+    for (const linha of (data || [])) {
+      let lista = [];
+      try { lista = JSON.parse(linha.value || '[]'); } catch (_) { continue; }
+      if (!Array.isArray(lista) || !lista.length) continue;
+      const agora = Date.now();
+      const vencidas = lista.filter(x => new Date(x.at).getTime() <= agora);
+      if (!vencidas.length) continue;
+      const restam = lista.filter(x => new Date(x.at).getTime() > agora);
+      await supabase.from('settings').upsert({ key: linha.key, value: JSON.stringify(restam), updated_at: new Date().toISOString() });
+      const donoBruto = linha.key.slice('agendadas::'.length);
+      const dono = donoBruto === ' ' ? null : donoBruto;
+      for (const it of vencidas) {
+        try {
+          stopBotRunsForPhone(it.phone, dono); // é um envio seu: o bot deste lead para
+          await sendBotMsg(it.phone, it.account_id, it.text, dono, it.account_id, null);
+          console.log('Agendada enviada:', it.phone, '→', new Date(it.at).toISOString());
+        } catch (e) { console.error('Agendada falhou:', e.message); }
+      }
+    }
+  } catch (e) { console.error('tick agendadas:', e.message); }
+  finally { _agRodando = false; }
+}, 30000);
+
 app.put('/messages/:id/pin', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('messages').update({ pinned: !!req.body.pinned })
@@ -6114,7 +6196,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
