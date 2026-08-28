@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 243;
+const SERVER_VER = 244;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -409,7 +409,7 @@ app.post("/webhook", async (req, res) => {
           } else {
             txt = `Qualidade do modelo ${modelo}: ${value?.previous_quality_score || '?'} → ${value?.new_quality_score || '?'}${sufixo}`;
           }
-          if (txt) addNotice(ownerN, txt, 'tmpl:' + change.field + ':' + wabaId + ':' + tName + ':' + (value?.event || value?.new_category || value?.new_quality_score || ''));
+          if (txt) addNotice(ownerN, txt, 'tmpl:' + change.field + ':' + wabaId + ':' + tName + ':' + (value?.event || value?.new_category || value?.new_quality_score || ''), { tipo: /APROVADO|VERIFICAD/i.test(txt) ? 'ok' : /REPROVADO|DESATIVADO|PAUSADO|SINALIZADO/i.test(txt) ? 'erro' : 'info', alvo: 'modelos' });
         } catch (e) { console.error('Evento de modelo Meta:', e.message); }
         continue;
       }
@@ -453,7 +453,7 @@ app.post("/webhook", async (req, res) => {
             const ev = String(value?.event || '');
             txt = `Qualidade do número atualizada${sufixo}: ${ev}${value?.current_limit ? ` — limite de envio: ${value.current_limit}` : ''}`;
           }
-          if (txt) addNotice(ownerN, txt, 'meta:' + change.field + ':' + wabaId + ':' + (value?.decision || value?.event || ''));
+          if (txt) addNotice(ownerN, txt, 'meta:' + change.field + ':' + wabaId + ':' + (value?.decision || value?.event || ''), { tipo: /APROVAD|VERIFICAD/i.test(txt) ? 'ok' : /REJEITAD|DESATIVAD|RESTRINGID|VIOLA|EXCLU/i.test(txt) ? 'erro' : 'info', alvo: 'contas' });
         } catch (e) { console.error('Evento de conta Meta:', e.message); }
         continue;
       }
@@ -879,7 +879,7 @@ async function _comAutor(dados, req) {
 // ── CENTRAL DE AVISOS: registra eventos importantes (ex.: número desconectado)
 // e manda push. Guardado em settings (notices::<dono>), últimos 50, sem repetir
 // o mesmo aviso em menos de 1 hora.
-async function addNotice(owner, text, dedupeKey) {
+async function addNotice(owner, text, dedupeKey, opts) {
   if (!supabase) return;
   try {
     const K = 'notices::' + (owner || ' ');
@@ -896,8 +896,13 @@ async function addNotice(owner, text, dedupeKey) {
       const ultReconn = list.find(n => n.k === 'reconn:' + idAlvo);
       if (ultDisc && (!ultReconn || ultDisc.ts > ultReconn.ts)) return;
     }
-    list.unshift({ text, ts: now, k: dedupeKey || null, read: false });
-    list = list.slice(0, 50);
+    list.unshift({
+      id: 'av' + now.toString(36) + Math.random().toString(36).slice(2, 7),
+      text, ts: now, k: dedupeKey || null, read: false,
+      tipo: (opts && opts.tipo) || 'info',   // erro | ok | info
+      alvo: (opts && opts.alvo) || null      // contas | modelos | automacao | bots
+    });
+    list = list.slice(0, 80);
     await supabase.from('settings').upsert({ key: K, value: JSON.stringify(list), updated_at: new Date().toISOString() });
     sendPushToOwner(owner || null, { title: 'VETRA — Aviso', body: text, tag: 'notice' }).catch(() => {});
   } catch (e) { console.error('addNotice:', e.message); }
@@ -920,6 +925,35 @@ app.get('/notices', async (req, res) => {
   let v = [];
   try { v = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
   res.json({ value: v });
+});
+app.delete('/notices', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  await supabase.from('settings').upsert({ key: 'notices::' + req.owner, value: '[]', updated_at: new Date().toISOString() });
+  res.json({ success: true });
+});
+app.delete('/notices/:id', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const K = 'notices::' + req.owner;
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  let list = []; try { list = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  const id = String(req.params.id);
+  const nova = list.filter(n => String(n.id || n.ts) !== id);
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(nova), updated_at: new Date().toISOString() });
+  res.json({ success: true });
+});
+// Marcar UM aviso como lido ou não lido (para deixar pendente o que falta tratar)
+app.put('/notices/item/:id', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const K = 'notices::' + req.owner;
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  let list = []; try { list = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  const id = String(req.params.id), lido = !!req.body?.read;
+  list = list.map(n => (String(n.id || n.ts) === id ? { ...n, read: lido } : n));
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(list), updated_at: new Date().toISOString() });
+  res.json({ success: true });
 });
 app.put('/notices/read', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -1008,14 +1042,14 @@ async function cloudApiStatus(accId) {
   if (status === 'disconnected' && prev !== 'disconnected') {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
-      if (a) addNotice(a.owner, `A conta da API oficial "${a.name}" está DESCONECTADA — ${motivo}. Verifique em Contas.`, 'disc:' + accId);
+      if (a) addNotice(a.owner, `A conta da API oficial "${a.name}" está DESCONECTADA — ${motivo}. Verifique em Contas.`, 'disc:' + accId, { tipo: 'erro', alvo: 'contas' });
     } catch (_) {}
   }
   // Estava DESCONECTADA e VOLTOU → avisa a boa notícia também
   if (status === 'connected' && prev === 'disconnected') {
     try {
       const { data: a } = await supabase.from('accounts').select('name, owner').eq('id', accId).maybeSingle();
-      if (a) addNotice(a.owner, `A conta da API oficial "${a.name}" foi RESTABELECIDA e está conectada novamente!`, 'reconn:' + accId);
+      if (a) addNotice(a.owner, `A conta da API oficial "${a.name}" foi RESTABELECIDA e está conectada novamente!`, 'reconn:' + accId, { tipo: 'ok', alvo: 'contas' });
     } catch (_) {}
   }
   // Conectada (por qualquer caminho) → libera novo aviso para uma queda futura
@@ -2992,7 +3026,7 @@ async function _dripTick() {
           if (r.manual || r.agendado) {
             r.manual = false; r.agendado = false; r.ativo = false; r._desligarManual = true; r._desligarAgendado = true; mudou = true;
             r.last = { quando: new Date().toISOString(), erro: 'Etapa da regra foi apagada — gotejamento desligado' };
-            try { addNotice(owner, `O gotejamento "${r.nome || r.id}" foi DESLIGADO: uma das etapas dele foi apagada.`, 'drip-etapa:' + r.id); } catch (_) {}
+            try { addNotice(owner, `O gotejamento "${r.nome || r.id}" foi DESLIGADO: uma das etapas dele foi apagada.`, 'drip-etapa:' + r.id, { tipo: 'erro', alvo: 'automacao' }); } catch (_) {}
           }
           continue;
         }
@@ -3048,6 +3082,10 @@ async function _dripTick() {
           // volta ao estado PARADA — sem "progresso pendente" (era isso que fazia
           // aparecer Retomar/Parar quando entravam leads novos pela planilha).
           r.last = { quando: new Date().toISOString(), vazio: true, total_ciclo: r.movidos || 0 };
+          if (r.movidos > 0) {
+            try { addNotice(owner, 'O gotejamento "' + (r.nome || 'sem nome') + '" terminou: ' + r.movidos + ' lead(s) movido(s).',
+              'drip-fim:' + r.id + ':' + (r.movidos || 0), { tipo: 'ok', alvo: 'automacao' }); } catch (_) {}
+          }
           r.ciclo_fechado = true; r._tocada = true;
           if (r.manual) { r.manual = false; r._desligarManual = true; }
           continue;
@@ -3961,7 +3999,7 @@ app.delete("/pipeline/stages/:id", async (req, res) => {
       if (String(r.de) !== String(req.params.id) && String(r.para) !== String(req.params.id)) continue;
       if (r.manual || r.agendado) { r.manual = false; r.agendado = false; r.ativo = false; mexeu = true; }
     }
-    if (mexeu) { await _dripSalva(req.owner, regras); addNotice(req.owner, `Gotejamento(s) que usavam a etapa "${st?.name || ''}" foram desligados.`, 'drip-del:' + req.params.id); }
+    if (mexeu) { await _dripSalva(req.owner, regras); addNotice(req.owner, `Gotejamento(s) que usavam a etapa "${st?.name || ''}" foram desligados.`, 'drip-del:' + req.params.id, { tipo: 'erro', alvo: 'automacao' }); }
     delete _dripStagesCache[req.owner];
   } catch (e) { console.error('drip pós-exclusão de etapa:', e.message); }
   res.json({ success: true, leads_movidos: (leads || []).length });
@@ -4635,6 +4673,11 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
       account_id: accountId || null, status: 'failed', error_info: fullErr, owner: owner || null
     });
     const prev = String(content || '').slice(0, 80);
+    // Avisa que um bot não está conseguindo enviar (1 aviso por hora, por número)
+    try {
+      addNotice(owner, 'Um bot não conseguiu enviar uma mensagem' + (acctName ? ' pelo número "' + acctName + '"' : '') + ': ' + (errText || 'falha no envio'),
+        'botfail:' + (accountId || 'sem'), { tipo: 'erro', alvo: 'bots' });
+    } catch (_) {}
     await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
   } catch(e) { console.error('recordBotFail:', e.message); }
 }
@@ -6942,7 +6985,7 @@ async function waStart(instanceName) {
         // Avisa a dona: número QR desconectado de vez
         (async () => { try {
           const { data: a } = await supabase.from('accounts').select('name, owner').eq('evolution_instance', instanceName).maybeSingle();
-          if (a) addNotice(a.owner, `O número QR "${a.name}" foi DESCONECTADO (sessão encerrada no celular). Use o botão Reconectar em Contas.`, 'disc:' + instanceName);
+          if (a) addNotice(a.owner, `O número QR "${a.name}" foi DESCONECTADO (sessão encerrada no celular). Use o botão Reconectar em Contas.`, 'disc:' + instanceName, { tipo: 'erro', alvo: 'contas' });
         } catch (_) {} })();
       } else if (_waSocks[instanceName] === sock) {
         // 515 (restartRequired) chega LOGO APÓS escanear o QR: o WhatsApp exige
@@ -6965,7 +7008,7 @@ async function waStart(instanceName) {
           if (_waRegistered[instanceName] && waitMs >= 64000) {
             (async () => { try {
               const { data: a } = await supabase.from('accounts').select('name, owner').eq('evolution_instance', instanceName).maybeSingle();
-              if (a) addNotice(a.owner, `O número QR "${a.name}" está DESCONECTADO (sem conseguir reconectar). Verifique o celular ou use Reconectar em Contas.`, 'disc:' + instanceName);
+              if (a) addNotice(a.owner, `O número QR "${a.name}" está DESCONECTADO (sem conseguir reconectar). Verifique o celular ou use Reconectar em Contas.`, 'disc:' + instanceName, { tipo: 'erro', alvo: 'contas' });
             } catch (_) {} })();
           }
         }
