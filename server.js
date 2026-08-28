@@ -83,7 +83,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 238;
+const SERVER_VER = 239;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5121,6 +5121,25 @@ async function processNode(run, depth=0) {
       else await stopRun(runId,'completed');
     }
 
+  } else if (node.type === 'condition') {
+    // Olha o cadastro do lead e escolhe o caminho: Sim (__sim__) ou Não (__nao__)
+    let bate = false;
+    try {
+      const { data: ct } = await supabase.from('contacts').select('tags, stage_id')
+        .eq('phone', phone).eq('owner', OW).maybeSingle();
+      if (cfg.campo === 'etapa') {
+        bate = String(ct?.stage_id || '') === String(cfg.stage_id || '');
+      } else {
+        const alvo = String(cfg.tag || '').trim().toLowerCase();
+        const tags = (ct?.tags || []).map(t => String(t).trim().toLowerCase());
+        bate = !!alvo && tags.includes(alvo);
+      }
+      if (cfg.negar) bate = !bate;
+    } catch (e) { console.error('condição do bot:', e.message); }
+    const nxt = await getNextNodeId(nodeId, bate ? '__sim__' : '__nao__');
+    if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+    else await stopRun(runId,'completed');
+
   } else if (node.type === 'move_stage') {
     if (cfg.stage_id) await supabase.from('contacts').update({ stage_id:cfg.stage_id }).eq('phone',phone).eq('owner',OW);
     const nxt = await getNextNodeId(nodeId, null);
@@ -5136,8 +5155,33 @@ async function processNode(run, depth=0) {
   }
 }
 
+// Encerra a sequência do bot quando o LEAD responde, se o bot pedir isso
+// (chave no passo "Início"). Não mexe em execuções que estão ESPERANDO resposta:
+// nessas a resposta é justamente o que faz o fluxo seguir.
+async function _paraBotSeLeadRespondeu(phone, owner) {
+  if (!supabase) return;
+  try {
+    let q = supabase.from('bot_runs').select('id, bot_id')
+      .eq('contact_phone', phone).in('status', ['running', 'paused']);
+    if (owner) q = q.eq('owner', owner);
+    const { data: runs } = await q;
+    if (!runs || !runs.length) return;
+    for (const r of runs) {
+      const { data: ini } = await supabase.from('bot_nodes').select('config')
+        .eq('bot_id', r.bot_id).eq('type', 'start').limit(1).maybeSingle();
+      let cfg = {};
+      try { cfg = typeof ini?.config === 'string' ? JSON.parse(ini.config) : (ini?.config || {}); } catch (_) {}
+      if (cfg && cfg.parar_ao_responder) {
+        await stopRun(r.id, 'stopped');
+        console.log('Bot encerrado: o lead respondeu (' + phone + ')');
+      }
+    }
+  } catch (e) { console.error('parar bot ao responder:', e.message); }
+}
+
 async function handleBotReply(phone, text, owner) {
   if (!supabase) return false;
+  await _paraBotSeLeadRespondeu(phone, owner);
   let rq = supabase.from('bot_runs').select('*').eq('contact_phone',phone).eq('status','waiting_reply').order('created_at',{ascending:false}).limit(1);
   if (owner) rq = rq.eq('owner', owner); // só a run do dono certo (telefone pode repetir entre donos)
   const { data:run } = await rq.maybeSingle();
