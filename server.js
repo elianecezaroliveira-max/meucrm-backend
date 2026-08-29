@@ -86,7 +86,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 246;
+const SERVER_VER = 247;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -941,6 +941,24 @@ app.get('/historico', async (req, res) => {
       out.push({ chave: base, nome: _HIST_CHAVES[base], ts: v.ts, por: v.por || null, itens });
     });
   }
+  // Versões do FLUXO dos bots (guardadas antes de cada salvamento)
+  try {
+    const { data: snaps } = await supabase.from('settings').select('key, value').like('key', 'bot_snap::' + req.owner + '::%');
+    const nomes = {};
+    if ((snaps || []).length) {
+      const ids = (snaps || []).map(x => x.key.split('::').pop());
+      const { data: bs } = await supabase.from('bots').select('id, name').in('id', ids).eq('owner', req.owner);
+      (bs || []).forEach(b => { nomes[b.id] = b.name; });
+    }
+    for (const linha of (snaps || [])) {
+      const botId = linha.key.split('::').pop();
+      let lista = []; try { lista = JSON.parse(linha.value || '[]'); } catch (_) {}
+      (Array.isArray(lista) ? lista : []).forEach(v => out.push({
+        chave: 'bot:' + botId, nome: 'Fluxo do bot "' + (nomes[botId] || botId) + '"',
+        ts: v.ts, por: null, itens: (v.nos || []).length
+      }));
+    }
+  } catch (e) { console.error('histórico dos bots:', e.message); }
   out.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
   res.json(out);
 });
@@ -949,6 +967,27 @@ app.post('/historico/restaurar', async (req, res) => {
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
   const base = String(req.body?.chave || '');
   const ts = String(req.body?.ts || '');
+  // Fluxo de bot: volta os passos e as ligações daquele salvamento
+  if (base.startsWith('bot:')) {
+    const botId = base.slice(4);
+    const { data: own } = await supabase.from('bots').select('id, name').eq('id', botId).eq('owner', req.owner).maybeSingle();
+    if (!own) return res.status(404).json({ error: 'Bot não encontrado' });
+    const { data: sn } = await supabase.from('settings').select('value').eq('key', 'bot_snap::' + req.owner + '::' + botId).maybeSingle();
+    let lista = []; try { lista = sn?.value ? JSON.parse(sn.value) : []; } catch (_) {}
+    const alvo = (Array.isArray(lista) ? lista : []).find(v => String(v.ts) === ts);
+    if (!alvo) return res.status(404).json({ error: 'Versão não encontrada' });
+    try {
+      const { data: nosAgora } = await supabase.from('bot_nodes').select('*').eq('bot_id', botId);
+      const { data: ligAgora } = await supabase.from('bot_edges').select('*').eq('bot_id', botId);
+      if ((nosAgora || []).length) await _botSnapSalvar(req.owner, botId, nosAgora || [], ligAgora || []);
+      await supabase.from('bot_edges').delete().eq('bot_id', botId);
+      await supabase.from('bot_nodes').delete().eq('bot_id', botId);
+      if ((alvo.nos || []).length)      await supabase.from('bot_nodes').insert(alvo.nos);
+      if ((alvo.ligacoes || []).length) await supabase.from('bot_edges').insert(alvo.ligacoes);
+      _botGraphLimpa();
+      return res.json({ success: true, nome: 'Fluxo do bot "' + own.name + '"' });
+    } catch (e) { _botGraphLimpa(); return res.status(500).json({ error: e.message }); }
+  }
   if (!_HIST_CHAVES[base] || !ts) return res.status(400).json({ error: 'Escolha uma versão válida' });
   const K = base + '::' + req.owner;
   const { data } = await supabase.from('settings').select('value').eq('key', 'hist::' + K).maybeSingle();
@@ -6429,39 +6468,6 @@ app.put('/bots/:id/flow', async (req,res) => {
       devolvido: voltou
     });
   }
-});
-// Versões anteriores do fluxo de um bot (guardadas antes de cada salvamento)
-app.get('/bots/:id/versoes', async (req, res) => {
-  if (!supabase) return res.json([]);
-  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
-  const K = 'bot_snap::' + req.owner + '::' + req.params.id;
-  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
-  let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
-  res.json((Array.isArray(lista) ? lista : []).map(v => ({ ts: v.ts, passos: (v.nos || []).length, ligacoes: (v.ligacoes || []).length })));
-});
-app.post('/bots/:id/versoes/restaurar', async (req, res) => {
-  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
-  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
-  const botId = req.params.id, ts = String(req.body?.ts || '');
-  const { data: own } = await supabase.from('bots').select('id').eq('id', botId).eq('owner', req.owner).maybeSingle();
-  if (!own) return res.status(404).json({ error: 'Bot não encontrado' });
-  const K = 'bot_snap::' + req.owner + '::' + botId;
-  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
-  let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
-  const alvo = (Array.isArray(lista) ? lista : []).find(v => String(v.ts) === ts);
-  if (!alvo) return res.status(404).json({ error: 'Versão não encontrada' });
-  try {
-    // o fluxo de agora também vira cópia, antes de voltar atrás
-    const { data: nosAgora } = await supabase.from('bot_nodes').select('*').eq('bot_id', botId);
-    const { data: ligAgora } = await supabase.from('bot_edges').select('*').eq('bot_id', botId);
-    if ((nosAgora || []).length) await _botSnapSalvar(req.owner, botId, nosAgora || [], ligAgora || []);
-    await supabase.from('bot_edges').delete().eq('bot_id', botId);
-    await supabase.from('bot_nodes').delete().eq('bot_id', botId);
-    if ((alvo.nos || []).length)      await supabase.from('bot_nodes').insert(alvo.nos);
-    if ((alvo.ligacoes || []).length) await supabase.from('bot_edges').insert(alvo.ligacoes);
-    _botGraphLimpa();
-    res.json({ success: true, passos: (alvo.nos || []).length });
-  } catch (e) { _botGraphLimpa(); res.status(500).json({ error: e.message }); }
 });
 // Duplicar um bot (copia config, nós e arestas com novos ids)
 app.post('/bots/:id/duplicate', async (req,res) => {
