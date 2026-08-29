@@ -86,7 +86,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 247;
+const SERVER_VER = 248;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3979,6 +3979,44 @@ app.delete("/templates/:template_id", async (req, res) => {
   }
 });
 
+// ── LIXEIRA DOS MODELOS ──
+// Antes de apagar na Meta, o VETRA guarda o modelo inteiro aqui. Assim dá para
+// recriar depois, sem depender da Meta ter mantido alguma cópia (ela não mantém).
+app.get('/tmpl-lixeira', async (req, res) => {
+  if (!supabase) return res.json([]);
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const { data } = await supabase.from('settings').select('value').eq('key', 'tmpl_lixeira::' + req.owner).maybeSingle();
+  let v = []; try { v = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  res.json(Array.isArray(v) ? v : []);
+});
+app.post('/tmpl-lixeira', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const t = req.body?.modelo;
+  if (!t || !t.name) return res.status(400).json({ error: 'Modelo inválido' });
+  const K = 'tmpl_lixeira::' + req.owner;
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  if (!Array.isArray(lista)) lista = [];
+  lista = lista.filter(x => String(x.id) !== String(t.id));
+  lista.unshift({ id: t.id || ('t' + Date.now()), name: t.name, language: t.language || 'pt_BR',
+                  category: t.category || 'MARKETING', components: t.components || [],
+                  account_id: req.body?.account_id || null, apagado_em: new Date().toISOString() });
+  lista = lista.slice(0, 40);
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+  res.json({ success: true });
+});
+app.delete('/tmpl-lixeira/:id', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const K = 'tmpl_lixeira::' + req.owner;
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  const nova = (Array.isArray(lista) ? lista : []).filter(x => String(x.id) !== String(req.params.id));
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(nova), updated_at: new Date().toISOString() });
+  res.json({ success: true });
+});
+
 // ── Enviar template ──
 app.post("/send-template", async (req, res) => {
   let { to, account_id, template_name, language_code, components, body_text } = req.body;
@@ -6815,7 +6853,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
