@@ -86,7 +86,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 245;
+const SERVER_VER = 246;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -878,6 +878,92 @@ async function _comAutor(dados, req) {
   } catch (_) {}
   return dados;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REDE DE SEGURANÇA: nada de configuração é substituído sem antes guardar a
+// versão anterior, e uma gravação "vazia" por cima de dados nunca passa sozinha.
+// ═══════════════════════════════════════════════════════════════════════════
+const _HIST_MAX = 8; // quantas versões anteriores ficam guardadas por chave
+
+function _vazio(v) {
+  if (v == null) return true;
+  if (typeof v === 'string') { const t = v.trim(); return !t || t === '[]' || t === '{}' || t === 'null'; }
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === 'object') return Object.keys(v).length === 0;
+  return false;
+}
+async function _guardaHistorico(chave, valorAntigo, quem) {
+  try {
+    if (!supabase || _vazio(valorAntigo)) return;
+    const K = 'hist::' + chave;
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+    if (!Array.isArray(lista)) lista = [];
+    const txt = typeof valorAntigo === 'string' ? valorAntigo : JSON.stringify(valorAntigo);
+    if (lista[0] && lista[0].value === txt) return; // nada mudou de verdade
+    lista.unshift({ ts: new Date().toISOString(), por: quem || null, value: txt });
+    lista = lista.slice(0, _HIST_MAX);
+    await supabase.from('settings').upsert({ key: K, value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+  } catch (e) { console.error('histórico de ' + chave + ':', e.message); }
+}
+// Grava uma configuração com as duas travas: histórico + bloqueio do "apagar tudo"
+async function _gravaConfigSegura(chave, novoValor, req, opts) {
+  const K = chave;
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  const antigo = data?.value ?? null;
+  const forcar = String(req?.query?.confirmar || '') === '1';
+  if (!forcar && _vazio(novoValor) && !_vazio(antigo)) {
+    const err = new Error('Gravação recusada: isso apagaria tudo o que está salvo. Se for de propósito, repita com confirmar=1.');
+    err.status = 409; err.vazio = true;
+    throw err;
+  }
+  await _guardaHistorico(K, antigo, req?.usuario || null);
+  const txt = typeof novoValor === 'string' ? novoValor : JSON.stringify(novoValor);
+  const { error } = await supabase.from('settings').upsert({ key: K, value: txt, updated_at: new Date().toISOString() });
+  if (error) throw error;
+  _settings[K] = txt;
+  return true;
+}
+// Versões anteriores de uma configuração (para o cliente voltar atrás sozinho)
+const _HIST_CHAVES = { quick_replies: 'Respostas rápidas', stage_actions: 'Automações por etapa',
+  drip_rules: 'Gotejamento', tag_catalog: 'Etiquetas', tag_cores: 'Cores das etiquetas',
+  sheets_sync: 'Planilha do Google', tmpl_ocultos: 'Modelos escondidos' };
+app.get('/historico', async (req, res) => {
+  if (!supabase) return res.json([]);
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const out = [];
+  for (const base in _HIST_CHAVES) {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'hist::' + base + '::' + req.owner).maybeSingle();
+    let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+    (Array.isArray(lista) ? lista : []).forEach(v => {
+      let itens = 0;
+      try { const o = JSON.parse(v.value); itens = Array.isArray(o) ? o.length : Object.keys(o || {}).length; } catch (_) {}
+      out.push({ chave: base, nome: _HIST_CHAVES[base], ts: v.ts, por: v.por || null, itens });
+    });
+  }
+  out.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+  res.json(out);
+});
+app.post('/historico/restaurar', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const base = String(req.body?.chave || '');
+  const ts = String(req.body?.ts || '');
+  if (!_HIST_CHAVES[base] || !ts) return res.status(400).json({ error: 'Escolha uma versão válida' });
+  const K = base + '::' + req.owner;
+  const { data } = await supabase.from('settings').select('value').eq('key', 'hist::' + K).maybeSingle();
+  let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  const alvo = (Array.isArray(lista) ? lista : []).find(v => String(v.ts) === ts);
+  if (!alvo) return res.status(404).json({ error: 'Versão não encontrada' });
+  try {
+    // a versão ATUAL também entra no histórico antes de voltar atrás
+    const { data: at } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    await _guardaHistorico(K, at?.value ?? null, req.usuario || null);
+    await supabase.from('settings').upsert({ key: K, value: alvo.value, updated_at: new Date().toISOString() });
+    _settings[K] = alvo.value;
+    res.json({ success: true, nome: _HIST_CHAVES[base] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── CENTRAL DE AVISOS: registra eventos importantes (ex.: número desconectado)
 // e manda push. Guardado em settings (notices::<dono>), últimos 50, sem repetir
@@ -5489,10 +5575,10 @@ app.get('/stage-actions', async (req, res) => {
 });
 app.put('/stage-actions', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
-  const v = JSON.stringify(req.body?.value || {});
-  const { error } = await supabase.from('settings').upsert({ key: 'stage_actions::' + (req.owner || ' '), value: v, updated_at: new Date().toISOString() });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
+  try {
+    await _gravaConfigSegura('stage_actions::' + (req.owner || ' '), req.body?.value || {}, req);
+    res.json({ success: true });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message, vazio: !!e.vazio }); }
 });
 
 // Dispara todos os bots com gatilho "entrou na etapa" para um lead (do dono certo)
@@ -6006,7 +6092,7 @@ function _tagCatalog(owner) {
   try { const a = JSON.parse(_cfg('tag_catalog', owner) || '[]'); return Array.isArray(a) ? a : []; }
   catch (_) { return []; }
 }
-async function _saveTagCatalog(arr, owner) {
+async function _saveTagCatalog(arr, owner, req) {
   const uniq = Array.from(new Set(arr.filter(Boolean)));
   const k = 'tag_catalog::' + (owner || ' '); // catálogo POR CONTA
   await supabase.from('settings').upsert({ key: k, value: JSON.stringify(uniq), updated_at: new Date().toISOString() });
@@ -6276,12 +6362,56 @@ app.get('/bots/:id/flow', async (req,res) => {
   ]);
   res.json({nodes:nr.data||[],edges:er.data||[]});
 });
+// SALVAR O FLUXO DO BOT — o ponto mais delicado do sistema: apagar e reinserir
+// não tem "desfazer" no banco. Aqui vão três travas:
+//   1) fluxo vazio NUNCA substitui um fluxo que tem passos (a não ser com confirmar=1);
+//   2) o fluxo anterior é guardado ANTES de qualquer exclusão (últimas 5 versões);
+//   3) se a regravação falhar no meio, o fluxo anterior VOLTA sozinho.
+async function _botSnapSalvar(owner, botId, nos, ligacoes) {
+  try {
+    const K = 'bot_snap::' + (owner || ' ') + '::' + botId;
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+    if (!Array.isArray(lista)) lista = [];
+    lista.unshift({ ts: new Date().toISOString(), nos, ligacoes });
+    lista = lista.slice(0, 5);
+    await supabase.from('settings').upsert({ key: K, value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+  } catch (e) { console.error('cópia do fluxo do bot:', e.message); }
+}
 app.put('/bots/:id/flow', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { nodes,edges } = req.body;
   const botId = req.params.id;
   const { data: own } = await supabase.from('bots').select('id').eq('id',botId).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
+
+  // Como está hoje no banco (a rede de segurança)
+  const { data: nosAntes }  = await supabase.from('bot_nodes').select('*').eq('bot_id', botId);
+  const { data: ligAntes }  = await supabase.from('bot_edges').select('*').eq('bot_id', botId);
+  const tinha = (nosAntes || []).length;
+  const forcar = String(req.query?.confirmar || '') === '1';
+
+  // TRAVA 1: nada de gravar um fluxo vazio por cima de um bot que tem passos
+  if (!forcar && !(nodes && nodes.length) && tinha > 0) {
+    return res.status(409).json({
+      error: 'Gravação recusada: o fluxo chegou vazio e este bot tem ' + tinha + ' passo(s) salvo(s). Recarregue a página e abra o bot de novo.',
+      vazio: true, passos_salvos: tinha
+    });
+  }
+  // TRAVA 2: guarda o fluxo atual antes de encostar em qualquer coisa
+  if (tinha > 0) await _botSnapSalvar(req.owner, botId, nosAntes || [], ligAntes || []);
+
+  const _volta = async () => {
+    try {
+      await supabase.from('bot_edges').delete().eq('bot_id', botId);
+      await supabase.from('bot_nodes').delete().eq('bot_id', botId);
+      if ((nosAntes || []).length) await supabase.from('bot_nodes').insert(nosAntes);
+      if ((ligAntes || []).length) await supabase.from('bot_edges').insert(ligAntes);
+      _botGraphLimpa();
+      return true;
+    } catch (e) { console.error('não consegui devolver o fluxo antigo:', e.message); return false; }
+  };
+
   try {
     _botGraphLimpa();
     await supabase.from('bot_edges').delete().eq('bot_id',botId);
@@ -6290,7 +6420,48 @@ app.put('/bots/:id/flow', async (req,res) => {
     if (edges?.length) { const { error:ee } = await supabase.from('bot_edges').insert(edges.map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'', owner:req.owner||null }))); if (ee) throw ee; }
     _botGraphLimpa(); // limpa de novo DEPOIS de gravar (o fluxo novo entra em vigor na hora)
     res.json({success:true});
-  } catch(err) { _botGraphLimpa(); res.status(500).json({error:err.message}); }
+  } catch(err) {
+    // TRAVA 3: deu errado no meio → devolve exatamente como estava
+    const voltou = tinha > 0 ? await _volta() : true;
+    _botGraphLimpa();
+    res.status(500).json({
+      error: err.message + (voltou ? ' — o fluxo anterior foi devolvido, nada foi perdido.' : ' — ATENÇÃO: não consegui devolver o fluxo anterior. Use Configurações → Versões anteriores.'),
+      devolvido: voltou
+    });
+  }
+});
+// Versões anteriores do fluxo de um bot (guardadas antes de cada salvamento)
+app.get('/bots/:id/versoes', async (req, res) => {
+  if (!supabase) return res.json([]);
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const K = 'bot_snap::' + req.owner + '::' + req.params.id;
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  res.json((Array.isArray(lista) ? lista : []).map(v => ({ ts: v.ts, passos: (v.nos || []).length, ligacoes: (v.ligacoes || []).length })));
+});
+app.post('/bots/:id/versoes/restaurar', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const botId = req.params.id, ts = String(req.body?.ts || '');
+  const { data: own } = await supabase.from('bots').select('id').eq('id', botId).eq('owner', req.owner).maybeSingle();
+  if (!own) return res.status(404).json({ error: 'Bot não encontrado' });
+  const K = 'bot_snap::' + req.owner + '::' + botId;
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+  let lista = []; try { lista = data?.value ? JSON.parse(data.value) : []; } catch (_) {}
+  const alvo = (Array.isArray(lista) ? lista : []).find(v => String(v.ts) === ts);
+  if (!alvo) return res.status(404).json({ error: 'Versão não encontrada' });
+  try {
+    // o fluxo de agora também vira cópia, antes de voltar atrás
+    const { data: nosAgora } = await supabase.from('bot_nodes').select('*').eq('bot_id', botId);
+    const { data: ligAgora } = await supabase.from('bot_edges').select('*').eq('bot_id', botId);
+    if ((nosAgora || []).length) await _botSnapSalvar(req.owner, botId, nosAgora || [], ligAgora || []);
+    await supabase.from('bot_edges').delete().eq('bot_id', botId);
+    await supabase.from('bot_nodes').delete().eq('bot_id', botId);
+    if ((alvo.nos || []).length)      await supabase.from('bot_nodes').insert(alvo.nos);
+    if ((alvo.ligacoes || []).length) await supabase.from('bot_edges').insert(alvo.ligacoes);
+    _botGraphLimpa();
+    res.json({ success: true, passos: (alvo.nos || []).length });
+  } catch (e) { _botGraphLimpa(); res.status(500).json({ error: e.message }); }
 });
 // Duplicar um bot (copia config, nós e arestas com novos ids)
 app.post('/bots/:id/duplicate', async (req,res) => {
@@ -6446,8 +6617,10 @@ app.get('/quick-replies', async (req, res) => {
 app.put('/quick-replies', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const arr = Array.isArray(req.body) ? req.body : [];
-  await supabase.from('settings').upsert({ key: 'quick_replies::' + (req.owner || ' '), value: JSON.stringify(arr), updated_at: new Date().toISOString() });
-  res.json({ success: true });
+  try {
+    await _gravaConfigSegura('quick_replies::' + (req.owner || ' '), arr, req);
+    res.json({ success: true });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message, vazio: !!e.vazio }); }
 });
 
 app.get('/integration/token', async (req, res) => {
@@ -6636,7 +6809,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
