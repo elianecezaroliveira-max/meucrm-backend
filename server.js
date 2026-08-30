@@ -86,7 +86,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 248;
+const SERVER_VER = 249;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -98,6 +98,7 @@ function _contasCompartilhadas() {
     membros_de_equipe: equipe
   };
 }
+const _NO_AR_DESDE = new Date().toISOString();
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -115,7 +116,9 @@ app.get('/versao', async (req, res) => {
       copias = tot;
     }
   } catch (_) {}
-  res.json({ contas: _contasCompartilhadas(), server: SERVER_VER, presencas: presCount, exemplos: presKeys.slice(0, 3),
+  res.json({ contas: _contasCompartilhadas(), server: SERVER_VER, no_ar_desde: _NO_AR_DESDE,
+    node: process.version, ambiente: process.env.RAILWAY_ENVIRONMENT_NAME || null,
+    presencas: presCount, exemplos: presKeys.slice(0, 3),
     copias_6meses: copias, cofre_ultimo_ok: _cofreUltimoOk, cofre_ultimo_erro: _cofreUltimoErro,
     // 📦 Espaço do Storage (última medição da faxina) — o plano grátis do Supabase dá 1 GB
     storage_mb: (_espacoCache ? _espacoCache.mb : null),
@@ -1441,6 +1444,7 @@ app.patch("/accounts/:id", async (req, res) => {
 
 // ── Remover conta ──
 app.delete("/accounts/:id", async (req, res) => {
+  if (!_exigeAdmin(req, res, 'apagar um número')) return;
   // Conta por QR: encerra a conexão ANTES de apagar — senão o WhatsApp continuava
   // conectado e as mensagens chegavam "sem dono" (invisíveis no CRM)
   try {
@@ -1501,6 +1505,7 @@ async function _isSelfSend(to, account_id) {
 }
 
 app.post("/send", async (req, res) => {
+  if (_planoBarra(req, res)) return;
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
@@ -1765,6 +1770,7 @@ function convertVideoToMp4(buf) {
 
 // ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
 app.post("/send-media", async (req, res) => {
+  if (_planoBarra(req, res)) return;
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
   const mCaption = String(req.body.caption || '').trim();
   if (!to || !fileBase64 || !fileName || !mimeType)
@@ -3954,6 +3960,7 @@ app.post("/templates", async (req, res) => {
 // A Meta exige excluir por NOME na borda do WABA (não pelo ID do nó).
 // O parâmetro :template_id agora recebe o NOME do template.
 app.delete("/templates/:template_id", async (req, res) => {
+  if (!_exigeAdmin(req, res, 'apagar um modelo')) return;
   const { account_id } = req.query;
   if (!supabase || !account_id) return res.status(400).json({ error: "account_id obrigatório" });
   const { data: account, error: accErr } = await supabase
@@ -4019,6 +4026,7 @@ app.delete('/tmpl-lixeira/:id', async (req, res) => {
 
 // ── Enviar template ──
 app.post("/send-template", async (req, res) => {
+  if (_planoBarra(req, res)) return;
   let { to, account_id, template_name, language_code, components, body_text } = req.body;
   if (!to || !account_id || !template_name)
     return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
@@ -4142,6 +4150,7 @@ async function _stageTrashSalva(owner, lista) {
   _settings[k] = value;
 }
 app.delete("/pipeline/stages/:id", async (req, res) => {
+  if (!_exigeAdmin(req, res, 'apagar uma etapa do funil')) return;
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const OW = req.owner || ' ';
   const { data: st } = await supabase.from('pipeline_stages').select('*').eq('id', req.params.id).eq('owner', OW).maybeSingle();
@@ -4392,6 +4401,7 @@ async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
 // 📍 Enviar localização (QR e API oficial)
 app.post('/send-location', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
+  if (_planoBarra(req, res)) return;
   try {
     let { to, account_id, lat, lng, name } = req.body || {};
     lat = parseFloat(lat); lng = parseFloat(lng);
@@ -4419,6 +4429,7 @@ app.post('/send-location', async (req, res) => {
 // 👤 Enviar cartão de contato (QR e API oficial)
 app.post('/send-contact', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
+  if (_planoBarra(req, res)) return;
   try {
     let { to, account_id, cname, cphone } = req.body || {};
     if (!to || !cname || !cphone) return res.status(400).json({ error: 'Informe to, cname e cphone' });
@@ -4447,6 +4458,7 @@ app.post('/send-contact', async (req, res) => {
 // 📊 Enviar enquete (SÓ números QR — a API oficial não tem enquete)
 app.post('/send-poll', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
+  if (_planoBarra(req, res)) return;
   try {
     let { to, account_id, question, options } = req.body || {};
     if (!to || !question || !Array.isArray(options) || options.length < 2) return res.status(400).json({ error: 'Informe to, question e pelo menos 2 options' });
@@ -4715,6 +4727,7 @@ app.put('/contacts/:phone/pin', async (req, res) => {
 // Apaga SÓ as mensagens da conversa — o lead continua no CRM e no Pipeline
 // (etapa, etiquetas, anotações e tarefas são preservados)
 app.delete("/contacts/:phone/messages", async (req, res) => {
+  if (!_exigeAdmin(req, res, 'apagar uma conversa')) return;
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const phone = _decSeguro(req.params.phone);
   await supabase.from("messages").delete().eq("phone", phone).eq("owner", req.owner || ' ');
@@ -4738,6 +4751,7 @@ async function _leadTrashSalva(owner, lista) {
   _settings[k] = value;
 }
 app.delete("/contacts/bulk-delete", async (req, res) => {
+  if (!_exigeAdmin(req, res, 'apagar leads em massa')) return;
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phones } = req.body;
   if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
@@ -6414,6 +6428,7 @@ app.put('/bots/:id', async (req,res) => {
   res.json(data);
 });
 app.delete('/bots/:id', async (req,res) => {
+  if (!_exigeAdmin(req, res, 'apagar um bot')) return;
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const id = req.params.id;
   // confirma que o bot é do dono antes de apagar os filhos
@@ -6681,13 +6696,16 @@ app.post('/integration/token', async (req, res) => {
   _settings[key] = token; // vale imediatamente, sem esperar o recarregamento
   res.json({ token });
 });
-// Faturamento (exibição): plano e validade ficam em settings (chave billing::<dono>)
+// Faturamento: plano, validade e limites (chave billing::<dono>). Lê SEMPRE do
+// banco para que uma mudança sua apareça na hora no cliente, sem esperar 5 min.
 app.get('/billing', async (req, res) => {
   if (!supabase) return res.json({ value: null });
-  const { data } = await supabase.from('settings').select('value').eq('key', 'billing::' + (req.owner || ' ')).maybeSingle();
+  const K = 'billing::' + (req.owner || ' ');
+  const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
   let v = null;
   try { v = data?.value ? (typeof data.value === 'string' ? JSON.parse(data.value) : data.value) : null; } catch (_) {}
-  res.json({ value: v });
+  if (data?.value) _settings[K] = (typeof data.value === 'string' ? data.value : JSON.stringify(data.value));
+  res.json({ value: v, info: _planoInfo(req.owner) });
 });
 
 // ═══════════════════════════════════════
@@ -6777,7 +6795,9 @@ const CHAVES_POR_CONTA = new Set([
   'sheets_sync', // planilha do Google ligada ao pipeline (importação de leads)
   'drip_rules',  // gotejamento: mover leads aos poucos de uma etapa para outra
   'stage_trash', // lixeira de colunas do pipeline (desfazer exclusão)
-  'lead_trash'   // lixeira de leads excluídos (30 dias)
+  'lead_trash',  // lixeira de leads excluídos (30 dias)
+  'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
+  'onboarding'   // passos de estreia já concluídos/dispensados
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
@@ -6809,6 +6829,235 @@ async function _marcaAcessoEquipe(dono, email) {
   } catch (_) {}
 }
 
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔐 PAPÉIS DA EQUIPE — quem é ADMINISTRADOR e quem é ATENDENTE
+// ═══════════════════════════════════════════════════════════════════
+// dono      = o e-mail titular da conta. Pode tudo, sempre.
+// admin     = pessoa da equipe com os mesmos poderes do titular.
+// atendente = só o dia a dia: conversar, mexer em leads, tarefas e etiquetas.
+//             NÃO apaga conversa, número, bot ou etapa; não mexe em automação,
+//             em Configurações, nem na própria equipe.
+//
+// ⚠️ Ninguém perde acesso numa atualização: quem já estava na equipe antes
+// desta versão continua ADMINISTRADOR (o mapa de papéis está vazio para ele).
+// Quem for adicionado a partir de agora entra como ATENDENTE.
+function _papeisMapa(owner) {
+  try { return JSON.parse(_settings['equipe_papel::' + (owner || ' ')] || '{}') || {}; } catch (_) { return {}; }
+}
+async function _papeisSalva(owner, mapa) {
+  const K = 'equipe_papel::' + (owner || ' ');
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(mapa), updated_at: new Date().toISOString() });
+  _settings[K] = JSON.stringify(mapa);
+}
+function _papelDe(req) {
+  const dono = String(req.owner || '').toLowerCase();
+  const quem = String(req.usuario || req.owner || '').toLowerCase();
+  if (!dono || !quem || quem === dono) return 'dono';
+  return _papeisMapa(dono)[quem] === 'atendente' ? 'atendente' : 'admin';
+}
+function _ehAtendente(req) { return _papelDe(req) === 'atendente'; }
+// Barra a ação e explica em português. Chame no COMEÇO da rota.
+function _exigeAdmin(req, res, oque) {
+  if (!_ehAtendente(req)) return true;
+  res.status(403).json({ error: 'Seu acesso é de atendente — ' + (oque || 'esta ação') + ' é só para administradores. Peça a quem administra a conta.', sem_permissao: true });
+  return false;
+}
+// Quem FORNECE o VETRA (você). Vale o e-mail titular do sistema ou o
+// ADMIN_TOKEN das variáveis do Railway (socorro quando o login está fora do ar).
+function _ehDono(req) {
+  const q = String((req && req.usuario) || (req && req.owner) || '').toLowerCase();
+  if (q && q === OWNER_LEGADO) return true;
+  const adm = String((req && req.query && req.query.admin) || (req && req.headers && req.headers['x-admin-token']) || '').trim();
+  const esp = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
+  return !!(adm && esp && adm === esp);
+}
+
+// O app pergunta isto assim que abre, para esconder o que a pessoa não pode fazer.
+app.get('/meu-acesso', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  res.json({ email: req.usuario || req.owner, dono: req.owner, papel: _papelDe(req), fornecedor: _ehDono(req), plano: _planoInfo(req.owner) });
+});
+
+app.put('/equipe/:email/papel', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'mudar o acesso de alguém')) return;
+  const email = _decSeguro(req.params.email).trim().toLowerCase();
+  const papel = String(req.body && req.body.papel || '').toLowerCase() === 'atendente' ? 'atendente' : 'admin';
+  const mapa = _equipeMapa();
+  if (String(mapa[email] || '').toLowerCase() !== String(req.owner).toLowerCase())
+    return res.status(403).json({ error: 'Este e-mail não faz parte da sua conta.' });
+  const p = _papeisMapa(req.owner);
+  p[email] = papel;
+  await _papeisSalva(req.owner, p);
+  console.log('Equipe: ' + email + ' agora é ' + papel + ' na conta de ' + req.owner);
+  res.json({ ok: true, papel });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 💳 PLANO / COBRANÇA — validade, limites e suspensão
+// ═══════════════════════════════════════════════════════════════════
+// O plano de cada cliente fica em settings, chave billing::<dono>. Só QUEM VENDE
+// o VETRA mexe (e-mail titular do sistema ou ADMIN_TOKEN do Railway).
+// Regra de ouro: plano vencido NUNCA apaga nem esconde dados. Ele só impede
+// ENVIAR mensagem nova. Ler, exportar e fazer backup continuam liberados.
+const _TOLERANCIA_DIAS = 5; // depois de vencer, ainda envia por 5 dias
+function _hojeBrtISO() { return new Date(Date.now() - 3 * 3600000).toISOString().slice(0, 10); }
+function _brDia(iso) { return /^\d{4}-\d{2}-\d{2}$/.test(String(iso || '')) ? iso.split('-').reverse().join('/') : ''; }
+function _planoBruto(owner) {
+  const v = _settings['billing::' + (owner || ' ')];
+  try { return v ? (typeof v === 'string' ? JSON.parse(v) : v) : null; } catch (_) { return null; }
+}
+function _planoInfo(owner) {
+  const p = _planoBruto(owner) || {};
+  const hoje = _hojeBrtISO();
+  const val = /^\d{4}-\d{2}-\d{2}$/.test(String(p.validade || '')) ? p.validade : null;
+  let dias = null, vencido = false, bloqueado = !!p.suspenso;
+  let motivo = p.suspenso ? 'Esta conta está suspensa.' : null;
+  if (val) {
+    dias = Math.round((Date.parse(val + 'T00:00:00Z') - Date.parse(hoje + 'T00:00:00Z')) / 86400000);
+    vencido = dias < 0;
+    if (dias < -_TOLERANCIA_DIAS) { bloqueado = true; motivo = 'O plano venceu em ' + _brDia(val) + '.'; }
+  }
+  return {
+    plano: p.plano || 'VETRA', validade: val, validade_br: _brDia(val), dias_restantes: dias,
+    vencido, bloqueado, motivo, tolerancia_dias: _TOLERANCIA_DIAS,
+    limite_numeros: p.limite_numeros || null, limite_msgs_mes: p.limite_msgs_mes || null,
+    contato: p.contato || null, obs: p.obs || null, sem_plano: !val && !p.plano
+  };
+}
+// Barra o ENVIO quando o plano está bloqueado. Devolve true se barrou.
+function _planoBarra(req, res) {
+  let i;
+  try { i = _planoInfo(req.owner); } catch (_) { return false; }
+  if (!i.bloqueado) return false;
+  res.status(402).json({
+    error: (i.motivo || 'Plano suspenso.') + ' Fale com quem te forneceu o VETRA para reativar. Nada foi perdido: suas conversas, leads e configurações continuam aqui.',
+    plano_bloqueado: true
+  });
+  return true;
+}
+
+app.put('/billing', async (req, res) => {
+  if (!_ehDono(req)) {
+    if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+    return res.status(403).json({ error: 'Só quem fornece o VETRA pode mexer no plano.' });
+  }
+  const alvo = String(req.body && req.body.dono || req.owner || '').toLowerCase();
+  if (!alvo || alvo.indexOf('@') < 0) return res.status(400).json({ error: 'Informe o e-mail do cliente em "dono".' });
+  const b = req.body || {};
+  const atual = _planoBruto(alvo) || {};
+  const novo = {
+    plano: b.plano !== undefined ? String(b.plano || '').slice(0, 60) : (atual.plano || 'VETRA'),
+    validade: b.validade !== undefined ? (/^\d{4}-\d{2}-\d{2}$/.test(String(b.validade || '')) ? b.validade : null) : (atual.validade || null),
+    suspenso: b.suspenso !== undefined ? !!b.suspenso : !!atual.suspenso,
+    limite_numeros: b.limite_numeros !== undefined ? (parseInt(b.limite_numeros, 10) || null) : (atual.limite_numeros || null),
+    limite_msgs_mes: b.limite_msgs_mes !== undefined ? (parseInt(b.limite_msgs_mes, 10) || null) : (atual.limite_msgs_mes || null),
+    contato: b.contato !== undefined ? String(b.contato || '').slice(0, 120) : (atual.contato || null),
+    obs: b.obs !== undefined ? String(b.obs || '').slice(0, 300) : (atual.obs || null)
+  };
+  const K = 'billing::' + alvo;
+  const { error } = await supabase.from('settings').upsert({ key: K, value: JSON.stringify(novo), updated_at: new Date().toISOString() });
+  if (error) return res.status(500).json({ error: error.message });
+  _settings[K] = JSON.stringify(novo);
+  console.log('Plano de ' + alvo + ' atualizado por ' + (req.usuario || 'admin-token'));
+  res.json({ ok: true, value: novo, info: _planoInfo(alvo) });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 📋 ACEITE DOS TERMOS (LGPD) — quem aceitou, qual versão e quando
+// ═══════════════════════════════════════════════════════════════════
+const TERMOS_VER = 1;
+app.get('/aceite', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const K = 'aceite::' + req.owner;
+  let m = {};
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    m = data && data.value ? JSON.parse(data.value) : {};
+  } catch (_) {}
+  const meu = m[String(req.usuario || req.owner).toLowerCase()] || null;
+  res.json({ versao_atual: TERMOS_VER, meu, todos: m, pendente: !meu || (meu.versao || 0) < TERMOS_VER });
+});
+app.post('/aceite', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const K = 'aceite::' + req.owner;
+  let m = {};
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+    m = data && data.value ? JSON.parse(data.value) : {};
+  } catch (_) {}
+  const quem = String(req.usuario || req.owner).toLowerCase();
+  m[quem] = { versao: TERMOS_VER, quando: new Date().toISOString(), ip: req.ip || null };
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(m), updated_at: new Date().toISOString() });
+  _settings[K] = JSON.stringify(m);
+  res.json({ ok: true, meu: m[quem] });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🛰️ PAINEL DO FORNECEDOR — a visão de TODOS os clientes (só sua)
+// ═══════════════════════════════════════════════════════════════════
+// Responde a pergunta "algum cliente está com problema agora?" sem que ele
+// precise ligar. Só leitura: nunca abre conversa nem dado de ninguém.
+app.get('/admin/clientes', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA vê este painel.' });
+  if (!supabase) return res.json({ clientes: [] });
+  try {
+    const donos = new Set();
+    // 1) quem tem qualquer configuração salva (chave termina em ::email)
+    for (const k in _settings) {
+      const i = k.indexOf('::');
+      if (i > 0) { const o = k.slice(i + 2).toLowerCase().trim(); if (o.indexOf('@') > 0) donos.add(o); }
+    }
+    // 2) quem tem número conectado
+    const { data: contas } = await supabase.from('accounts').select('id, name, owner, type, evolution_instance, phone_number_id').limit(500);
+    (contas || []).forEach(a => { if (a.owner && String(a.owner).indexOf('@') > 0) donos.add(String(a.owner).toLowerCase()); });
+    // 3) quem tem equipe
+    try { Object.values(_equipeMapa()).forEach(v => { if (v) donos.add(String(v).toLowerCase()); }); } catch (_) {}
+
+    const agoraBrt = new Date(Date.now() - 3 * 3600000);
+    const iniMes = new Date(Date.UTC(agoraBrt.getUTCFullYear(), agoraBrt.getUTCMonth(), 1));
+    const mesISO = new Date(iniMes.getTime() + 3 * 3600000).toISOString();
+    const conta = (q) => q.then(r => r.count || 0).catch(() => 0);
+
+    const lista = Array.from(donos).sort().slice(0, 120);
+    const equipe = _equipeMapa();
+    const saida = [];
+    for (const ow of lista) {
+      const meusNums = (contas || []).filter(a => String(a.owner || '').toLowerCase() === ow);
+      const nums = [];
+      for (const a of meusNums) {
+        const c = _acctStatusCache[a.id] || {};
+        nums.push({ nome: a.name || '(sem nome)', tipo: a.evolution_instance ? 'QR' : 'API', estado: c.status || 'desconhecido', motivo: c.motivo || null, qualidade: c.qualidade || null });
+      }
+      const [msgs, leads] = await Promise.all([
+        conta(supabase.from('messages').select('id', { count: 'exact', head: true }).eq('owner', ow).gte('timestamp', mesISO)),
+        conta(supabase.from('contacts').select('phone', { count: 'exact', head: true }).eq('owner', ow))
+      ]);
+      // Último erro que o cliente recebeu (sem mostrar conteúdo de conversa)
+      let ultimoErro = null;
+      try {
+        const av = JSON.parse(_settings['notices::' + ow] || '[]');
+        const e = (av || []).filter(x => x && x.tipo === 'erro').sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
+        if (e) ultimoErro = { texto: String(e.text || '').slice(0, 140), ts: e.ts || null };
+      } catch (_) {}
+      let ultimoAcesso = null;
+      try {
+        const ac = JSON.parse(_settings['equipe_acesso::' + ow] || '{}');
+        for (const e in ac) if (!ultimoAcesso || ac[e] > ultimoAcesso) ultimoAcesso = ac[e];
+      } catch (_) {}
+      const membros = Object.keys(equipe).filter(e => String(equipe[e]).toLowerCase() === ow);
+      saida.push({
+        dono: ow, plano: _planoInfo(ow), numeros: nums,
+        desconectados: nums.filter(n => n.estado !== 'connected').length,
+        mensagens_mes: msgs, leads, equipe: membros.length,
+        ultimo_erro: ultimoErro, ultimo_acesso: ultimoAcesso
+      });
+    }
+    res.json({ servidor: SERVER_VER, no_ar_desde: _NO_AR_DESDE, total: saida.length, clientes: saida });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/equipe', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   const mapa = _equipeMapa();
@@ -6818,10 +7067,11 @@ app.get('/equipe', async (req, res) => {
     const { data } = await supabase.from('settings').select('value').eq('key', 'equipe_acesso::' + req.owner).maybeSingle();
     acessos = data?.value ? JSON.parse(data.value) : {};
   } catch (_) {}
-  res.json({ dono: req.owner, membros: meus, acessos });
+  res.json({ dono: req.owner, membros: meus, acessos, papeis: _papeisMapa(req.owner), meu_papel: _papelDe(req) });
 });
 app.post('/equipe', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'liberar acesso para alguém')) return;
   const email = String(req.body?.email || '').trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'E-mail inválido.' });
   if (email === String(req.owner).toLowerCase()) return res.status(400).json({ error: 'Este é o seu próprio e-mail.' });
@@ -6836,11 +7086,18 @@ app.post('/equipe', async (req, res) => {
   } catch (_) {}
   mapa[email] = String(req.owner).toLowerCase();
   await _equipeSalva(mapa);
+  // Entra com o acesso MENOR possível. Quem administra promove depois se quiser.
+  try {
+    const pedido = String(req.body?.papel || '').toLowerCase() === 'admin' ? 'admin' : 'atendente';
+    const p = _papeisMapa(req.owner); p[email] = pedido;
+    await _papeisSalva(req.owner, p);
+  } catch (_) {}
   console.log('Equipe: ' + email + ' agora entra na conta de ' + req.owner);
   res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
 });
 app.delete('/equipe/:email', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'remover alguém da equipe')) return;
   const email = _decSeguro(req.params.email).trim().toLowerCase();
   const mapa = _equipeMapa();
   if (!mapa[email]) return res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
@@ -6848,12 +7105,13 @@ app.delete('/equipe/:email', async (req, res) => {
     return res.status(403).json({ error: 'Este e-mail não faz parte da sua conta.' });
   delete mapa[email];
   await _equipeSalva(mapa);
+  try { const p = _papeisMapa(req.owner); delete p[email]; await _papeisSalva(req.owner, p); } catch (_) {}
   console.log('Equipe: ' + email + ' saiu da conta de ' + req.owner);
   res.json({ ok: true, membros: Object.keys(mapa).filter(e => String(mapa[e]).toLowerCase() === String(req.owner).toLowerCase()) });
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
