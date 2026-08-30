@@ -72,6 +72,71 @@ app.use(async (req, res, next) => {
   next();
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 🚪 PORTARIA — só usa o VETRA quem VOCÊ liberou
+// ═══════════════════════════════════════════════════════════════════
+// Sem isso, qualquer pessoa que criasse um login ganhava uma conta e usava de
+// graça. Agora existe uma lista de e-mails liberados (settings: acesso_liberado).
+//
+// Três travas de segurança para NUNCA deixar você (ou um cliente seu) na rua:
+//   1. A portaria só age quando você LIGA a chave (ligado: true).
+//   2. Ao ligar, o servidor solta automaticamente todo mundo que já usa o VETRA.
+//   3. O seu e-mail e o ADMIN_TOKEN do Railway passam sempre, aconteça o que
+//      acontecer — é a chave reserva da porta.
+const _ACESSO_K = 'acesso_liberado';
+function _acessoLista() {
+  try {
+    const v = JSON.parse(_settings[_ACESSO_K] || '{}') || {};
+    return { ligado: !!v.ligado, emails: v.emails || {}, tentativas: v.tentativas || {} };
+  } catch (_) { return { ligado: false, emails: {}, tentativas: {} }; }
+}
+async function _acessoSalva(v) {
+  const txt = JSON.stringify({ ligado: !!v.ligado, emails: v.emails || {}, tentativas: v.tentativas || {} });
+  await supabase.from('settings').upsert({ key: _ACESSO_K, value: txt, updated_at: new Date().toISOString() });
+  _settings[_ACESSO_K] = txt;
+}
+// Rotas que respondem mesmo para quem ainda não foi liberado — senão o app não
+// teria como explicar o motivo e a pessoa veria só telas quebradas.
+const _PORTARIA_LIVRE = new Set(['/', '/versao', '/meu-acesso', '/webhook', '/favicon.ico']);
+// Guarda quem tentou entrar sem liberação, para aparecer no seu painel.
+const _tentUlt = {};
+async function _anotaTentativa(email) {
+  try {
+    if (!supabase || !email) return;
+    if (Date.now() - (_tentUlt[email] || 0) < 600000) return;
+    _tentUlt[email] = Date.now();
+    const l = _acessoLista();
+    l.tentativas[email] = new Date().toISOString();
+    // guarda no máximo as 50 mais recentes
+    const chaves = Object.keys(l.tentativas).sort((a, b) => String(l.tentativas[b]).localeCompare(String(l.tentativas[a])));
+    if (chaves.length > 50) { const novo = {}; chaves.slice(0, 50).forEach(k => novo[k] = l.tentativas[k]); l.tentativas = novo; }
+    await _acessoSalva(l);
+  } catch (_) {}
+}
+function _temLiberacao(req) {
+  const l = _acessoLista();
+  if (!l.ligado) return true;                       // portaria desligada: tudo como antes
+  const dono = String(req.owner || '').toLowerCase();
+  const quem = String(req.usuario || '').toLowerCase();
+  if (!dono) return true;                           // sem login: as rotas já barram
+  if (dono === OWNER_LEGADO || quem === OWNER_LEGADO) return true;   // chave reserva
+  const adm = String((req.query && req.query.admin) || req.headers['x-admin-token'] || '').trim();
+  const esp = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
+  if (adm && esp && adm === esp) return true;       // chave reserva
+  return !!l.emails[dono];
+}
+app.use((req, res, next) => {
+  try {
+    if (_PORTARIA_LIVRE.has(req.path)) return next();
+    if (_temLiberacao(req)) return next();
+    _anotaTentativa(String(req.usuario || req.owner || '').toLowerCase());
+    return res.status(403).json({
+      error: 'Este e-mail ainda não foi liberado para usar o VETRA. Fale com quem te forneceu o sistema.',
+      sem_liberacao: true
+    });
+  } catch (_) { return next(); }   // se a portaria falhar, ela ABRE (nunca tranca por engano)
+});
+
 // 🛡️ REDE DE SEGURANÇA: uma falha inesperada dentro de uma rota (ex.: dado
 // estranho vindo de fora) só vira log — nunca derruba o CRM inteiro.
 process.on('unhandledRejection', (e) => console.error('Falha não tratada:', (e && e.message) || e));
@@ -86,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 249;
+const SERVER_VER = 250;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6876,7 +6941,12 @@ function _ehDono(req) {
 // O app pergunta isto assim que abre, para esconder o que a pessoa não pode fazer.
 app.get('/meu-acesso', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
-  res.json({ email: req.usuario || req.owner, dono: req.owner, papel: _papelDe(req), fornecedor: _ehDono(req), plano: _planoInfo(req.owner) });
+  const l = _acessoLista();
+  res.json({
+    email: req.usuario || req.owner, dono: req.owner, papel: _papelDe(req),
+    fornecedor: _ehDono(req), plano: _planoInfo(req.owner),
+    liberado: _temLiberacao(req), portaria: l.ligado
+  });
 });
 
 app.put('/equipe/:email/papel', async (req, res) => {
@@ -6999,6 +7069,96 @@ app.post('/aceite', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // Responde a pergunta "algum cliente está com problema agora?" sem que ele
 // precise ligar. Só leitura: nunca abre conversa nem dado de ninguém.
+
+// ── 🚪 Painel do fornecedor: liberar e bloquear clientes ──
+function _todosOsDonos() {
+  const donos = new Set();
+  for (const k in _settings) {
+    const i = k.indexOf('::');
+    if (i > 0) { const o = k.slice(i + 2).toLowerCase().trim(); if (o.indexOf('@') > 0) donos.add(o); }
+  }
+  try { Object.values(_equipeMapa()).forEach(v => { if (v) donos.add(String(v).toLowerCase()); }); } catch (_) {}
+  donos.add(OWNER_LEGADO);
+  return donos;
+}
+app.get('/admin/acesso', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA vê esta lista.' });
+  const l = _acessoLista();
+  // Quem já usa o VETRA mas ainda NÃO está na lista — é o que seria trancado
+  const fora = [];
+  try {
+    const contas = new Set();
+    if (supabase) {
+      const { data } = await supabase.from('accounts').select('owner').limit(500);
+      (data || []).forEach(a => { if (a.owner && String(a.owner).indexOf('@') > 0) contas.add(String(a.owner).toLowerCase()); });
+    }
+    for (const o of _todosOsDonos()) contas.add(o);
+    contas.forEach(o => { if (!l.emails[o] && o !== OWNER_LEGADO) fora.push(o); });
+  } catch (_) {}
+  const planos = {};
+  Object.keys(l.emails).forEach(e => { planos[e] = _planoInfo(e); });
+  res.json({ ligado: l.ligado, emails: l.emails, tentativas: l.tentativas, ja_usam_sem_liberacao: fora.sort(), planos, eu: OWNER_LEGADO });
+});
+app.post('/admin/acesso', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode liberar acesso.' });
+  const email = String(req.body && req.body.email || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'E-mail inválido.' });
+  const l = _acessoLista();
+  l.emails[email] = { desde: (l.emails[email] && l.emails[email].desde) || new Date().toISOString(), obs: String(req.body.obs || '').slice(0, 160) || null };
+  delete l.tentativas[email];
+  await _acessoSalva(l);
+  // Já deixa o plano montado, se você mandou
+  const b = req.body || {};
+  if (b.plano || b.validade) {
+    const atual = _planoBruto(email) || {};
+    const novo = {
+      plano: b.plano ? String(b.plano).slice(0, 60) : (atual.plano || 'VETRA'),
+      validade: /^\d{4}-\d{2}-\d{2}$/.test(String(b.validade || '')) ? b.validade : (atual.validade || null),
+      suspenso: false,
+      limite_numeros: atual.limite_numeros || null, limite_msgs_mes: atual.limite_msgs_mes || null,
+      contato: atual.contato || null, obs: atual.obs || null
+    };
+    const K = 'billing::' + email;
+    await supabase.from('settings').upsert({ key: K, value: JSON.stringify(novo), updated_at: new Date().toISOString() });
+    _settings[K] = JSON.stringify(novo);
+  }
+  console.log('Acesso LIBERADO para ' + email);
+  res.json({ ok: true, email, plano: _planoInfo(email) });
+});
+app.delete('/admin/acesso/:email', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode bloquear acesso.' });
+  const email = _decSeguro(req.params.email).trim().toLowerCase();
+  if (email === OWNER_LEGADO) return res.status(400).json({ error: 'Você não pode bloquear o seu próprio acesso.' });
+  const l = _acessoLista();
+  delete l.emails[email];
+  await _acessoSalva(l);
+  console.log('Acesso BLOQUEADO para ' + email);
+  res.json({ ok: true });
+});
+// Liga/desliga a portaria. Ao LIGAR, solta automaticamente quem já usa o VETRA.
+app.put('/admin/acesso/trava', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode mexer na portaria.' });
+  const l = _acessoLista();
+  const ligar = !!(req.body && req.body.ligado);
+  let soltos = [];
+  if (ligar) {
+    const contas = new Set(_todosOsDonos());
+    try {
+      if (supabase) {
+        const { data } = await supabase.from('accounts').select('owner').limit(500);
+        (data || []).forEach(a => { if (a.owner && String(a.owner).indexOf('@') > 0) contas.add(String(a.owner).toLowerCase()); });
+      }
+    } catch (_) {}
+    contas.forEach(o => {
+      if (!l.emails[o]) { l.emails[o] = { desde: new Date().toISOString(), obs: 'liberado automaticamente ao ligar a portaria' }; soltos.push(o); }
+    });
+  }
+  l.ligado = ligar;
+  await _acessoSalva(l);
+  console.log('Portaria ' + (ligar ? 'LIGADA' : 'DESLIGADA') + ' — liberados automaticamente: ' + soltos.length);
+  res.json({ ok: true, ligado: l.ligado, liberados_automaticamente: soltos });
+});
+
 app.get('/admin/clientes', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA vê este painel.' });
   if (!supabase) return res.json({ clientes: [] });
@@ -7048,7 +7208,7 @@ app.get('/admin/clientes', async (req, res) => {
       } catch (_) {}
       const membros = Object.keys(equipe).filter(e => String(equipe[e]).toLowerCase() === ow);
       saida.push({
-        dono: ow, plano: _planoInfo(ow), numeros: nums,
+        dono: ow, plano: _planoInfo(ow), numeros: nums, liberado: !!_acessoLista().emails[ow],
         desconectados: nums.filter(n => n.estado !== 'connected').length,
         mensagens_mes: msgs, leads, equipe: membros.length,
         ultimo_erro: ultimoErro, ultimo_acesso: ultimoAcesso
@@ -7111,7 +7271,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
