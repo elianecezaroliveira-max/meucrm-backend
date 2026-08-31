@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 252;
+const SERVER_VER = 253;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3178,6 +3178,7 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
       continue;
     }
     a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; a.ciclo_fechado = !!r.ciclo_fechado;
+    a.ciclo_ini = r.ciclo_ini || null;
   }
   await _dripSalva(owner, atuais);
 }
@@ -3282,6 +3283,7 @@ async function _dripTick() {
           r.min_seg = rf.min_seg || r.min_seg; r.max_seg = rf.max_seg || r.max_seg; r.numeros = rf.numeros || r.numeros;
           r.dias = Array.isArray(rf.dias) ? rf.dias : r.dias; r.hora_ini = rf.hora_ini || ''; r.hora_fim = rf.hora_fim || '';
           r.movidos = rf.movidos || 0; r.last = rf.last || r.last; r.reset_seq = rf.reset_seq || 0;
+          r.ciclo_ini = rf.ciclo_ini || r.ciclo_ini || null;
           const ligadaAgora = !!rf.manual || (!!rf.agendado && _dripDentroDaJanela(r));
           if (!ligadaAgora) { mudou = true; continue; } // DESLIGADA no banco: não move nada
           if (rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; continue; }
@@ -3308,10 +3310,18 @@ async function _dripTick() {
           // Fila acabou: o ciclo fecha. O total movido vira histórico e a regra
           // volta ao estado PARADA — sem "progresso pendente" (era isso que fazia
           // aparecer Retomar/Parar quando entravam leads novos pela planilha).
-          r.last = { quando: new Date().toISOString(), vazio: true, total_ciclo: r.movidos || 0 };
+          r.last = { quando: new Date().toISOString(), vazio: true, total_ciclo: r.movidos || 0, ciclo_ini: r.ciclo_ini || null };
           if (r.movidos > 0) {
-            try { addNotice(owner, 'O gotejamento "' + (r.nome || 'sem nome') + '" terminou: ' + r.movidos + ' lead(s) movido(s).',
-              'drip-fim:' + r.id + ':' + (r.movidos || 0), { tipo: 'ok', alvo: 'automacao' }); } catch (_) {}
+            // Diz desde quando é a conta: assim dá para conferir com a etapa
+            let desde = '';
+            try {
+              if (r.ciclo_ini) {
+                const d = new Date(Date.parse(r.ciclo_ini) - 3 * 3600000), p = n => String(n).padStart(2, '0');
+                desde = ' (contando desde ' + p(d.getUTCDate()) + '/' + p(d.getUTCMonth() + 1) + ' às ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ')';
+              }
+            } catch (_) {}
+            try { addNotice(owner, 'O gotejamento "' + (r.nome || 'sem nome') + '" terminou: ' + r.movidos + ' lead(s) movido(s)' + desde + '.',
+              'drip-fim:' + r.id + ':' + (r.ciclo_ini || '') + ':' + (r.movidos || 0), { tipo: 'ok', alvo: 'automacao' }); } catch (_) {}
           }
           r.ciclo_fechado = true; r._tocada = true;
           if (r.manual) { r.manual = false; r._desligarManual = true; }
@@ -3326,6 +3336,14 @@ async function _dripTick() {
         // a trava de intervalo nem encerrar uma fila que varou a madrugada.
         if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), pulado: true }; r._tocada = true; continue; }
         try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
+        // 🐞 O ciclo anterior tinha FECHADO (a fila esvaziou) e agora entraram leads
+        // novos na etapa: isto aqui é o PRIMEIRO lead de um ciclo novo, então a
+        // contagem recomeça do zero. Sem isto, o total do ciclo passado se somava ao
+        // atual e o aviso do fim anunciava mais leads do que realmente havia na etapa
+        // (ex.: 30 de ontem + 60 de hoje = "90 movidos"). Só o número estava errado —
+        // os leads sempre foram movidos um a um, na quantidade certa.
+        if (r.ciclo_fechado) { r.movidos = 0; r.ciclo_ini = null; }
+        if (!r.ciclo_ini) r.ciclo_ini = new Date().toISOString();
         r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false; r._tocada = true;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
         console.log(`Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
@@ -3435,7 +3453,8 @@ app.put('/drip', async (req, res) => {
       dias: Array.isArray(r.dias) ? r.dias.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6) : [],
       next_at: nextAt, // mantém o próximo horário (pausar/ligar não encurta o intervalo); intervalo novo → recalculado
       parado_ate: (r.parado_ate && !isNaN(Date.parse(r.parado_ate)) && Date.parse(r.parado_ate) > Date.now()) ? new Date(r.parado_ate).toISOString() : null,
-      movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null)
+      movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null),
+      ciclo_ini: r.zerar_movidos ? null : (a.ciclo_ini || null)
     };
   });
   const recusadas = [];
