@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 251;
+const SERVER_VER = 252;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1333,6 +1333,30 @@ app.get('/accounts/uso', async (req, res) => {
 });
 
 // O que depende deste número (para avisar antes de excluir)
+// 🔎 Onde este modelo está sendo usado? Antes de esconder ou apagar um modelo,
+// o VETRA avisa se algum bot depende dele — senão o passo do bot fica apontando
+// para um modelo que não existe mais e ninguém descobre até o cliente reclamar.
+app.get('/templates/uso', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const nome = String(req.query.nome || '').trim();
+  if (!nome || !supabase) return res.json({ bots: [], passos: 0 });
+  try {
+    const { data: nodes } = await supabase.from('bot_nodes').select('bot_id, config').eq('owner', req.owner);
+    const ids = new Set();
+    let passos = 0;
+    for (const n of (nodes || [])) {
+      let c = {}; try { c = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); } catch (_) {}
+      if (String(c.template_name || '') === nome) { ids.add(n.bot_id); passos++; }
+    }
+    const bots = [];
+    if (ids.size) {
+      const { data: bs } = await supabase.from('bots').select('id, name').in('id', [...ids]).eq('owner', req.owner);
+      (bs || []).forEach(b => bots.push(b.name || ('bot ' + b.id)));
+    }
+    res.json({ bots, passos });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/accounts/:id/dependencias', async (req, res) => {
   if (!supabase) return res.json({ conversas: 0, mensagens: 0, bots: [] });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
