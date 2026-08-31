@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 253;
+const SERVER_VER = 254;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3141,6 +3141,9 @@ app.post("/import/lead", async (req, res) => {
 // ⏳ GOTEJAMENTO (substitui o 2º fluxo do n8n): move leads de uma etapa para
 // outra UM POR VEZ, com intervalo aleatório entre eles (ex.: 3,5 a 5 min), para
 // que os bots da etapa de destino disparem espaçados. Regras por conta em
+// Quanto tempo a fila precisa ficar VAZIA para o VETRA considerar que o ciclo
+// terminou de verdade (e só então avisar, uma única vez).
+const _DRIP_CARENCIA_MS = 10 * 60 * 1000; // 10 minutos
 // settings drip_rules::owner = [{ id, nome, de, para, min_seg, max_seg, ativo,
 // hora_ini, hora_fim, next_at, last }]
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3178,7 +3181,7 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
       continue;
     }
     a.next_at = r.next_at; a.last = r.last; a.movidos = r.movidos; a.ciclo_fechado = !!r.ciclo_fechado;
-    a.ciclo_ini = r.ciclo_ini || null;
+    a.ciclo_ini = r.ciclo_ini || null; a.vazio_desde = r.vazio_desde || null; a.avisou_fim = !!r.avisou_fim;
   }
   await _dripSalva(owner, atuais);
 }
@@ -3284,6 +3287,8 @@ async function _dripTick() {
           r.dias = Array.isArray(rf.dias) ? rf.dias : r.dias; r.hora_ini = rf.hora_ini || ''; r.hora_fim = rf.hora_fim || '';
           r.movidos = rf.movidos || 0; r.last = rf.last || r.last; r.reset_seq = rf.reset_seq || 0;
           r.ciclo_ini = rf.ciclo_ini || r.ciclo_ini || null;
+          r.vazio_desde = rf.vazio_desde || null; r.avisou_fim = !!rf.avisou_fim;
+          r.avisar_fim = (rf.avisar_fim !== false);
           const ligadaAgora = !!rf.manual || (!!rf.agendado && _dripDentroDaJanela(r));
           if (!ligadaAgora) { mudou = true; continue; } // DESLIGADA no banco: não move nada
           if (rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; continue; }
@@ -3307,11 +3312,18 @@ async function _dripTick() {
         const lead = leads && leads[0];
         mudou = true;
         if (!lead) {
-          // Fila acabou: o ciclo fecha. O total movido vira histórico e a regra
-          // volta ao estado PARADA — sem "progresso pendente" (era isso que fazia
-          // aparecer Retomar/Parar quando entravam leads novos pela planilha).
+          // ⏳ CARÊNCIA: a fila vazia por um instante NÃO é o fim. Se entrar lead
+          // novo (planilha, bot, você arrastando) nos próximos minutos, o ciclo
+          // simplesmente continua. Sem isto, cada gota que caía virava um "ciclo
+          // concluído" e você recebia o mesmo aviso várias vezes seguidas.
+          if (!r.vazio_desde) { r.vazio_desde = new Date().toISOString(); r._tocada = true; mudou = true; }
+          if (Date.now() - Date.parse(r.vazio_desde) < _DRIP_CARENCIA_MS) continue;
+          // Fila acabou de verdade: o ciclo fecha. O total movido vira histórico e a
+          // regra volta ao estado PARADA — sem "progresso pendente" (era isso que
+          // fazia aparecer Retomar/Parar quando entravam leads novos pela planilha).
           r.last = { quando: new Date().toISOString(), vazio: true, total_ciclo: r.movidos || 0, ciclo_ini: r.ciclo_ini || null };
-          if (r.movidos > 0) {
+          // 🔔 UM aviso por ciclo. avisou_fim só volta a false quando um ciclo NOVO começa.
+          if (r.movidos > 0 && !r.avisou_fim && r.avisar_fim !== false) {
             // Diz desde quando é a conta: assim dá para conferir com a etapa
             let desde = '';
             try {
@@ -3321,7 +3333,8 @@ async function _dripTick() {
               }
             } catch (_) {}
             try { addNotice(owner, 'O gotejamento "' + (r.nome || 'sem nome') + '" terminou: ' + r.movidos + ' lead(s) movido(s)' + desde + '.',
-              'drip-fim:' + r.id + ':' + (r.ciclo_ini || '') + ':' + (r.movidos || 0), { tipo: 'ok', alvo: 'automacao' }); } catch (_) {}
+              'drip-fim:' + r.id + ':' + (r.ciclo_ini || ''), { tipo: 'ok', alvo: 'automacao' }); } catch (_) {}
+            r.avisou_fim = true;
           }
           r.ciclo_fechado = true; r._tocada = true;
           if (r.manual) { r.manual = false; r._desligarManual = true; }
@@ -3342,8 +3355,9 @@ async function _dripTick() {
         // atual e o aviso do fim anunciava mais leads do que realmente havia na etapa
         // (ex.: 30 de ontem + 60 de hoje = "90 movidos"). Só o número estava errado —
         // os leads sempre foram movidos um a um, na quantidade certa.
-        if (r.ciclo_fechado) { r.movidos = 0; r.ciclo_ini = null; }
+        if (r.ciclo_fechado) { r.movidos = 0; r.ciclo_ini = null; r.avisou_fim = false; }
         if (!r.ciclo_ini) r.ciclo_ini = new Date().toISOString();
+        r.vazio_desde = null; // entrou lead: a contagem de carência recomeça
         r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false; r._tocada = true;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
         console.log(`Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
@@ -3454,7 +3468,11 @@ app.put('/drip', async (req, res) => {
       next_at: nextAt, // mantém o próximo horário (pausar/ligar não encurta o intervalo); intervalo novo → recalculado
       parado_ate: (r.parado_ate && !isNaN(Date.parse(r.parado_ate)) && Date.parse(r.parado_ate) > Date.now()) ? new Date(r.parado_ate).toISOString() : null,
       movidos: r.zerar_movidos ? 0 : (a.movidos || 0), last: r.zerar_movidos ? null : (a.last || null),
-      ciclo_ini: r.zerar_movidos ? null : (a.ciclo_ini || null)
+      ciclo_ini: r.zerar_movidos ? null : (a.ciclo_ini || null),
+      vazio_desde: r.zerar_movidos ? null : (a.vazio_desde || null),
+      avisou_fim: r.zerar_movidos ? false : !!a.avisou_fim,
+      // Avisar quando terminar: ligado por padrão; você desliga na regra
+      avisar_fim: (r.avisar_fim !== undefined) ? !!r.avisar_fim : (a.avisar_fim !== false)
     };
   });
   const recusadas = [];
