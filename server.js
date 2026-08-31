@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 254;
+const SERVER_VER = 255;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3323,7 +3323,21 @@ async function _dripTick() {
           // fazia aparecer Retomar/Parar quando entravam leads novos pela planilha).
           r.last = { quando: new Date().toISOString(), vazio: true, total_ciclo: r.movidos || 0, ciclo_ini: r.ciclo_ini || null };
           // 🔔 UM aviso por ciclo. avisou_fim só volta a false quando um ciclo NOVO começa.
-          if (r.movidos > 0 && !r.avisou_fim && r.avisar_fim !== false) {
+          // 🔒 SEGUNDA TRAVA (o banco manda): durante um deploy o Railway chega a
+          // manter DOIS servidores no ar por alguns segundos. Cada um tem a sua
+          // memória, então os dois achavam que ainda não tinham avisado e mandavam
+          // um aviso cada. Antes de avisar, relemos a regra no banco: se lá já
+          // consta avisado, este servidor cala a boca.
+          let jaAvisou = !!r.avisou_fim;
+          if (!jaAvisou) {
+            try {
+              const { data: chk } = await supabase.from('settings').select('value').eq('key', 'drip_rules::' + owner).maybeSingle();
+              const rk = chk && chk.value ? (JSON.parse(chk.value) || []).find(x => x.id === r.id) : null;
+              if (rk && rk.avisou_fim) jaAvisou = true;
+            } catch (_) {}
+          }
+          if (jaAvisou) { r.avisou_fim = true; }
+          if (r.movidos > 0 && !jaAvisou && r.avisar_fim !== false) {
             // Diz desde quando é a conta: assim dá para conferir com a etapa
             let desde = '';
             try {
@@ -3332,9 +3346,14 @@ async function _dripTick() {
                 desde = ' (contando desde ' + p(d.getUTCDate()) + '/' + p(d.getUTCMonth() + 1) + ' às ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ')';
               }
             } catch (_) {}
-            try { addNotice(owner, 'O gotejamento "' + (r.nome || 'sem nome') + '" terminou: ' + r.movidos + ' lead(s) movido(s)' + desde + '.',
-              'drip-fim:' + r.id + ':' + (r.ciclo_ini || ''), { tipo: 'ok', alvo: 'automacao' }); } catch (_) {}
+            // Grava o "já avisei" ANTES de avisar: se o servidor cair no meio, o
+            // pior caso é ficar sem o aviso — nunca receber ele duas vezes.
             r.avisou_fim = true;
+            try { await _dripSalvaProgresso(owner, regras); } catch (_) {}
+            // A chave de dedupe é só a REGRA: qualquer repetição na mesma hora,
+            // venha de onde vier, é engolida pelo addNotice.
+            try { addNotice(owner, 'O gotejamento "' + (r.nome || 'sem nome') + '" terminou: ' + r.movidos + ' lead(s) movido(s)' + desde + '.',
+              'drip-fim:' + r.id, { tipo: 'ok', alvo: 'automacao' }); } catch (_) {}
           }
           r.ciclo_fechado = true; r._tocada = true;
           if (r.manual) { r.manual = false; r._desligarManual = true; }
