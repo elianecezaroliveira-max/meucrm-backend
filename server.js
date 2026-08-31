@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 256;
+const SERVER_VER = 257;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1596,6 +1596,38 @@ async function _isSelfSend(to, account_id) {
   } catch (_) { return false; }
 }
 
+// 💬 RESPONDER DE VERDADE: o VETRA guarda a citação pelo id INTERNO da mensagem,
+// mas o WhatsApp precisa do id DELE (wamid) para desenhar a citação no celular do
+// cliente. Aqui trocamos um pelo outro. Se a mensagem citada for antiga demais e
+// não tiver wamid, o envio segue normal — só sem a citação (nunca falha por isso).
+async function _citacaoWamid(quotedId, owner, phone) {
+  try {
+    if (!supabase || !quotedId) return null;
+    let q = supabase.from('messages').select('wamid, content, direction').eq('id', quotedId);
+    q = owner ? q.eq('owner', owner) : q;
+    const { data } = await q.maybeSingle();
+    if (!data || !data.wamid) return null;
+    return { wamid: data.wamid, content: data.content || '', direction: data.direction || 'inbound' };
+  } catch (_) { return null; }
+}
+// Envia pelo QR com a citação; se o WhatsApp recusar a mensagem citada, manda
+// sem ela — o arquivo nunca deixa de ir por causa da citação.
+async function _qrEnvia(sock, jid, conteudo, opt) {
+  if (opt && opt.quoted) {
+    try { return await sock.sendMessage(jid, conteudo, opt); }
+    catch (e) { console.error('QR: citação recusada, enviando sem ela:', e.message); }
+  }
+  return await sock.sendMessage(jid, conteudo);
+}
+// Objeto mínimo que o motor QR entende como "mensagem citada"
+function _quotedQR(cit, phone) {
+  if (!cit) return null;
+  return {
+    key: { remoteJid: String(phone).replace(/\D/g, '') + '@s.whatsapp.net', fromMe: cit.direction === 'outbound', id: cit.wamid },
+    message: { conversation: String(cit.content || '').slice(0, 300) || ' ' }
+  };
+}
+
 app.post("/send", async (req, res) => {
   if (_planoBarra(req, res)) return;
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
@@ -1631,7 +1663,8 @@ app.post("/send", async (req, res) => {
   // 3. Envio via Evolution API (QR Code)
   if (accountType === 'evolution' && evolutionInstance) {
     try {
-      const evoRes = await sendViaEvolution(evolutionInstance, to, message);
+      const _cit = await _citacaoWamid(quoted_id, req.owner, to);
+      const evoRes = await sendViaEvolution(evolutionInstance, to, message, _quotedQR(_cit, to));
       const wamid = evoRes?.key?.id || null; // mesmo id que volta no webhook → permite dedup
       if (supabase) {
         const safeAccountId = account_id || null;
@@ -1651,11 +1684,23 @@ app.post("/send", async (req, res) => {
     return res.status(400).json({ error: "Nenhuma conta configurada. Adicione uma conta WhatsApp primeiro." });
 
   try {
-    const response = await axios.post(
-      `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
-      { messaging_product: "whatsapp", to, type: "text", text: { body: message } },
-      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
-    );
+    const _cit = await _citacaoWamid(quoted_id, req.owner, to);
+    const _corpo = { messaging_product: "whatsapp", to, type: "text", text: { body: message } };
+    // É isto que faz a citação aparecer NO CELULAR DO CLIENTE
+    if (_cit) _corpo.context = { message_id: _cit.wamid };
+    const _hdr = { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } };
+    let response;
+    try {
+      response = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`, _corpo, _hdr);
+    } catch (e1) {
+      // A Meta recusou a mensagem citada (antiga demais, apagada)? Manda sem ela —
+      // a mensagem NUNCA deixa de sair por causa da citação.
+      if (_cit) {
+        console.error('Citação recusada pela Meta, enviando sem ela:', e1.response?.data?.error?.message || e1.message);
+        delete _corpo.context;
+        response = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`, _corpo, _hdr);
+      } else { throw e1; }
+    }
 
     if (supabase) {
       const safeAccountId = account_id || null;
@@ -1891,10 +1936,16 @@ app.post("/send-media", async (req, res) => {
       const sock = _waSocks[evolutionInstance];
       if (!sock || _waState[evolutionInstance] !== 'open')
         return res.status(400).json({ error: 'WhatsApp QR desconectado — gere o QR novamente em Contas' });
+      const _citQR = await _citacaoWamid(qId, req.owner, to);
       let fileBuf = Buffer.from(fileBase64, "base64");
       const baseMime = String(mimeType).split(";")[0].trim();
       const jid = await waResolveJid(sock, to); // endereço real (resolve o nono dígito)
       const durSecs = Number(req.body.duration) || 0;
+      // Responder com foto/arquivo: a citação também vai para o celular do cliente
+      const _optQR = (function () {
+        const q = _quotedQR(_citQR, to);
+        return q ? { quoted: q } : undefined;
+      })();
       let sent, content, msgType, qrSentMime = baseMime;
       if (baseMime.startsWith('audio/')) {
         if (baseMime !== 'audio/ogg') {
@@ -1904,17 +1955,17 @@ app.post("/send-media", async (req, res) => {
         // Envelope de volume (os "pauzinhos" da mensagem de voz)
         const wf = req.body.voice === true ? await computeWaveform(fileBuf) : null;
         req._wfOut = wf; // usado depois para gravar a onda no banco
-        sent = await sock.sendMessage(jid, {
+        sent = await _qrEnvia(sock, jid, {
           audio: fileBuf, mimetype: 'audio/ogg; codecs=opus',
           ptt: req.body.voice === true, seconds: durSecs || undefined,
           ...(wf ? { waveform: wf } : {}),
-        });
+        }, _optQR);
         msgType = 'audio'; qrSentMime = 'audio/ogg';
         content = req.body.voice === true
           ? '🎤 Mensagem de voz' + (durSecs ? ` (${_fmtDur(durSecs)})` : '')
           : `[Áudio: ${fileName}]`;
       } else if (baseMime.startsWith('image/')) {
-        sent = await sock.sendMessage(jid, { image: fileBuf, mimetype: baseMime, ...(mCaption ? { caption: mCaption } : {}) });
+        sent = await _qrEnvia(sock, jid, { image: fileBuf, mimetype: baseMime, ...(mCaption ? { caption: mCaption } : {}) }, _optQR);
         msgType = 'image'; content = mCaption || `[Imagem: ${fileName}]`;
       } else if (baseMime.startsWith('video/')) {
         let vMime = 'video/mp4';
@@ -1922,10 +1973,10 @@ app.post("/send-media", async (req, res) => {
           try { fileBuf = await convertVideoToMp4(fileBuf); }
           catch (ve) { console.error('Conversão de vídeo falhou, enviando original:', ve.message); vMime = baseMime; }
         }
-        sent = await sock.sendMessage(jid, { video: fileBuf, mimetype: vMime, ...(mCaption ? { caption: mCaption } : {}) });
+        sent = await _qrEnvia(sock, jid, { video: fileBuf, mimetype: vMime, ...(mCaption ? { caption: mCaption } : {}) }, _optQR);
         msgType = 'video'; qrSentMime = vMime; content = mCaption || `[Vídeo: ${fileName}]`;
       } else {
-        sent = await sock.sendMessage(jid, { document: fileBuf, mimetype: baseMime, fileName });
+        sent = await _qrEnvia(sock, jid, { document: fileBuf, mimetype: baseMime, fileName }, _optQR);
         msgType = 'document'; content = `[Documento: ${fileName}]`;
       }
       let mediaPathOut = null; // visível na resposta final (fora do bloco do supabase)
@@ -2019,11 +2070,20 @@ app.post("/send-media", async (req, res) => {
     if (msgType === "audio" && req.body.voice === true && sendMime === "audio/ogg") mediaObj.voice = true;
 
     // 3. Envia a mensagem de mídia
-    const mediaResp = await axios.post(
-      `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
-      { messaging_product: "whatsapp", to, type: msgType, [msgType]: mediaObj },
-      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
-    );
+    const _citM = await _citacaoWamid(qId, req.owner, to);
+    const _corpoM = { messaging_product: "whatsapp", to, type: msgType, [msgType]: mediaObj };
+    if (_citM) _corpoM.context = { message_id: _citM.wamid }; // citação no celular do cliente
+    const _hdrM = { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } };
+    let mediaResp;
+    try {
+      mediaResp = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`, _corpoM, _hdrM);
+    } catch (e1) {
+      if (_citM) {
+        console.error('Citação recusada pela Meta (mídia), enviando sem ela:', e1.response?.data?.error?.message || e1.message);
+        delete _corpoM.context;
+        mediaResp = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`, _corpoM, _hdrM);
+      } else { throw e1; }
+    }
 
     // 4. Salva no Supabase
     if (supabase) {
@@ -8482,10 +8542,16 @@ async function waFetchAvatar(instanceName, phone, owner) {
   } catch (_) {}
 }
 
-async function waSendText(instanceName, to, text) {
+async function waSendText(instanceName, to, text, quoted) {
   const sock = _waSocks[instanceName];
   if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
   const jid = await waResolveJid(sock, to);
+  // Com citação: se o WhatsApp recusar a mensagem citada (muito antiga, apagada),
+  // manda sem a citação em vez de deixar de enviar.
+  if (quoted) {
+    try { return await sock.sendMessage(jid, { text }, { quoted }); }
+    catch (e) { console.error('QR: citação recusada, enviando sem ela:', e.message); }
+  }
   return await sock.sendMessage(jid, { text });
 }
 // Envio de conteúdo especial pelo QR (localização, contato, enquete, revogação…)
@@ -8554,14 +8620,13 @@ async function initEmbeddedWa() {
 setTimeout(initEmbeddedWa, 2500);
 
 // Envia mensagem via Evolution API
-async function sendViaEvolution(instanceName, to, text) {
-  if (WA_EMBEDDED) return await waSendText(instanceName, to, text); // motor embutido
+async function sendViaEvolution(instanceName, to, text, quoted) {
+  if (WA_EMBEDDED) return await waSendText(instanceName, to, text, quoted); // motor embutido
   // Evolution API v2: body usa "text" direto
-  const r = await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
-    number: to,
-    text,
-    options: { delay: 1000 }
-  }, { headers: evoHdr(), timeout: 15000 });
+  const corpo = { number: to, text, options: { delay: 1000 } };
+  if (quoted) corpo.quoted = quoted; // responde a mensagem citada no celular do cliente
+  const r = await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`, corpo,
+    { headers: evoHdr(), timeout: 15000 });
   return r.data;
 }
 
