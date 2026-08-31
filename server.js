@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 255;
+const SERVER_VER = 256;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1865,6 +1865,10 @@ app.post("/send-media", async (req, res) => {
   if (_planoBarra(req, res)) return;
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
   const mCaption = String(req.body.caption || '').trim();
+  // Responder com FOTO: a citação vem junto, do mesmo jeito que na mensagem de texto
+  const qId = req.body.quoted_id || null;
+  const qTxt = req.body.quoted_content || null;
+  const qDir = req.body.quoted_direction || null;
   if (!to || !fileBase64 || !fileName || !mimeType)
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
@@ -1944,6 +1948,7 @@ app.post("/send-media", async (req, res) => {
           phone: to, content, type: msgType, direction: 'outbound',
           timestamp: new Date().toISOString(), account_id: account_id || null,
           status: 'sent', wamid, owner: req.owner || null,
+          quoted_id: qId, quoted_content: qTxt, quoted_direction: qDir,
           media_id: mediaPathOut, media_mime_type: mediaPathOut ? outMime : null }, req));
         // Onda REAL da mensagem de voz (opcional — ignora se a coluna não existir)
         try {
@@ -2039,6 +2044,7 @@ app.post("/send-media", async (req, res) => {
         type: msgType, direction: "outbound",
         timestamp: new Date().toISOString(), account_id: safeAccountId,
         status: mediaWamid ? 'sent' : 'pending', wamid: mediaWamid, owner: req.owner || null,
+        quoted_id: qId, quoted_content: qTxt, quoted_direction: qDir,
         media_id: mediaId, media_mime_type: sendMime, // permite exibir a mídia no CRM
       }, req));
       await applyPendingStatus(mediaWamid);
