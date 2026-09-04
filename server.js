@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 257;
+const SERVER_VER = 258;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7412,6 +7412,123 @@ app.post('/backup/auto/restaurar', async (req, res) => {
   res.json({ ok: true, dia, restaurados: feitos });
 });
 
+
+// ═══════════════════════════════════════════════════════════════════
+// 💵 CONTADOR DE MENSAGENS COBRADAS PELA META
+// ═══════════════════════════════════════════════════════════════════
+// A partir de 01/10/2026 a Meta cobra por mensagem de SERVIÇO entregue (as
+// respostas livres dentro da janela de 24h). Este contador existe para o cliente
+// saber, ANTES da fatura, quanto está gastando.
+//
+// O que entra e o que NÃO entra na conta:
+//   ✅ enviadas por número da API oficial (texto, foto, áudio, arquivo) = SERVIÇO
+//   ✅ enviadas por modelo aprovado (template) = MODELO — já é cobrado hoje
+//   ❌ recebidas do cliente (a Meta nunca cobra)
+//   ❌ notas internas (nunca saem do VETRA)
+//   ❌ que falharam (a Meta cobra só o que é ENTREGUE)
+//   ❌ números por QR Code (não passam pela Meta, não têm cobrança)
+const _CUSTOS_PADRAO = { preco_servico: 0.035, preco_modelo: 0.035, franquia: 1000, por: 'waba' };
+function _custosCfg(owner) {
+  try {
+    const v = JSON.parse(_settings['custos_cfg::' + (owner || ' ')] || '{}');
+    return Object.assign({}, _CUSTOS_PADRAO, v || {});
+  } catch (_) { return Object.assign({}, _CUSTOS_PADRAO); }
+}
+// Começo e fim do mês (YYYY-MM) no horário de Brasília, devolvidos em UTC
+function _mesBrt(mes) {
+  const hoje = new Date(Date.now() - 3 * 3600000);
+  let a = hoje.getUTCFullYear(), m = hoje.getUTCMonth();
+  const casa = /^(\d{4})-(\d{2})$/.exec(String(mes || ''));
+  if (casa) { a = parseInt(casa[1], 10); m = parseInt(casa[2], 10) - 1; }
+  const ini = new Date(Date.UTC(a, m, 1));
+  const fim = new Date(Date.UTC(a, m + 1, 1));
+  const p = n => String(n).padStart(2, '0');
+  return {
+    mes: a + '-' + p(m + 1),
+    de: new Date(ini.getTime() + 3 * 3600000).toISOString(),
+    ate: new Date(fim.getTime() + 3 * 3600000).toISOString()
+  };
+}
+app.get('/custos', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  try {
+    const cfg = _custosCfg(req.owner);
+    const { mes, de, ate } = _mesBrt(req.query.mes);
+    const { data: contas } = await supabase.from('accounts')
+      .select('id, name, type, evolution_instance, waba_id, phone_display, phone_number_id')
+      .eq('owner', req.owner);
+    const conta = (q) => q.then(r => r.count || 0).catch(() => 0);
+    const numeros = [];
+    for (const a of (contas || [])) {
+      const qr = !!a.evolution_instance || a.type === 'evolution';
+      const base = () => supabase.from('messages').select('id', { count: 'exact', head: true })
+        .eq('owner', req.owner).eq('account_id', a.id).eq('direction', 'outbound')
+        .gte('timestamp', de).lt('timestamp', ate)
+        .not('status', 'eq', 'failed');           // a Meta cobra só o ENTREGUE
+      const [servico, modelo] = await Promise.all([
+        conta(base().not('type', 'in', '(template,note)')), // resposta livre = SERVIÇO
+        conta(base().eq('type', 'template'))                 // modelo aprovado
+      ]);
+      numeros.push({
+        id: a.id, nome: a.name || '(sem nome)', numero: a.phone_display || null,
+        qr, waba_id: a.waba_id || null,
+        servico: qr ? 0 : servico, modelo: qr ? 0 : modelo,
+        servico_qr: qr ? servico : 0, modelo_qr: qr ? modelo : 0
+      });
+    }
+    // Agrupado por WABA (a franquia da Meta historicamente era por conta, não por número)
+    const wabas = {};
+    numeros.filter(n => !n.qr).forEach(n => {
+      const k = n.waba_id || 'sem-waba';
+      const w = wabas[k] = wabas[k] || { waba_id: n.waba_id, numeros: [], servico: 0, modelo: 0 };
+      w.numeros.push(n.nome); w.servico += n.servico; w.modelo += n.modelo;
+    });
+    // Franquia aplicada onde você mandar (por número ou por WABA)
+    const grupos = cfg.por === 'numero'
+      ? numeros.filter(n => !n.qr).map(n => ({ nome: n.nome, servico: n.servico, modelo: n.modelo }))
+      : Object.values(wabas).map(w => ({ nome: w.numeros.join(', '), servico: w.servico, modelo: w.modelo }));
+    let servicoCobrado = 0, gratisUsadas = 0;
+    grupos.forEach(g => {
+      const gratis = Math.min(g.servico, cfg.franquia || 0);
+      gratisUsadas += gratis;
+      servicoCobrado += Math.max(0, g.servico - gratis);
+    });
+    const totServico = numeros.reduce((s, n) => s + n.servico, 0);
+    const totModelo = numeros.reduce((s, n) => s + n.modelo, 0);
+    const totQR = numeros.reduce((s, n) => s + n.servico_qr + n.modelo_qr, 0);
+    res.json({
+      mes, de, ate, cfg,
+      numeros, wabas: Object.values(wabas), grupos,
+      totais: {
+        servico: totServico, modelo: totModelo, qr: totQR,
+        gratis_usadas: gratisUsadas,
+        gratis_total: (cfg.franquia || 0) * (grupos.length || 1),
+        servico_cobrado: servicoCobrado,
+        custo_servico: +(servicoCobrado * (cfg.preco_servico || 0)).toFixed(2),
+        custo_modelo: +(totModelo * (cfg.preco_modelo || 0)).toFixed(2),
+        custo_total: +((servicoCobrado * (cfg.preco_servico || 0)) + (totModelo * (cfg.preco_modelo || 0))).toFixed(2)
+      }
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/custos/config', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'mudar os valores da calculadora')) return;
+  const b = req.body || {};
+  const atual = _custosCfg(req.owner);
+  const num = (v, d) => { const n = parseFloat(String(v).replace(',', '.')); return isFinite(n) && n >= 0 ? n : d; };
+  const novo = {
+    preco_servico: b.preco_servico !== undefined ? num(b.preco_servico, atual.preco_servico) : atual.preco_servico,
+    preco_modelo: b.preco_modelo !== undefined ? num(b.preco_modelo, atual.preco_modelo) : atual.preco_modelo,
+    franquia: b.franquia !== undefined ? Math.max(0, parseInt(b.franquia, 10) || 0) : atual.franquia,
+    por: b.por === 'numero' ? 'numero' : (b.por === 'waba' ? 'waba' : atual.por)
+  };
+  const K = 'custos_cfg::' + req.owner;
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(novo), updated_at: new Date().toISOString() });
+  _settings[K] = JSON.stringify(novo);
+  res.json({ ok: true, cfg: novo });
+});
+
 // ═══════════════════════════════════════════════════════════════════
 // 📊 RELATÓRIOS — o que o dono da empresa quer ver
 // ═══════════════════════════════════════════════════════════════════
@@ -7885,7 +8002,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
