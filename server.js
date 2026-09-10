@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 259;
+const SERVER_VER = 260;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1402,10 +1402,22 @@ app.get('/accounts/:id/dependencias', async (req, res) => {
 // registro na Cloud API e inscrição da WABA no webhook — sem isso a conta
 // ficava "capada": sem número na tela, sem modelos e sem receber mensagens
 app.post("/accounts", async (req, res) => {
-  const { name, phone_number_id, token } = req.body;
-  if (!name || !phone_number_id || !token)
-    return res.status(400).json({ error: "Informe name, phone_number_id e token" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  const { name, phone_number_id } = req.body;
+  let token = String(req.body.token || '').trim();
+  // REAPROVEITAR O TOKEN DE OUTRA CONTA: a Meta mostra o token de usuário do
+  // sistema uma única vez. Quem já colou um aqui não precisa gerar outro a cada
+  // número novo — o VETRA usa o que já está guardado (o token não vai para a
+  // tela em momento nenhum; a troca é só aqui dentro).
+  const _tokenDe = String(req.body.usar_token_de || '').trim();
+  if (!token && _tokenDe) {
+    const { data: _outra } = await supabase.from('accounts').select('token')
+      .eq('id', _tokenDe).eq('owner', req.owner || ' ').maybeSingle();
+    if (!_outra || !_outra.token) return res.status(400).json({ error: 'Não achei o token da conta escolhida.' });
+    token = _outra.token;
+  }
+  if (!name || !phone_number_id || !token)
+    return res.status(400).json({ error: "Informe o nome, o ID do número e o token (ou escolha uma conta que já tem token)." });
 
   let phone_display = null;
   // WABA informada no formulário tem prioridade (tokens de usuário do sistema
