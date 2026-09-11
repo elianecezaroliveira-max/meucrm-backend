@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 262;
+const SERVER_VER = 263;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2565,6 +2565,106 @@ app.get('/audio-dur/:mediaId', async (req, res) => {
     }
     res.json({ seconds: val });
   } catch (e) { res.json({ seconds: 0 }); }
+});
+
+// ── 📦 MEUS DADOS: conversas e arquivos do cliente ──
+function _csvCampo(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"'; }
+function _dataBr(iso) {
+  try { const d = new Date(new Date(iso).getTime() - 3 * 3600000);
+    return String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + d.getUTCFullYear()
+      + ' ' + String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+  } catch (_) { return String(iso || ''); }
+}
+// Traz as mensagens em blocos (uma conta grande não cabe numa consulta só)
+async function* _todasMensagens(owner, filtroFone) {
+  let de = 0; const passo = 1000;
+  for (;;) {
+    let q = supabase.from('messages')
+      .select('phone, direction, type, content, timestamp, media_id, media_mime_type')
+      .eq('owner', owner).order('timestamp', { ascending: true }).range(de, de + passo - 1);
+    if (filtroFone) q = q.eq('phone', filtroFone);
+    const { data, error } = await q;
+    if (error || !data || !data.length) return;
+    yield data;
+    if (data.length < passo) return;
+    de += passo;
+  }
+}
+// Conversas em planilha (abre no Excel)
+app.get('/exportar/conversas.csv', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const nomes = {};
+  try {
+    const { data: cs } = await supabase.from('contacts').select('phone, name').eq('owner', req.owner);
+    (cs || []).forEach(c => { nomes[c.phone] = c.name || ''; });
+  } catch (_) {}
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="conversas_' + new Date().toISOString().slice(0, 10) + '.csv"');
+  res.write('\ufeff' + ['Data', 'Telefone', 'Nome', 'Quem', 'Tipo', 'Mensagem', 'Arquivo'].join(';') + '\r\n');
+  let n = 0;
+  for await (const bloco of _todasMensagens(req.owner, req.query.phone || null)) {
+    for (const m of bloco) {
+      const quem = m.type === 'note' ? 'Nota interna' : (m.direction === 'outbound' ? 'Eu' : 'Cliente');
+      res.write([_csvCampo(_dataBr(m.timestamp)), _csvCampo(m.phone), _csvCampo(nomes[m.phone] || ''),
+        _csvCampo(quem), _csvCampo(m.type || 'text'), _csvCampo(m.content || ''), _csvCampo(m.media_id || '')].join(';') + '\r\n');
+      n++;
+    }
+  }
+  console.log('Exportação de conversas de ' + req.owner + ': ' + n + ' mensagem(ns)');
+  res.end();
+});
+// Lista dos arquivos, com link para baixar cada um
+app.get('/exportar/arquivos.html', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const nomes = {};
+  try {
+    const { data: cs } = await supabase.from('contacts').select('phone, name, account_id').eq('owner', req.owner);
+    (cs || []).forEach(c => { nomes[c.phone] = { nome: c.name || '', acc: c.account_id || '' }; });
+  } catch (_) {}
+  const esc = t => String(t == null ? '' : t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const base = (req.headers['x-forwarded-proto'] || 'https') + '://' + req.headers.host;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="arquivos_' + new Date().toISOString().slice(0, 10) + '.html"');
+  res.write('<!doctype html><meta charset="utf-8"><title>Arquivos do VETRA</title>'
+    + '<style>body{font-family:system-ui,Arial;margin:24px;color:#131c20}h1{font-size:19px}'
+    + 'table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid #e9edef;padding:7px 8px;text-align:left}'
+    + 'a{color:#00806a}</style><h1>Arquivos recebidos e enviados</h1>'
+    + '<p style="font-size:13px;color:#667781">Clique para baixar. Os links funcionam com você conectado ao VETRA.</p>'
+    + '<table><tr><th>Data</th><th>Lead</th><th>Tipo</th><th>Arquivo</th></tr>');
+  let n = 0;
+  for await (const bloco of _todasMensagens(req.owner, null)) {
+    for (const m of bloco) {
+      if (!m.media_id) continue;
+      const inf = nomes[m.phone] || {};
+      const u = base + '/media-proxy/' + encodeURIComponent(m.media_id)
+        + '?account_id=' + encodeURIComponent(inf.acc || '') + '&download=1';
+      res.write('<tr><td>' + esc(_dataBr(m.timestamp)) + '</td><td>' + esc(inf.nome || m.phone)
+        + '</td><td>' + esc(m.type || '') + '</td><td><a href="' + esc(u) + '">baixar</a></td></tr>');
+      n++;
+    }
+  }
+  res.write('</table><p style="font-size:12px;color:#8696a0">' + n + ' arquivo(s).</p>');
+  console.log('Exportação de arquivos de ' + req.owner + ': ' + n + ' arquivo(s)');
+  res.end();
+});
+// Quanto o cliente tem guardado (para ele saber antes de exportar)
+app.get('/exportar/resumo', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.json({});
+  try {
+    const cnt = async (tab, filtro) => {
+      let q = supabase.from(tab).select('*', { count: 'exact', head: true }).eq('owner', req.owner);
+      if (filtro) q = filtro(q);
+      const { count } = await q; return count || 0;
+    };
+    res.json({
+      mensagens: await cnt('messages'),
+      arquivos: await cnt('messages', q => q.not('media_id', 'is', null)),
+      leads: await cnt('contacts')
+    });
+  } catch (e) { res.json({}); }
 });
 
 app.get("/media-proxy/:mediaId", async (req, res) => {
@@ -6651,6 +6751,7 @@ app.get('/uso-conta', async (req, res) => {
 // ── BACKUP: baixa tudo o que é configuração (não leva conversas nem leads) ──
 const _BK_CHAVES = ['quick_replies', 'tag_catalog', 'tag_cores', 'stage_actions', 'drip_rules', 'sheets_sync'];
 app.get('/backup', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
   try {
@@ -6676,6 +6777,7 @@ app.get('/backup', async (req, res) => {
 // gotejamento e planilha). Bots e etapas ficam no arquivo, mas não são
 // sobrescritos aqui — mexer neles às cegas quebraria o que está rodando.
 app.post('/backup/restaurar', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
   if (!_exigeAdmin(req, res, 'restaurar um backup')) return;
@@ -7400,7 +7502,22 @@ app.delete('/auditoria', async (req, res) => {
 // Guarda só CONFIGURAÇÃO (respostas rápidas, etiquetas, automações, funil,
 // bots, perguntas da IA). Conversas e leads não entram: são grandes demais e
 // já vivem no banco. Mantém os últimos 30 dias.
-const _BKP_DIAS = 30;
+const _BKP_DIAS = 8; // 8 versões DIFERENTES (não 30 cópias iguais)
+// Compacta/descompacta o texto da cópia (zlib é nativo do Node)
+function _zipTxt(txt) {
+  try { return 'z:' + require('zlib').gzipSync(Buffer.from(txt, 'utf8'), { level: 9 }).toString('base64'); }
+  catch (_) { return txt; }
+}
+function _unzipTxt(v) {
+  const t = String(v || '');
+  if (!t.startsWith('z:')) return t; // cópia antiga, sem compactação
+  try { return require('zlib').gunzipSync(Buffer.from(t.slice(2), 'base64')).toString('utf8'); }
+  catch (_) { return ''; }
+}
+function _impressao(txt) {
+  try { return require('crypto').createHash('sha1').update(String(txt)).digest('hex').slice(0, 16); }
+  catch (_) { return String(txt).length + ''; }
+}
 function _diaBrt(ms) { return new Date((ms || Date.now()) - 3 * 3600000).toISOString().slice(0, 10); }
 async function _backupDados(owner) {
   const out = { vetra: 'backup', versao: SERVER_VER, dono: owner, quando: new Date().toISOString(), settings: {}, bots: [], etapas: [], faqs: [] };
@@ -7428,7 +7545,22 @@ async function _backupAutoDe(owner) {
     const dados = await _backupDados(owner);
     // Nada configurado ainda? Não gasta uma linha do banco com um arquivo vazio.
     if (!Object.keys(dados.settings).length && !dados.etapas.length && !dados.bots.length && !dados.faqs.length) return null;
-    const txt = JSON.stringify(dados);
+    // Tira a hora de dentro do conteúdo antes de comparar (senão "muda" todo dia)
+    const _semHora = Object.assign({}, dados); delete _semHora.quando;
+    const dig = _impressao(JSON.stringify(_semHora));
+    // Nada mudou desde a última cópia? Não gasta espaço com uma cópia igual.
+    try {
+      const { data: ult } = await supabase.from('settings').select('key, value')
+        .like('key', 'bkp::' + owner + '::%').order('key', { ascending: false }).limit(1);
+      const anterior = (ult && ult[0]) ? _unzipTxt(ult[0].value) : '';
+      if (anterior) {
+        try {
+          const o = JSON.parse(anterior); delete o.quando;
+          if (_impressao(JSON.stringify(o)) === dig) return { dia, igual: true, bytes: 0 };
+        } catch (_) {}
+      }
+    } catch (_) {}
+    const txt = _zipTxt(JSON.stringify(dados));
     await supabase.from('settings').upsert({ key: K, value: txt, updated_at: new Date().toISOString() });
     // de propósito NÃO guarda na memória: cópia é grande e só é lida quando você pede
     // apaga o que passou de 30 dias
@@ -7461,6 +7593,7 @@ async function _backupAutoTodos() {
 setTimeout(() => { _backupAutoTodos(); setInterval(_backupAutoTodos, 24 * 3600 * 1000); }, 10 * 60000);
 
 app.get('/backup/auto', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
   if (!_exigeLogin(req, res)) return;
   try {
     // só as datas: baixar o conteúdo de 30 cópias só para montar a lista seria desperdício
@@ -7473,13 +7606,16 @@ app.get('/backup/auto', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/backup/auto/:dia', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
   if (!_exigeLogin(req, res)) return;
   const dia = String(req.params.dia || '').slice(0, 10);
-  const { data } = await supabase.from('settings').select('value').eq('key', 'bkp::' + req.owner + '::' + dia).maybeSingle();
+  const { data: _d0 } = await supabase.from('settings').select('value').eq('key', 'bkp::' + req.owner + '::' + dia).maybeSingle();
+  const data = _d0 ? { value: _unzipTxt(_d0.value) } : null;
   if (!data?.value) return res.status(404).json({ error: 'Não existe cópia desse dia.' });
   try { res.json(JSON.parse(data.value)); } catch (_) { res.status(500).json({ error: 'Cópia ilegível.' }); }
 });
 app.post('/backup/auto/agora', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
   if (!_exigeLogin(req, res)) return;
   if (!_exigeAdmin(req, res, 'gerar uma cópia agora')) return;
   const r = await _backupAutoDe(req.owner);
@@ -7488,10 +7624,12 @@ app.post('/backup/auto/agora', async (req, res) => {
   res.json({ ok: true, dia: r.dia });
 });
 app.post('/backup/auto/restaurar', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
   if (!_exigeLogin(req, res)) return;
   if (!_exigeAdmin(req, res, 'restaurar um backup')) return;
   const dia = String(req.body?.dia || '').slice(0, 10);
-  const { data } = await supabase.from('settings').select('value').eq('key', 'bkp::' + req.owner + '::' + dia).maybeSingle();
+  const { data: _d0 } = await supabase.from('settings').select('value').eq('key', 'bkp::' + req.owner + '::' + dia).maybeSingle();
+  const data = _d0 ? { value: _unzipTxt(_d0.value) } : null;
   if (!data?.value) return res.status(404).json({ error: 'Não existe cópia desse dia.' });
   let bk; try { bk = JSON.parse(data.value); } catch (_) { return res.status(500).json({ error: 'Cópia ilegível.' }); }
   // Antes de sobrescrever, guarda o de HOJE — dá para voltar atrás do "voltar atrás"
