@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 261;
+const SERVER_VER = 262;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1875,6 +1875,23 @@ async function getAudioDurationSecs(mediaId, token) {
   finally { try { fs.unlinkSync(f); } catch (_) {} }
 }
 
+// Mede a duração de um arquivo de áudio que já está em memória
+async function _durDoBuffer(buf) {
+  if (!_ffmpeg || !buf || !buf.length) return null;
+  const os = require('os'), fs = require('fs'), path = require('path');
+  const f = path.join(os.tmpdir(), 'dur2_' + Date.now() + '_' + Math.random().toString(36).slice(2));
+  try {
+    fs.writeFileSync(f, buf);
+    return await new Promise(resolve => {
+      const { execFile } = require('child_process');
+      execFile(require('@ffmpeg-installer/ffmpeg').path, ['-i', f], (err, so, se) => {
+        const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(String(se || ''));
+        resolve(m ? (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]) : null);
+      });
+    });
+  } catch (_) { return null; }
+  finally { try { fs.unlinkSync(f); } catch (_) {} }
+}
 // Calcula os "pauzinhos" da mensagem de voz: envelope de volume em 64 barras (0-99)
 async function computeWaveform(audioBuf) {
   if (!_ffmpeg) return null;
@@ -2501,6 +2518,54 @@ async function getMediaUrl(mediaId, token, cacheKey, force) {
   mediaUrlCache.set(cacheKey, { url, ts: Date.now() });
   return url;
 }
+
+// ⏱️ DURAÇÃO do áudio (para a barrinha andar certo já na 1ª reprodução)
+const _durCache = {};
+app.get('/audio-dur/:mediaId', async (req, res) => {
+  const mediaId = String(req.params.mediaId || '');
+  if (!mediaId) return res.json({ seconds: 0 });
+  if (_durCache[mediaId] !== undefined) return res.json({ seconds: _durCache[mediaId] });
+  if (!_ffmpeg || !supabase) return res.json({ seconds: 0 });
+  try {
+    let buf = null;
+    // 1º: a cópia no cofre do VETRA (não gasta cota da Meta e é mais rápido)
+    const caminhos = /^(qr|notas|bot)\//.test(mediaId) ? [mediaId] : ['api/' + mediaId];
+    for (const c of caminhos) {
+      try {
+        const { data: b } = await supabase.storage.from('wa-media').download(c);
+        if (b) { buf = Buffer.from(await b.arrayBuffer()); break; }
+      } catch (_) {}
+    }
+    // 2º: ainda na Meta (áudio dos últimos 30 dias, sem cópia guardada)
+    if (!buf && req.query.account_id) {
+      const { data: acc } = await supabase.from('accounts').select('token').eq('id', req.query.account_id).eq('owner', req.owner || ' ').maybeSingle();
+      if (acc?.token) {
+        try {
+          const mr = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, { headers: { Authorization: `Bearer ${acc.token}` }, timeout: 12000 });
+          if (mr.data?.url) {
+            const md = await axios.get(mr.data.url, { headers: { Authorization: `Bearer ${acc.token}`, 'User-Agent': 'WhatsApp/2.0' },
+              responseType: 'arraybuffer', timeout: 20000, maxContentLength: 25 * 1024 * 1024 });
+            buf = Buffer.from(md.data);
+          }
+        } catch (_) {}
+      }
+    }
+    const secs = buf ? await _durDoBuffer(buf) : null;
+    const val = (secs && secs > 0) ? Math.round(secs * 10) / 10 : 0;
+    _durCache[mediaId] = val;
+    // Grava na própria mensagem: da próxima vez já vem pronta, sem medir de novo
+    if (val > 0) {
+      try {
+        const { data: ms } = await supabase.from('messages').select('id, content').eq('media_id', mediaId).eq('owner', req.owner || ' ').limit(3);
+        for (const m of (ms || [])) {
+          if (/\(\d+:\d{2}\)/.test(String(m.content || ''))) continue; // já tem
+          await supabase.from('messages').update({ content: '🎤 Mensagem de voz (' + _fmtDur(val) + ')' }).eq('id', m.id);
+        }
+      } catch (_) {}
+    }
+    res.json({ seconds: val });
+  } catch (e) { res.json({ seconds: 0 }); }
+});
 
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
