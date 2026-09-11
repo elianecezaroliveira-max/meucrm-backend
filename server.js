@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 260;
+const SERVER_VER = 261;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7067,7 +7067,8 @@ const CHAVES_POR_CONTA = new Set([
   'stage_trash', // lixeira de colunas do pipeline (desfazer exclusão)
   'lead_trash',  // lixeira de leads excluídos (30 dias)
   'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
-  'onboarding'   // passos de estreia já concluídos/dispensados
+  'onboarding',  // passos de estreia já concluídos/dispensados
+  'bots_fav'     // bots favoritos: sobem para o topo na hora de escolher
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
