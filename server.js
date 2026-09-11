@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 263;
+const SERVER_VER = 264;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -4056,11 +4056,110 @@ app.get("/leads", async (req, res) => {
 
 
 // ── Deletar mensagem individual ──
+const _MSGLIX_DIAS = 30, _MSGLIX_MAX = 40, _MSGLIX_MSGS = 5000;
+async function _msgLixLe(owner) {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'msg_trash::' + (owner || ' ')).maybeSingle();
+    const a = JSON.parse(_unzipTxt(data?.value) || '[]');
+    return Array.isArray(a) ? a : [];
+  } catch (_) { return []; }
+}
+async function _msgLixGrava(owner, lista) {
+  const corte = Date.now() - _MSGLIX_DIAS * 86400000;
+  lista = (lista || []).filter(x => x && x.quando && new Date(x.quando).getTime() > corte).slice(0, _MSGLIX_MAX);
+  const k = 'msg_trash::' + (owner || ' ');
+  await supabase.from('settings').upsert({ key: k, value: _zipTxt(JSON.stringify(lista)), updated_at: new Date().toISOString() });
+  delete _settings[k]; // linha pesada: não fica na memória
+}
+// Guarda na lixeira antes de apagar
+async function _msgLixGuarda(owner, phone, nome, linhas, oque) {
+  if (!linhas || !linhas.length) return null;
+  const lista = await _msgLixLe(owner);
+  const item = {
+    id: 'lx' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    quando: new Date().toISOString(), phone: phone || null, nome: nome || null,
+    oque: oque || 'mensagens', n: linhas.length,
+    dados: _zipTxt(JSON.stringify(linhas.slice(-_MSGLIX_MSGS)))
+  };
+  lista.unshift(item);
+  await _msgLixGrava(owner, lista);
+  return item;
+}
 app.delete("/messages/id/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { error } = await supabase.from("messages").delete().eq("id", req.params.id).eq("owner", req.owner || ' ');
+  const OW = req.owner || ' ';
+  // Antes de apagar: cópia na lixeira (30 dias)
+  try {
+    const { data: linhas } = await supabase.from('messages').select('*').eq('id', req.params.id).eq('owner', OW).limit(1);
+    if (linhas && linhas.length) {
+      const txt = String(linhas[0].content || '').replace(/\s+/g, ' ').slice(0, 60);
+      await _msgLixGuarda(OW, linhas[0].phone, txt, linhas, 'uma mensagem');
+    }
+  } catch (e) { console.error('Lixeira de mensagem:', e.message); }
+  const { error } = await supabase.from("messages").delete().eq("id", req.params.id).eq("owner", OW);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
+});
+// 📒 Notas internas de UM lead (para o painel de detalhes)
+app.get('/notas/:phone', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.json([]);
+  const { data, error } = await supabase.from('messages')
+    .select('id, content, timestamp, media_id, media_mime_type, sent_by')
+    .in('phone', phoneVariants(req.params.phone)).eq('owner', req.owner || ' ').eq('type', 'note')
+    .order('timestamp', { ascending: false }).limit(60);
+  if (error) { // a coluna sent_by pode não existir ainda: tenta sem ela
+    const { data: d2 } = await supabase.from('messages')
+      .select('id, content, timestamp, media_id, media_mime_type')
+      .in('phone', phoneVariants(req.params.phone)).eq('owner', req.owner || ' ').eq('type', 'note')
+      .order('timestamp', { ascending: false }).limit(60);
+    return res.json(d2 || []);
+  }
+  res.json(data || []);
+});
+
+// 🗑️ Lixeira de conversas/mensagens: ver, restaurar e esvaziar
+app.get('/msg-lixeira', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const lista = await _msgLixLe(req.owner);
+  res.json(lista.map(x => ({ id: x.id, quando: x.quando, phone: x.phone, nome: x.nome, oque: x.oque, n: x.n })));
+});
+app.post('/msg-lixeira/restaurar', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'restaurar mensagens apagadas')) return;
+  const id = String(req.body?.id || '');
+  const lista = await _msgLixLe(req.owner);
+  const item = lista.find(x => x.id === id);
+  if (!item) return res.status(404).json({ error: 'Esse item já saiu da lixeira.' });
+  let linhas = [];
+  try { linhas = JSON.parse(_unzipTxt(item.dados) || '[]'); } catch (_) {}
+  if (!Array.isArray(linhas) || !linhas.length) return res.status(500).json({ error: 'Cópia ilegível.' });
+  let voltaram = 0;
+  for (let i = 0; i < linhas.length; i += 200) {
+    const lote = linhas.slice(i, i + 200);
+    const { error } = await supabase.from('messages').upsert(lote, { onConflict: 'id' });
+    if (!error) voltaram += lote.length;
+  }
+  // A prévia da conversa volta a apontar para a última mensagem restaurada
+  try {
+    const ult = linhas[linhas.length - 1];
+    if (ult && ult.phone) {
+      await supabase.from('contacts').update({
+        last_message_at: ult.timestamp, last_message_preview: String(ult.content || '').slice(0, 80),
+        last_message_direction: ult.direction || 'inbound'
+      }).eq('phone', ult.phone).eq('owner', req.owner || ' ');
+    }
+  } catch (_) {}
+  await _msgLixGrava(req.owner, lista.filter(x => x.id !== id));
+  await _audita(req, 'Mensagens restauradas', voltaram + ' mensagem(ns)');
+  res.json({ ok: true, voltaram });
+});
+app.delete('/msg-lixeira/:id', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'esvaziar a lixeira')) return;
+  const lista = await _msgLixLe(req.owner);
+  await _msgLixGrava(req.owner, lista.filter(x => x.id !== String(req.params.id)));
+  res.json({ ok: true });
 });
 
 // ── 📷 FOTOS DOS BOTS ──
@@ -5144,6 +5243,17 @@ app.delete("/contacts/:phone/messages", async (req, res) => {
   _audita(req, 'Conversa apagada', _decSeguro(req.params.phone));
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const phone = _decSeguro(req.params.phone);
+  // Cópia na lixeira ANTES de apagar (30 dias) — é a rede de segurança
+  try {
+    const { data: linhas } = await supabase.from('messages').select('*')
+      .eq('phone', phone).eq('owner', req.owner || ' ').order('timestamp', { ascending: true }).limit(_MSGLIX_MSGS);
+    let nome = null;
+    try {
+      const { data: c } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', req.owner || ' ').maybeSingle();
+      nome = c?.name || null;
+    } catch (_) {}
+    await _msgLixGuarda(req.owner || ' ', phone, nome, linhas || [], 'conversa inteira');
+  } catch (e) { console.error('Lixeira da conversa:', e.message); }
   await supabase.from("messages").delete().eq("phone", phone).eq("owner", req.owner || ' ');
   const { error } = await supabase.from("contacts")
     .update({ last_message_preview: null, last_message_direction: null, unread_count: 0, first_unread_at: null })
@@ -7193,7 +7303,7 @@ let _settings = {};
 // configuração e fotos de fluxo de bot). Elas são grandes, ninguém lê da memória
 // (todas as rotas buscam direto no banco) e, sem esta exclusão, elas empurrariam
 // as configurações de verdade para fora do limite de linhas da consulta.
-const _SETTINGS_PESADAS = /^(bkp::|hist::|bot_snap::)/;
+const _SETTINGS_PESADAS = /^(bkp::|hist::|bot_snap::|msg_trash::)/;
 async function loadSettings() {
   if (!supabase) return;
   try {
@@ -8237,7 +8347,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|.*token.*|.*secret.*)$/i;
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
