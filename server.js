@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 266;
+const SERVER_VER = 267;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5740,6 +5740,16 @@ async function processNode(run, depth=0) {
     return;
   }
   const { id:runId, contact_phone:phone, account_id:acctId, current_node_id:nodeId, owner:botOwner } = run;
+  // TRAVA DE VIDA: a execução ainda vale? Se foi encerrada (você parou o bot, ou
+  // o mesmo bot foi disparado de novo e este é o disparo antigo), nada é enviado.
+  // Sem isto, uma sequência já em andamento continuava mandando mensagens em
+  // paralelo com a nova — o lead recebia tudo duas vezes.
+  if (runId) {
+    try {
+      const { data: _vivo } = await supabase.from('bot_runs').select('status').eq('id', runId).maybeSingle();
+      if (!_vivo || _vivo.status === 'stopped' || _vivo.status === 'completed') return;
+    } catch (_) {}
+  }
   const OW = botOwner || ' '; // sentinela p/ escopo por dono
   const node = await _nodeById(nodeId);
   if (!node) { await stopRun(runId,'stopped'); return; }
@@ -5891,6 +5901,7 @@ async function processNode(run, depth=0) {
     // O ciclo de 30s fica só para esperas longas e como segurança pós-reinício.
     const _prof = depth; // mantém a contagem de passos (senão um fluxo em círculo nunca para)
     if (waitMs <= _CRONO_EXATO_MS) {
+      _cronoProprio.add(String(runId)); // esta espera já tem despertador; o ciclo não marca outro
       // O próximo passo é descoberto DURANTE a espera (não atrasa nem a conta
       // nem a retomada), junto com o "digitando…" para o lead.
       let typingTimer = null;
@@ -5911,6 +5922,7 @@ async function processNode(run, depth=0) {
       // Espera o que FALTA até o instante alvo (desconta o tempo já gasto)
       setTimeout(async () => {
         try {
+          _cronoProprio.delete(String(runId));
           if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
           // Atômico: só retoma se AINDA estiver pausada (evita corrida com o ciclo de 30s)
           const { data: took } = await supabase.from('bot_runs')
@@ -6226,6 +6238,18 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
   if (!supabase) return null;
   let ownerEmail = owner;
   if (!ownerEmail) { const { data:b } = await supabase.from('bots').select('owner').eq('id',botId).maybeSingle(); ownerEmail = b?.owner || null; }
+  // 🔒 DOIS TOQUES = UM DISPARO. Se este mesmo bot acabou de ser disparado para
+  // este mesmo lead (últimos 10 segundos) e ainda está rodando, devolve aquele
+  // disparo em vez de criar outro. Sem isto, um toque duplo no botão punha duas
+  // sequências para correr ao mesmo tempo e o lead recebia tudo duas vezes.
+  try {
+    const _recente = new Date(Date.now() - 10000).toISOString();
+    const { data: _ja } = await supabase.from('bot_runs').select('*')
+      .eq('contact_phone', phone).eq('bot_id', botId)
+      .in('status', ['running','waiting_reply','paused'])
+      .gte('created_at', _recente).limit(1);
+    if (_ja && _ja.length) { console.log('Disparo repetido ignorado (bot já rodando há poucos segundos):', botId, phone); return _ja[0]; }
+  } catch (_) {}
   await supabase.from('bot_runs').update({ status:'stopped', updated_at:new Date().toISOString() }).eq('contact_phone',phone).eq('bot_id',botId).in('status',['running','waiting_reply','paused']);
   const { data:startNodes } = await supabase.from('bot_nodes').select('id').eq('bot_id',botId).eq('type','start').limit(1);
   const startNode = startNodes && startNodes[0];
@@ -6272,6 +6296,9 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
 // Cronômetro EXATO (na memória) para esperas de até 2 horas. Acima disso, o
 // ciclo de 30s marca o cronômetro exato quando a hora se aproxima.
 const _CRONO_EXATO_MS = 2 * 3600000;
+// Esperas que JÁ têm cronômetro próprio nesta instância. O ciclo de 30s não
+// marca um segundo despertador para elas (era o que disparava o passo 2x).
+const _cronoProprio = new Set();
 let _retomaOcupado = false;
 // Execuções que já têm cronômetro marcado nesta instância (não marca duas vezes)
 const _cronoMarcado = {};
@@ -6287,10 +6314,10 @@ setInterval(async () => {
     // Ainda não é a hora? Marca o cronômetro para o segundo exato e segue.
     const _falta = Date.parse(run.pause_until) - Date.now();
     if (_falta > 400) {
-      if (!_cronoMarcado[run.id]) {
+      if (!_cronoMarcado[run.id] && !_cronoProprio.has(String(run.id))) {
         _cronoMarcado[run.id] = setTimeout(() => {
           delete _cronoMarcado[run.id];
-          _retomaUma(run).catch(e => console.error('cronômetro exato:', e.message));
+          _retomaUma(run, true).catch(e => console.error('cronômetro exato:', e.message)); // confere antes de agir
         }, _falta);
       }
       continue;
@@ -6301,8 +6328,19 @@ setInterval(async () => {
   } catch (e) { console.error('retomada de bots:', e.message); }
   finally { _retomaOcupado = false; }
 }, 30000);
-// Retoma UMA execução pausada (usado pelo ciclo e pelo cronômetro exato)
-async function _retomaUma(run) {
+// Retoma UMA execução pausada (usado pelo ciclo e pelo cronômetro exato).
+// conferir = a fotografia da execução pode ter envelhecido (o cronômetro foi
+// marcado segundos atrás): confere no banco e só age se NADA mudou desde então.
+async function _retomaUma(run, conferir) {
+  if (conferir) {
+    const { data: atual } = await supabase.from('bot_runs').select('*').eq('id', run.id).maybeSingle();
+    if (!atual) return;
+    const mudou = String(atual.current_node_id || '') !== String(run.current_node_id || '')
+               || String(atual.status || '')          !== String(run.status || '')
+               || String(atual.pause_until || '')     !== String(run.pause_until || '');
+    if (mudou) return; // outro despertador já cuidou desta espera — não repete o passo
+    run = atual;
+  }
   const now = new Date().toISOString();
   {
     // 🔒 CLAIM: só continua quem conseguir "pegar" a execução (evita o mesmo passo
