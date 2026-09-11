@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 265;
+const SERVER_VER = 266;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5881,33 +5881,34 @@ async function processNode(run, depth=0) {
     await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
 
   } else if (node.type === 'pause') {
+    const _t0 = Date.now(); // marco zero: o relógio começa AQUI, não depois das consultas
     const ms = ((cfg.days||0)*24+(cfg.hours||0))*3600000 + (cfg.minutes||0)*60000 + (cfg.seconds||0)*1000;
     const waitMs = Math.max(ms, 1000);
-    const pauseUntil = new Date(Date.now()+waitMs).toISOString();
+    const _alvoMs = _t0 + waitMs;               // instante exato de retomar
+    const pauseUntil = new Date(_alvoMs).toISOString();
     await supabase.from('bot_runs').update({ status:'paused', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
     // Espera CURTA (até 2 min): cronômetro EXATO na memória — retoma na hora certa.
     // O ciclo de 30s fica só para esperas longas e como segurança pós-reinício.
     const _prof = depth; // mantém a contagem de passos (senão um fluxo em círculo nunca para)
     if (waitMs <= _CRONO_EXATO_MS) {
-      // "digitando…" para o lead enquanto o cronômetro roda, se o PRÓXIMO passo é uma mensagem
+      // O próximo passo é descoberto DURANTE a espera (não atrasa nem a conta
+      // nem a retomada), junto com o "digitando…" para o lead.
       let typingTimer = null;
-      try {
-        const nxtPeek = await getNextNodeId(nodeId, null);
-        if (nxtPeek) {
-          const nxNode = await _nodeById(nxtPeek);
-          if (nxNode && nxNode.type === 'message') {
-            const typeAcct = (nxNode.config && nxNode.config.account_id) || run.account_id || null;
-            if (typeAcct) {
-              botTypingPulse(phone, typeAcct).then(via => {
-                if (!via) return;
-                const ritmo = via === 'qr' ? 8000 : 22000; // API: renovar cedo demais cancela o indicador
-                typingTimer = setInterval(() => botTypingPulse(phone, typeAcct), ritmo);
-                setTimeout(() => { if (typingTimer) { clearInterval(typingTimer); typingTimer = null; } }, waitMs + 2000);
-              }).catch(()=>{});
-            }
-          }
-        }
-      } catch (_) {}
+      let _nxtPre = null;
+      getNextNodeId(nodeId, null).then(async (nxtPeek) => {
+        _nxtPre = nxtPeek || null;
+        if (!nxtPeek) return;
+        const nxNode = await _nodeById(nxtPeek);
+        if (!nxNode || nxNode.type !== 'message') return;
+        const typeAcct = (nxNode.config && nxNode.config.account_id) || run.account_id || null;
+        if (!typeAcct) return;
+        const via = await botTypingPulse(phone, typeAcct);
+        if (!via) return;
+        const ritmo = via === 'qr' ? 8000 : 22000; // API: renovar cedo demais cancela o indicador
+        typingTimer = setInterval(() => botTypingPulse(phone, typeAcct), ritmo);
+        setTimeout(() => { if (typingTimer) { clearInterval(typingTimer); typingTimer = null; } }, Math.max(0, _alvoMs - Date.now()) + 2000);
+      }).catch(() => {});
+      // Espera o que FALTA até o instante alvo (desconta o tempo já gasto)
       setTimeout(async () => {
         try {
           if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
@@ -5916,15 +5917,16 @@ async function processNode(run, depth=0) {
             .update({ status:'running', pause_until:null, updated_at:new Date().toISOString() })
             .eq('id', runId).eq('status', 'paused').select('id');
           if (!took || !took.length) return;
-          const nxt = await getNextNodeId(nodeId, null);
+          const nxt = _nxtPre || await getNextNodeId(nodeId, null); // já descoberto durante a espera
           if (nxt) {
-            await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId);
+            // O passo seguinte sai PRIMEIRO; a marcação no banco vai em paralelo
+            supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId).then(()=>{},()=>{});
             await processNode({ ...run, current_node_id:nxt, status:'running' }, _prof + 1);
           } else {
             await stopRun(runId,'completed');
           }
         } catch (e) { console.error('Retomada de pausa curta:', e.message); }
-      }, waitMs);
+      }, Math.max(0, _alvoMs - Date.now()));
     }
 
   } else if (node.type === 'business_hours') {
