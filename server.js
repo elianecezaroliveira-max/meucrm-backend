@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 264;
+const SERVER_VER = 265;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5888,7 +5888,7 @@ async function processNode(run, depth=0) {
     // Espera CURTA (até 2 min): cronômetro EXATO na memória — retoma na hora certa.
     // O ciclo de 30s fica só para esperas longas e como segurança pós-reinício.
     const _prof = depth; // mantém a contagem de passos (senão um fluxo em círculo nunca para)
-    if (waitMs <= 120000) {
+    if (waitMs <= _CRONO_EXATO_MS) {
       // "digitando…" para o lead enquanto o cronômetro roda, se o PRÓXIMO passo é uma mensagem
       let typingTimer = null;
       try {
@@ -6267,31 +6267,59 @@ async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPl
 // Timer: retoma runs pausadas/expiradas do bot.
 // 30s (era 5s) — economiza CPU/banda no Railway; as esperas dos bots são de
 // minutos/horas, então até 30s de folga não muda nada na prática.
+// Cronômetro EXATO (na memória) para esperas de até 2 horas. Acima disso, o
+// ciclo de 30s marca o cronômetro exato quando a hora se aproxima.
+const _CRONO_EXATO_MS = 2 * 3600000;
 let _retomaOcupado = false;
+// Execuções que já têm cronômetro marcado nesta instância (não marca duas vezes)
+const _cronoMarcado = {};
 setInterval(async () => {
   if (!supabase || _retomaOcupado) return; // um ciclo por vez (senão o mesmo passo rodava 2x)
   _retomaOcupado = true;
   try {
   const now = new Date().toISOString();
-  const { data:paused } = await supabase.from('bot_runs').select('*').in('status',['paused','waiting_reply']).lte('pause_until',now).not('pause_until','is',null);
+  // Pega também o que vence nos PRÓXIMOS 35s: esses ganham cronômetro exato
+  const _emBreve = new Date(Date.now() + 35000).toISOString();
+  const { data:paused } = await supabase.from('bot_runs').select('*').in('status',['paused','waiting_reply']).lte('pause_until',_emBreve).not('pause_until','is',null);
   for (const run of paused||[]) {
+    // Ainda não é a hora? Marca o cronômetro para o segundo exato e segue.
+    const _falta = Date.parse(run.pause_until) - Date.now();
+    if (_falta > 400) {
+      if (!_cronoMarcado[run.id]) {
+        _cronoMarcado[run.id] = setTimeout(() => {
+          delete _cronoMarcado[run.id];
+          _retomaUma(run).catch(e => console.error('cronômetro exato:', e.message));
+        }, _falta);
+      }
+      continue;
+    }
+    if (_cronoMarcado[run.id]) { clearTimeout(_cronoMarcado[run.id]); delete _cronoMarcado[run.id]; }
+    await _retomaUma(run);
+  }
+  } catch (e) { console.error('retomada de bots:', e.message); }
+  finally { _retomaOcupado = false; }
+}, 30000);
+// Retoma UMA execução pausada (usado pelo ciclo e pelo cronômetro exato)
+async function _retomaUma(run) {
+  const now = new Date().toISOString();
+  {
     // 🔒 CLAIM: só continua quem conseguir "pegar" a execução (evita o mesmo passo
     // sair duas vezes quando o cronômetro curto e este ciclo se cruzam)
     const { data: pego } = await supabase.from('bot_runs')
       .update({ pause_until: null, updated_at: new Date().toISOString() })
       .eq('id', run.id).eq('status', run.status).not('pause_until', 'is', null).select('id');
-    if (!pego || !pego.length) continue;
+    if (!pego || !pego.length) return;
     const _devolve = async () => { try { await supabase.from('bot_runs').update({ pause_until: run.pause_until }).eq('id', run.id).eq('status', run.status); } catch (_) {} };
     try {
     // EXPIRADA: se a hora de retomar passou há mais de 15 min (servidor reiniciou,
     // execução esquecida), NÃO envia nada "do nada" — encerra em silêncio.
-    if (Date.now() - new Date(run.pause_until).getTime() > 15*60000) { await stopRun(run.id,'stopped'); continue; }
+    if (Date.now() - new Date(run.pause_until).getTime() > 15*60000) { await stopRun(run.id,'stopped'); return; }
     // Se o nó atual é "Horário comercial", re-avalia o próprio nó (não avança)
     const curNode = await _nodeById(run.current_node_id);
     if (curNode?.type === 'business_hours') {
       await supabase.from('bot_runs').update({ status:'running', pause_until:null, updated_at:now }).eq('id',run.id);
       await processNode({...run, status:'running'});
-      continue;
+      return;
     }
     // Só as saídas de "sem resposta". Sem elas desenhadas, a execução ENCERRA —
     // antes ela seguia pela primeira seta qualquer (quem não respondeu ia pelo "Sim")
@@ -6300,9 +6328,7 @@ setInterval(async () => {
     else { await stopRun(run.id,'completed'); }
     } catch (e) { console.error('retomada de uma execução:', e.message); await _devolve(); }
   }
-  } catch (e) { console.error('retomada de bots:', e.message); }
-  finally { _retomaOcupado = false; }
-}, 30000);
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  IA / FAQ — responde automaticamente SÓ a perguntas cadastradas
