@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 267;
+const SERVER_VER = 268;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8414,6 +8414,20 @@ app.delete('/equipe/:email', async (req, res) => {
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
 const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|.*token.*|.*secret.*)$/i;
+// ── PÁGINA PÚBLICA (Termos e Privacidade) ──────────────────────────
+// privacy.html e terms.html ficam FORA do login: a Meta, o cliente e qualquer
+// pessoa precisam conseguir abrir. Estas páginas mostram a razão social, o CNPJ
+// e a cidade que você preencheu em Configurações ▸ Termos e privacidade — então
+// esta rota entrega SÓ esses três campos, mais nada.
+app.get('/publico/empresa', async (req, res) => {
+  try {
+    let d = {};
+    try { d = JSON.parse(_cfg('empresa_dados', OWNER_LEGADO) || '{}') || {}; } catch (_) { d = {}; }
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json({ nome: d.nome || '', cnpj: d.cnpj || '', cidade: d.cidade || '' });
+  } catch (_) { res.json({ nome: '', cnpj: '', cidade: '' }); }
+});
+
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
   const k = req.params.key;
