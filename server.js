@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 268;
+const SERVER_VER = 269;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5319,15 +5319,24 @@ app.post('/contacts/restore', async (req, res) => {
 
 app.put("/contacts/bulk-tags", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { phones, tags } = req.body;
-  if (!Array.isArray(phones) || !Array.isArray(tags)) return res.status(400).json({ error: "phones e tags obrigatórios" });
-  // For each phone, merge new tags with existing
+  const { phones, tags, add, remove } = req.body;
+  // {tags:[...]} = jeito antigo (só somava). {add:[...], remove:[...]} = novo.
+  const entram = (Array.isArray(add) ? add : (Array.isArray(tags) ? tags : [])).map(t => String(t).trim()).filter(Boolean);
+  const saem   = (Array.isArray(remove) ? remove : []).map(t => String(t).trim()).filter(Boolean);
+  if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: "phones obrigatório" });
+  if (!entram.length && !saem.length) return res.status(400).json({ error: "nada a fazer" });
+  const _ch = t => String(t).trim().toLowerCase(); // comparação sem depender de maiúsculas
+  const fora = new Set(saem.map(_ch));
+  let mexidos = 0;
   for (const phone of phones) {
     const { data: contact } = await supabase.from("contacts").select("tags").eq("phone", phone).eq("owner", req.owner || ' ').maybeSingle();
-    const merged = Array.from(new Set([...(contact?.tags || []), ...tags]));
-    await supabase.from("contacts").update({ tags: merged }).eq("phone", phone).eq("owner", req.owner || ' ');
+    const antes = Array.isArray(contact?.tags) ? contact.tags : [];
+    const lista = antes.filter(t => !fora.has(_ch(t)));
+    for (const t of entram) if (!lista.some(x => _ch(x) === _ch(t))) lista.push(t);
+    if (lista.length !== antes.length || lista.some((t, i) => t !== antes[i])) mexidos++;
+    await supabase.from("contacts").update({ tags: lista }).eq("phone", phone).eq("owner", req.owner || ' ');
   }
-  res.json({ success: true });
+  res.json({ success: true, leads: mexidos, adicionadas: entram.length, removidas: saem.length });
 });
 
 // ── Marcar conversa como lida ──
