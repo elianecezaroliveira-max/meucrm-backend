@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 269;
+const SERVER_VER = 270;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5691,6 +5691,36 @@ function businessHoursState(nowMs, cfg) {
   return { open: false, nextOpenMs: nowMs + 3600000 };
 }
 
+// Nó "Aguardar até um horário": em que instante (UTC) o bot deve acordar?
+//   cfg.time      'HH:MM' (hora de Brasília)
+//   cfg.days      dias em que pode acordar (0=Dom..6=Sáb); padrão Seg–Sex
+//   cfg.ja_passou 'proximo' (padrão): a hora já passou hoje → espera a PRÓXIMA vez
+//                 (20:00 esperando as 08:00 = amanhã 08:00)
+//                 'segue': se passou há menos de cfg.tolerancia_h horas (padrão 2),
+//                 ainda "é aquela hora" → segue na hora (09:00 esperando as 08:00 = já)
+// Devolve null quando é para seguir agora.
+function waitUntilTarget(nowMs, cfg) {
+  const days = (cfg.days && cfg.days.length) ? cfg.days.map(Number) : [1,2,3,4,5];
+  const [hh, mm] = String(cfg.time || '08:00').split(':').map(Number);
+  const alvoMin = (hh || 0) * 60 + (mm || 0);
+  const brt = new Date(nowMs - 3*3600000); // relógio de Brasília nos campos UTC
+  const minNow = brt.getUTCHours()*60 + brt.getUTCMinutes();
+  if (days.includes(brt.getUTCDay()) && minNow >= alvoMin) {
+    // É A HORA (deu 08:00 há menos de 15 min): segue. Sem esta folga, o bot que
+    // acorda às 08:00:03 acharia que "já passou" e dormiria até o dia seguinte.
+    if (minNow - alvoMin < 15) return null;
+    const tol = cfg.ja_passou === 'segue' ? Math.max(0, Number(cfg.tolerancia_h != null ? cfg.tolerancia_h : 2)) * 60 : 0;
+    if (minNow < alvoMin + tol) return null; // passou há pouco e a pessoa pediu para seguir
+  }
+  for (let off = 0; off <= 7; off++) {
+    const d = new Date(Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate() + off));
+    if (!days.includes(d.getUTCDay())) continue;
+    if (off === 0 && minNow >= alvoMin) continue; // hoje já passou da hora
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hh || 0, mm || 0) + 3*3600000; // volta para UTC real
+  }
+  return nowMs + 3600000; // nenhum dia marcado: tenta de novo em 1h
+}
+
 // ⚡ CACHE CURTO do desenho do bot (nós e setas) — cada passo fazia 2-4 consultas
 // ao banco só para reler o fluxo; agora relê no máximo a cada 20s (e zera ao salvar)
 const _botGraphCache = { nodes: new Map(), edges: new Map() };
@@ -5962,6 +5992,18 @@ async function processNode(run, depth=0) {
     } else {
       const nxt = await getNextNodeId(nodeId, '__closed__');
       if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
+      else await stopRun(runId,'completed');
+    }
+
+  } else if (node.type === 'wait_until') {
+    // Aguardar até um horário do relógio (ex.: 08:00). Fica PAUSADA neste nó; o
+    // ciclo de 30s / cronômetro exato re-avalia o nó na hora e aí ele segue.
+    const alvo = waitUntilTarget(Date.now(), cfg);
+    if (alvo && alvo > Date.now() + 1500) {
+      await supabase.from('bot_runs').update({ status:'paused', pause_until:new Date(alvo).toISOString(), updated_at:new Date().toISOString() }).eq('id',runId);
+    } else {
+      const nxt = await getNextNodeId(nodeId, null);
+      if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, status:'running', pause_until:null, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt,status:'running'}, depth+1); }
       else await stopRun(runId,'completed');
     }
 
@@ -6363,9 +6405,10 @@ async function _retomaUma(run, conferir) {
     // EXPIRADA: se a hora de retomar passou há mais de 15 min (servidor reiniciou,
     // execução esquecida), NÃO envia nada "do nada" — encerra em silêncio.
     if (Date.now() - new Date(run.pause_until).getTime() > 15*60000) { await stopRun(run.id,'stopped'); return; }
-    // Se o nó atual é "Horário comercial", re-avalia o próprio nó (não avança)
+    // Se o nó atual é "Horário comercial" ou "Aguardar até um horário", re-avalia
+    // o próprio nó (não avança às cegas: ele mesmo decide se já é hora)
     const curNode = await _nodeById(run.current_node_id);
-    if (curNode?.type === 'business_hours') {
+    if (curNode?.type === 'business_hours' || curNode?.type === 'wait_until') {
       await supabase.from('bot_runs').update({ status:'running', pause_until:null, updated_at:now }).eq('id',run.id);
       await processNode({...run, status:'running'});
       return;
