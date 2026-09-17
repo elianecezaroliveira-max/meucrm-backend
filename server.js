@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 275;
+const SERVER_VER = 276;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -298,6 +298,16 @@ async function _somaNaoLida(phone, owner, timestamp) {
   _filaUnread[chave] = agora;
   await agora;
   if (_filaUnread[chave] === agora) delete _filaUnread[chave]; // limpa a fila terminada
+}
+
+// Reação do lead = conversa NÃO LIDA (igual WhatsApp): soma 1 no contador e
+// manda o aviso no celular, como se fosse uma mensagem.
+async function _reacaoNaoLida(phone, owner, nome, previa) {
+  try {
+    await _somaNaoLida(phone, owner, new Date().toISOString());
+    const { data: c } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+    if (!(await _isContactMuted(phone, owner))) sendPushToOwner(owner, { title: (c && c.name) || nome || phone, body: previa, phone, tag: 'chat-' + phone }).catch(() => {});
+  } catch (e) { console.error('Reação como não lida:', e.message); }
 }
 
 // Depois de gravar uma mensagem ENVIADA: a prévia da conversa passa a mostrar o
@@ -572,6 +582,8 @@ app.post("/webhook", async (req, res) => {
       if (message.type === 'reaction') {
         const emoji = message.reaction?.emoji || null; // vazio = reação removida
         const targetWamid = message.reaction?.message_id;
+        // (a Meta reenvia webhooks: a mesma reação não pode contar duas vezes)
+        if (message.id && !_carimbaChegada('meta|reacao|' + message.id)) { console.log('↩️ Reação repetida ignorada:', message.id); continue; }
         if (supabase && targetWamid) {
           await supabase.from('messages').update({ reaction: emoji, reaction_by: 'contact' }).eq('wamid', targetWamid);
           // Prévia da lista IGUAL ao WhatsApp: "Reagiu com ❤️ a: …" (e sobe a conversa)
@@ -579,13 +591,16 @@ app.post("/webhook", async (req, res) => {
             const { data: alvo } = await supabase.from('messages').select('content, phone, owner').eq('wamid', targetWamid).maybeSingle();
             if (alvo) {
               const trecho = String(alvo.content || 'sua mensagem').replace(/\s+/g, ' ').slice(0, 40);
+              const previa = `Reagiu com ${emoji} a: ${trecho}`;
               let q = supabase.from('contacts').update({
-                last_message_preview: `Reagiu com ${emoji} a: ${trecho}`,
+                last_message_preview: previa,
                 last_message_at: new Date().toISOString(),
                 last_message_direction: 'inbound', last_message_status: null
               }).eq('phone', alvo.phone);
               if (alvo.owner) q = q.eq('owner', alvo.owner);
               await q;
+              // Igual WhatsApp: a reação do lead conta como NÃO LIDA e avisa no celular
+              await _reacaoNaoLida(alvo.phone, alvo.owner, name, previa);
             }
           } catch (_) {} }
           console.log(`Reação ${emoji||'(removida)'} em ${targetWamid}`);
@@ -9128,6 +9143,8 @@ async function waStart(instanceName) {
       // Reação (emoji sobre uma mensagem) → atualiza a mensagem alvo, não cria nova
       if (m.message.reactionMessage) {
         const r = m.message.reactionMessage;
+        // (o WhatsApp reentrega a mesma reação: só conta uma vez)
+        if (m.key?.id && !_carimbaChegada(instanceName + '|reacao|' + m.key.id)) continue;
         if (supabase && r.key?.id) {
           try {
             await supabase.from('messages')
@@ -9138,13 +9155,16 @@ async function waStart(instanceName) {
               const { data: alvo } = await supabase.from('messages').select('content, phone, owner').eq('wamid', r.key.id).maybeSingle();
               if (alvo) {
                 const trecho = String(alvo.content || 'sua mensagem').replace(/\s+/g, ' ').slice(0, 40);
+                const previa = `Reagiu com ${r.text} a: ${trecho}`;
                 let q = supabase.from('contacts').update({
-                  last_message_preview: `Reagiu com ${r.text} a: ${trecho}`,
+                  last_message_preview: previa,
                   last_message_at: new Date().toISOString(),
                   last_message_direction: 'inbound', last_message_status: null
                 }).eq('phone', alvo.phone);
                 if (alvo.owner) q = q.eq('owner', alvo.owner);
                 await q;
+                // Igual WhatsApp: a reação do lead conta como NÃO LIDA e avisa no celular
+                await _reacaoNaoLida(alvo.phone, alvo.owner, m.pushName || '', previa);
               }
             }
           } catch (_) {}
