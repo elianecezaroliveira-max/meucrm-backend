@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 272;
+const SERVER_VER = 273;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -593,7 +593,11 @@ app.post("/webhook", async (req, res) => {
         continue;
       }
 
-      // Dedup: a Meta reenvia webhooks — ignora mensagem que já está salva
+      // Dedup: a Meta reenvia webhooks — ignora mensagem que já está salva.
+      // Primeiro o carimbo em memória (barra a cópia que chega no MESMO instante,
+      // antes de a primeira ser gravada), depois o banco.
+      const _carimboMeta = message.id ? ('meta|' + message.id + '|inbound|' + String(from || '').replace(/\D/g, '')) : null;
+      if (_carimboMeta && !_carimbaChegada(_carimboMeta)) { console.log('↩️ Webhook duplicado ignorado (cópia simultânea):', message.id); continue; }
       if (supabase && message.id) {
         const { data: dupe } = await supabase.from("messages").select("id").eq("wamid", message.id).maybeSingle();
         if (dupe) { console.log("↩️ Webhook duplicado ignorado:", message.id); continue; }
@@ -744,6 +748,7 @@ app.post("/webhook", async (req, res) => {
 
         if (msgErr) {
           console.error("Erro ao salvar mensagem:", msgErr.message, msgErr.details);
+          if (_carimboMeta) _carimbos.delete(_carimboMeta); // não gravou: o reenvio da Meta pode tentar de novo
         } else {
           console.log("Mensagem salva:", content.substring(0, 50));
         }
@@ -4266,11 +4271,27 @@ app.post("/notes", async (req, res) => {
 // variante — o chat mostra TUDO num lugar só, como deve ser
 app.get("/messages/:phone", async (req, res) => {
   if (!supabase) return res.json([]);
-  const { data, error } = await supabase
+  const { data: brutas, error } = await supabase
     .from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
     .order("timestamp", { ascending: true });
   if (error) return res.status(500).json({ error: error.message });
+  // CURA das duplicatas antigas: a mesma mensagem (mesmo id do WhatsApp, mesma
+  // direção) gravada duas vezes aparece UMA vez — e a sobra é apagada do banco
+  // em segundo plano, para a conversa ficar limpa de vez.
+  const data = [], _vistos = new Set(), _sobras = [];
+  for (const m of (brutas || [])) {
+    const k = m.wamid ? (String(m.wamid) + '|' + String(m.direction || '')) : null;
+    if (k && _vistos.has(k)) { _sobras.push(m.id); continue; }
+    if (k) _vistos.add(k);
+    data.push(m);
+  }
   res.json(data);
+  if (_sobras.length) {
+    (async () => { try {
+      await supabase.from('messages').delete().in('id', _sobras).eq('owner', req.owner || ' ');
+      console.log('🧹 ' + _sobras.length + ' bolha(s) duplicada(s) apagada(s) na conversa ' + req.params.phone);
+    } catch (_) {} })();
+  }
   // CURA RETROATIVA (só a partir de RECIBOS REAIS): "leu uma = leu as anteriores".
   // Antes ela partia do status da PRÉVIA do contato — se a prévia estivesse com um
   // "lida" herdado, pintava de azul mensagens que ninguém leu (caso do bot).
@@ -5058,6 +5079,24 @@ async function _subscribeRecentPresence(owner) {
 
 // "digitando…"/"gravando áudio…" AGORA, para a lista de conversas (SÓ QR)
 // Devolve o telefone COM e SEM o nono dígito (o WhatsApp ora usa um, ora outro)
+// ── CARIMBO DE CHEGADA (contra a mensagem recebida DUPLICADA) ──
+// O WhatsApp entrega a mesma mensagem duas vezes com frequência: leads com o
+// id oculto (@lid) chegam pelo id E pelo número, o aparelho do lead reenvia
+// após "retry", a reconexão do QR reentrega as recentes, a Meta reenvia o
+// webhook. As duas cópias chegam JUNTAS — antes de a primeira ser gravada —
+// e a pergunta ao banco "já existe?" respondia "não" para as duas. Aqui a
+// primeira cópia carimba a mensagem NA MEMÓRIA, sem esperar o banco; a
+// segunda vê o carimbo e vai embora. (Vale por 30 min; o banco segue como
+// segunda barreira para cópias mais tardias.)
+const _carimbos = new Map();
+function _carimbaChegada(chave) {
+  const agora = Date.now();
+  if (_carimbos.size > 5000) for (const [k, t] of _carimbos) if (agora - t > 30 * 60000) _carimbos.delete(k);
+  const t = _carimbos.get(chave);
+  if (t && agora - t < 30 * 60000) return false; // já chegou: cópia
+  _carimbos.set(chave, agora);
+  return true;
+}
 function _brPhoneVariants(ph) {
   const out = new Set([ph]);
   if (/^55\d{10}$/.test(ph)) out.add(ph.slice(0, 4) + '9' + ph.slice(4));
@@ -9560,6 +9599,15 @@ app.post('/evolution-webhook', async (req, res) => {
         type = 'text';
       }
 
+      // A mesma mensagem já chegou (pelo @lid e pelo número, retry, reconexão)?
+      // Carimbo em memória, ANTES de qualquer ida ao banco — é o que barra a
+      // cópia que chega no mesmo instante da primeira.
+      const _carimboQR = wamid ? (instanceName + '|' + wamid + '|' + direction + '|' + String(phone).replace(/\D/g, '')) : null;
+      if (_carimboQR && !_carimbaChegada(_carimboQR)) {
+        console.log('↩️ Cópia da mesma mensagem ignorada (QR):', wamid);
+        return;
+      }
+
       // Busca account_id + dono (owner) — sem o owner a mensagem não aparece no CRM
       let accountId = null;
       let ownerEmail = null;
@@ -9595,8 +9643,10 @@ app.post('/evolution-webhook', async (req, res) => {
           // Compara COM e SEM o nono dígito: o eco da mensagem enviada pelo CRM
           // volta às vezes no outro formato e escapava da checagem (duplicava).
           const _vars = _brPhoneVariants(String(phone).replace(/\D/g, ''));
+          if (!_vars.includes(String(phone))) _vars.push(String(phone)); // como está gravado (ex.: "…@lid")
+          if (data.lidJid && !_vars.includes(String(data.lidJid))) _vars.push(String(data.lidJid));
           const { data: exists } = await supabase.from('messages').select('id')
-            .eq('wamid', wamid).in('phone', _vars.length ? _vars : [phone]).limit(1).maybeSingle();
+            .eq('wamid', wamid).in('phone', _vars).limit(1).maybeSingle();
           if (exists) return;
         }
 
@@ -9634,7 +9684,7 @@ app.post('/evolution-webhook', async (req, res) => {
         if (ownerEmail) msgData.owner = ownerEmail;
         if (data.mediaPath) { msgData.media_id = data.mediaPath; msgData.media_mime_type = data.mediaMime || null; }
         const { error: mErr } = await supabase.from('messages').insert(msgData);
-        if (mErr) console.error('Evolution: erro ao salvar mensagem:', mErr.message);
+        if (mErr) { console.error('Evolution: erro ao salvar mensagem:', mErr.message); if (_carimboQR) _carimbos.delete(_carimboQR); } // não gravou: uma reentrega pode tentar de novo
         // Extras opcionais (não quebram se as colunas não existirem no banco)
         try {
           if (data._wfJson && wamid) await supabase.from('messages').update({ waveform: data._wfJson }).eq('wamid', wamid).eq('phone', phone);
