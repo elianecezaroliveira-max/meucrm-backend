@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 279;
+const SERVER_VER = 280;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -287,11 +287,16 @@ async function _somaNaoLida(phone, owner, timestamp) {
   const anterior = _filaUnread[chave] || Promise.resolve();
   const agora = anterior.catch(() => {}).then(async () => {
     try {
-      const { data: c } = await supabase.from('contacts').select('unread_count')
+      const { data: c } = await supabase.from('contacts').select('unread_count, first_unread_at')
         .eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
       const atual = c?.unread_count || 0;
       const upd = { unread_count: atual + 1 };
-      if (atual === 0) upd.first_unread_at = timestamp;
+      // A primeira não lida é a mais ANTIGA: uma foto demora a baixar e a mensagem
+      // seguinte era gravada antes — a faixa "N não lidas" nascia na segunda e a
+      // foto ficava acima dela, como se já estivesse lida.
+      let tAtual = 0; try { tAtual = c?.first_unread_at ? Date.parse(c.first_unread_at) : 0; } catch (_) { tAtual = 0; }
+      const tNova = Date.parse(timestamp) || Date.now();
+      if (atual === 0 || !tAtual || tNova < tAtual) upd.first_unread_at = timestamp;
       await supabase.from('contacts').update(upd).eq('phone', phone).eq('owner', owner || ' ');
     } catch (e) { console.error('Contador de não lidas:', e.message); }
   });
