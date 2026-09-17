@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 273;
+const SERVER_VER = 274;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -4271,9 +4271,32 @@ app.post("/notes", async (req, res) => {
 // variante — o chat mostra TUDO num lugar só, como deve ser
 app.get("/messages/:phone", async (req, res) => {
   if (!supabase) return res.json([]);
-  const { data: brutas, error } = await supabase
-    .from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
-    .order("timestamp", { ascending: true });
+  // Só as mais recentes (?limite=300): conversa comprida vinha INTEIRA (milhares
+  // de linhas) e a abertura no celular demorava. As antigas entram por "Ver as
+  // mensagens mais antigas" (o app pede sem limite). O cabeçalho X-Mais-Antigas
+  // diz quantas ficaram de fora (-1 = há mais, sem contagem).
+  const _lim = Math.max(0, parseInt(req.query.limite, 10) || 0);
+  let brutas, error;
+  if (_lim) {
+    const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
+      .order("timestamp", { ascending: false }).limit(_lim + 1);
+    error = r.error; brutas = (r.data || []).slice().reverse();
+    let mais = 0;
+    if (brutas.length > _lim) {
+      brutas = brutas.slice(brutas.length - _lim);
+      mais = -1;
+      try {
+        const c = await supabase.from("messages").select("id", { count: 'exact', head: true }).in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ');
+        if (c && typeof c.count === 'number' && c.count > _lim) mais = c.count - _lim;
+      } catch (_) {}
+    }
+    res.set('Access-Control-Expose-Headers', 'X-Mais-Antigas');
+    res.set('X-Mais-Antigas', String(mais));
+  } else {
+    const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
+      .order("timestamp", { ascending: true });
+    error = r.error; brutas = r.data;
+  }
   if (error) return res.status(500).json({ error: error.message });
   // CURA das duplicatas antigas: a mesma mensagem (mesmo id do WhatsApp, mesma
   // direção) gravada duas vezes aparece UMA vez — e a sobra é apagada do banco
