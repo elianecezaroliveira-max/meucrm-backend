@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 271;
+const SERVER_VER = 272;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -684,6 +684,15 @@ app.post("/webhook", async (req, res) => {
 
         // Salva contato com prévia da última mensagem
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
+        // NOTIFICAÇÃO PUSH SAI AGORA, em paralelo com as gravações abaixo. Antes ela
+        // só saía depois de 6 consultas ao banco: o chat aberto (que lê o banco)
+        // mostrava a mensagem antes de a notificação chegar no celular.
+        (async () => {
+          try {
+            if (await _isContactMuted(from, ownerEmail)) return; // silenciada: sem push
+            await sendPushToOwner(ownerEmail, { title: existing?.name || name || from, body: preview, phone: from, tag: 'chat-' + from }, { naoLidaMais: 1 });
+          } catch (_) {}
+        })();
         const contactData = {
           phone: from, last_message_at: timestamp,
           last_message_preview: preview,
@@ -744,15 +753,7 @@ app.post("/webhook", async (req, res) => {
             await supabase.from('messages').update({ forwarded: true }).eq('wamid', message.id);
         } catch (_) {}
 
-        // Notificação push nos aparelhos do dono (não bloqueia o processamento)
-        // — a menos que a conversa esteja SILENCIADA (🔇)
-        if (await _isContactMuted(from, ownerEmail)) { /* silenciada: sem push */ } else
-        sendPushToOwner(ownerEmail, {
-          title: existing?.name || name || from,
-          body: preview,
-          phone: from,
-          tag: 'chat-' + from,
-        }).catch(() => {});
+        // (a notificação push já saiu lá em cima, antes das gravações)
         // Processa reply de bot ativo (texto OU clique em botão/lista)
         if (['text','button','interactive'].includes(type) && content) {
           try { await handleBotReply(from, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
@@ -3190,6 +3191,10 @@ app.get("/search", async (req, res) => {
 
     // 2. Contatos por nome/telefone OU entre os telefones encontrados
     let orCond = `name.ilike.${like},phone.ilike.${like}`;
+    // Número digitado com máscara — "(15) 98165-1975", "15 98165 1975", "+55 15…" —
+    // tem de achar o contato: compara só os dígitos
+    const soDig = raw.replace(/\D/g, '');
+    if (soDig.length >= 4 && soDig.length >= raw.replace(/\s/g, '').length * 0.5) orCond += `,phone.ilike.%${soDig}%`;
     if (phones.length) orCond += `,phone.in.(${phones.join(",")})`;
     let cq = supabase.from("contacts")
       .select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
@@ -8603,24 +8608,23 @@ app.post('/push/test', async (req, res) => {
 });
 
 // Envia push para todos os aparelhos do dono; remove inscrições mortas (404/410)
-async function sendPushToOwner(owner, payload) {
+async function sendPushToOwner(owner, payload, opt) {
   if (!webpush || !_vapid || !supabase) return;
   // 🔒 SEM DONO = não envia. Antes, avisos "sem dono" iam para TODOS os aparelhos
   // cadastrados sem dono (de contas diferentes) — era o que fazia o contador de
   // uma conta aparecer/sumir por causa da outra.
   if (!owner) { console.warn('Push ignorado: mensagem sem dono definido'); return; }
   try {
-    // Total de MENSAGENS não lidas DESTE dono → número no ícone do app
-    try {
-      const { data: rows } = await supabase.from('contacts')
-        .select('unread_count').gt('unread_count', 0).eq('owner', owner);
-      payload.badge = (rows || []).reduce((s, r) => s + (r.unread_count || 0), 0);
-    } catch (_) {}
     payload.owner = owner; // o aparelho confere se o aviso é mesmo dele
-
-    const { data: subs } = await supabase.from('push_subscriptions')
-      .select('endpoint, subscription').eq('owner', owner);
-    for (const s of subs || []) {
+    // As duas consultas (contador do ícone + aparelhos) vão JUNTAS, e o envio para
+    // cada aparelho também: antes era um atrás do outro e cada passo somava atraso.
+    const [rowsR, subsR] = await Promise.all([
+      supabase.from('contacts').select('unread_count').gt('unread_count', 0).eq('owner', owner).then(r => r, () => ({ data: null })),
+      supabase.from('push_subscriptions').select('endpoint, subscription').eq('owner', owner),
+    ]);
+    try { payload.badge = ((rowsR && rowsR.data) || []).reduce((s, r) => s + (r.unread_count || 0), 0) + ((opt && opt.naoLidaMais) || 0); } catch (_) {}
+    const subs = (subsR && subsR.data) || [];
+    await Promise.all(subs.map(async (s) => {
       try {
         await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: 3600 });
       } catch (e) {
@@ -8631,7 +8635,7 @@ async function sendPushToOwner(owner, payload) {
           console.error('Push send error:', e.statusCode || e.message);
         }
       }
-    }
+    }));
   } catch (e) { console.error('Push error:', e.message); }
 }
 
