@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 276;
+const SERVER_VER = 277;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7367,6 +7367,9 @@ app.post('/bots/:id/start', async (req,res) => {
   const run = await startBot(req.params.id, phone, account_id, req.owner, true, true); // manual no chat: herda o número da conversa; responde na hora
   if (!run) return res.status(500).json({error:'Erro ao iniciar bot (verifique se o fluxo tem nó Início)'});
   res.json({success:true, run_id:run.id});
+  // Disparo MANUAL = você respondeu: a conversa deixa de ser "não lida" (também
+  // no celular). O bot que responde sozinho NÃO marca — só o disparo seu.
+  try { await supabase.from('contacts').update({ unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', req.owner || ' '); } catch (_) {}
 });
 app.post('/bot-runs/:id/stop', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
