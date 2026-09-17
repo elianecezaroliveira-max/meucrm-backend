@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 277;
+const SERVER_VER = 279;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3328,12 +3328,24 @@ app.put("/contacts/:phone/notes", async (req, res) => {
 });
 
 // ── Criar contato manualmente ──
+// Número digitado à mão, com ou sem DDI: "(11) 99999-0001", "11 99999 0001",
+// "011999990001", "+55 11…" e "5511…" viram todos 5511999990001 (DDI padrão 55).
+// Só DDD + número, sem DDD, não dá para adivinhar: fica como veio (a rota recusa).
+function _foneComDDI(raw) {
+  let d = String(raw || '').replace(/\D/g, '');
+  if (!d) return '';
+  if (d.startsWith('00')) d = d.slice(2);               // 0055…
+  if (/^0\d{10,11}$/.test(d)) d = d.slice(1);           // prefixo de operadora/tronco: 011 9…
+  if (/^55\d{10,11}$/.test(d)) return d;                // já veio com o DDI
+  if (/^\d{10,11}$/.test(d)) return '55' + d;           // DDD + número → DDI 55
+  return d;                                              // outros países (com DDI próprio) ficam como vieram
+}
 app.post("/contacts", async (req, res) => {
   const { name, phone, account_id } = req.body;
   if (!name || !phone) return res.status(400).json({ error: "Nome e celular são obrigatórios" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const cleanPhone = String(phone).replace(/\D/g, '');
-  if (cleanPhone.length < 8) return res.status(400).json({ error: "Número de celular inválido" });
+  const cleanPhone = _foneComDDI(phone);
+  if (cleanPhone.length < 10) return res.status(400).json({ error: "Número de celular inválido: informe DDD + número (ex.: 11 99999-0001)" });
   // UNIFICAÇÃO: se o número JÁ existe (com OU sem o nono dígito), reaproveita o
   // registro existente — o nome vira o último informado e o chat continua UM só
   let phoneFinal = cleanPhone;
@@ -3352,11 +3364,11 @@ app.post("/contacts/import", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const toInsert = contacts
     .map(c => {
-      const obj = { phone: String(c.phone || '').replace(/\D/g, ''), name: c.name || 'Desconhecido', account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() };
+      const obj = { phone: _foneComDDI(c.phone), name: c.name || 'Desconhecido', account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() }; // com ou sem DDI (55)
       if (stage_id) obj.stage_id = stage_id; // só grava etapa quando escolhida (não apaga a de quem já existe)
       return obj;
     })
-    .filter(c => c.phone.length >= 8);
+    .filter(c => c.phone.length >= 10);
   if (!toInsert.length) return res.status(400).json({ error: "Nenhum contato válido encontrado" });
   const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "owner,phone" });
   if (error) return res.status(500).json({ error: error.message });
@@ -5583,7 +5595,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
       timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: wamid || null,
       owner: owner || null, media_id: _mediaPath, media_mime_type: _mediaMime,
     });
-    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
+    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
   };
   // 🔎 O WhatsApp baixa a foto pelo link. Se o link não abrir, o envio "vai" mas
   // chega sem imagem — então conferimos ANTES e avisamos com clareza.
@@ -5650,7 +5662,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
         const ts = new Date().toISOString();
         await supabase.from('messages').insert({ phone, content: text, type: 'text', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid, owner: owner || null });
         const prev = text.length > 80 ? text.substring(0, 80) + '…' : text;
-        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
+        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
       }
       return wamid || true;
     } catch (e) {
@@ -5675,7 +5687,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       // last_message_status: null é OBRIGATÓRIO — sem isso a prévia herdava o "lida"
       // da mensagem anterior e a cura retroativa pintava a mensagem do bot de azul
-      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null }).eq('phone',phone).eq('owner',owner||' ');
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null, unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' '); // enviou de verdade → a conversa fica lida
     }
     return wamid;
   } catch(e) {
@@ -5796,7 +5808,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       const tWamid = r.data?.messages?.[0]?.id || null;
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
-      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
     }
     return true;
   } catch(e) {
@@ -7367,9 +7379,7 @@ app.post('/bots/:id/start', async (req,res) => {
   const run = await startBot(req.params.id, phone, account_id, req.owner, true, true); // manual no chat: herda o número da conversa; responde na hora
   if (!run) return res.status(500).json({error:'Erro ao iniciar bot (verifique se o fluxo tem nó Início)'});
   res.json({success:true, run_id:run.id});
-  // Disparo MANUAL = você respondeu: a conversa deixa de ser "não lida" (também
-  // no celular). O bot que responde sozinho NÃO marca — só o disparo seu.
-  try { await supabase.from('contacts').update({ unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', req.owner || ' '); } catch (_) {}
+  // (a conversa passa a "lida" quando o bot ENVIA algo de fato — não só por disparar)
 });
 app.post('/bot-runs/:id/stop', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
