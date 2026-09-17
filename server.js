@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 284;
+const SERVER_VER = 285;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7041,6 +7041,264 @@ app.post('/faqs/ai-test', async (req, res) => {
   }
 });
 
+// ═══════════════════════ ✨ SUGESTÕES DE RESPOSTA (IA) ═══════════════════════
+// A IA escreve uma SUGESTÃO no jeito dela (estilo + fluxo + exemplos reais) e o
+// app mostra num cartão acima do campo. NADA sai daqui para o lead: quem envia é
+// ela, com um toque. A memória fica em texto simples (settings ia_mem::dona::…)
+// para poder ser exportada e levada para qualquer outra IA.
+const IA_SUG_MODELOS = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b'];
+const _iaMemCache = {};   // dona → { t, estilo, fluxo, exemplos:[…], brutoExemplos }
+const _iaSugCache = {};   // dona|fone|últimaMsgDoLead → { t, mensagens }
+const _iaMemK = (owner, parte) => 'ia_mem::' + (owner || ' ') + '::' + parte;
+
+function _iaLinhasJsonl(txt) {
+  const out = [];
+  for (const l of String(txt || '').split('\n')) {
+    const t = l.trim(); if (!t) continue;
+    try { const o = JSON.parse(t); if (o && typeof o === 'object') out.push(o); } catch (_) {}
+  }
+  return out;
+}
+async function _iaMemoria(owner, semCache) {
+  const c = _iaMemCache[owner || ' '];
+  if (c && !semCache && Date.now() - c.t < 60000) return c;
+  const m = { t: Date.now(), estilo: '', fluxo: '', exemplos: [], brutoExemplos: '' };
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('settings').select('key, value').in('key', [_iaMemK(owner, 'estilo'), _iaMemK(owner, 'fluxo'), _iaMemK(owner, 'exemplos')]);
+      for (const r of (data || [])) {
+        if (r.key.endsWith('::estilo')) m.estilo = r.value || '';
+        else if (r.key.endsWith('::fluxo')) m.fluxo = r.value || '';
+        else if (r.key.endsWith('::exemplos')) { m.brutoExemplos = r.value || ''; m.exemplos = _iaLinhasJsonl(r.value); }
+      }
+    } catch (e) { console.error('IA memória:', e.message); }
+  }
+  _iaMemCache[owner || ' '] = m;
+  return m;
+}
+async function _iaMemoriaGrava(owner, parte, valor) {
+  await supabase.from('settings').upsert({ key: _iaMemK(owner, parte), value: String(valor || ''), updated_at: new Date().toISOString() });
+  delete _iaMemCache[owner || ' '];
+}
+// Ligada quando ela ligou — ou, sem escolha ainda, quando já existe memória (a chave
+// nunca foi mexida em contas sem memória, então nada muda para as outras donas)
+async function _iaSugLigada(owner) {
+  const v = _cfg('ia_sug_on', owner);
+  if (v === 'on') return true;
+  if (v === 'off') return false;
+  const m = await _iaMemoria(owner);
+  return !!(m.estilo || m.exemplos.length);
+}
+const _iaTok = (s) => new Set(_faqTokens(_faqNorm(s)));
+// Exemplos mais parecidos com o que o lead acabou de dizer (os mais recentes desempatam)
+function _iaExemplosParecidos(exemplos, textoLead, n) {
+  const alvo = _iaTok(textoLead);
+  const pont = exemplos.map((e, i) => {
+    const lt = _iaTok([].concat(e.lead || []).join(' '));
+    let comum = 0; alvo.forEach(t => { if (lt.has(t)) comum++; });
+    const ctx = _iaTok([].concat(e.contexto || []).join(' '));
+    let comumCtx = 0; alvo.forEach(t => { if (ctx.has(t)) comumCtx++; });
+    const sc = (comum / Math.max(1, Math.min(alvo.size || 1, lt.size || 1))) + comumCtx * 0.05 + i * 1e-6;
+    return { e, sc };
+  });
+  pont.sort((a, b) => b.sc - a.sc);
+  return pont.slice(0, n).map(p => p.e);
+}
+// Uma linha da conversa do jeito que a IA lê (mídia vira "(áudio)", com transcrição se houver)
+function _iaLinha(m) {
+  const quem = m.direction === 'outbound' ? 'Eu' : 'Lead';
+  const t = String(m.type || 'text');
+  let txt = String(m.content || '').trim();
+  if (t === 'audio') txt = '(áudio' + (m.transcript ? ': ' + String(m.transcript).trim() : '') + ')';
+  else if (t === 'image' || t === 'video' || t === 'sticker') txt = '(' + (t === 'image' ? 'imagem' : t === 'video' ? 'vídeo' : 'figurinha') + (txt ? ': ' + txt : '') + ')';
+  else if (t === 'document') txt = '(documento' + (txt ? ': ' + txt : '') + ')';
+  else if (t === 'template') txt = txt || '(modelo)';
+  else if (t === 'location') txt = '(localização)';
+  else if (t === 'contacts') txt = '(contato)';
+  return quem + ': ' + (txt || '(vazio)').slice(0, 600);
+}
+const _iaHoje = () => { const d = new Date(Date.now() - 3 * 3600000); return ['domingo', 'segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado'][d.getUTCDay()] + ', ' + String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + d.getUTCFullYear(); };
+// Tira o que identifica o lead antes de guardar na memória
+function _iaAnonima(txt, nomeLead) {
+  let t = String(txt || '');
+  const primeiro = String(nomeLead || '').trim().split(/\s+/)[0];
+  if (primeiro && primeiro.length > 2) t = t.replace(new RegExp(primeiro.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '{nome}');
+  t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '{email}');
+  t = t.replace(/(?:\+?55\s?)?\(?\d{2}\)?\s?9?\d{4}[-\s]?\d{4}/g, '{telefone}');
+  t = t.replace(/https?:\/\/\S+/g, '{link}');
+  return t;
+}
+async function _iaChamaGroq(sys, usr, owner) {
+  const pref = _cfg('ia_sug_model', owner);
+  const modelos = (pref ? [pref] : []).concat(IA_SUG_MODELOS.filter(m => m !== pref));
+  let ultimoErro = null;
+  for (const model of modelos) {
+    const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 1500 };
+    if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
+    try {
+      const r = await axios.post(GROQ_URL, body, { headers: { Authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' }, timeout: 25000 });
+      const msg = (r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message) || {};
+      return { texto: String(msg.content || ''), model };
+    } catch (e) {
+      ultimoErro = e;
+      const st = e.response && e.response.status;
+      const em = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message || '');
+      // modelo desligado/fora do ar → tenta o próximo; outro erro (chave, cota) → para
+      if (st === 404 || st === 400 && /model/i.test(em) || st === 503) continue;
+      throw e;
+    }
+  }
+  throw ultimoErro || new Error('sem modelo');
+}
+function _iaExtraiMensagens(texto) {
+  const t = String(texto || '');
+  const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
+  if (ini >= 0 && fim > ini) {
+    try {
+      const o = JSON.parse(t.slice(ini, fim + 1));
+      if (o && Array.isArray(o.mensagens)) return o.mensagens.map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
+    } catch (_) {}
+  }
+  // sem JSON: cada parágrafo vira uma mensagem
+  return t.replace(/```[a-z]*/g, '').split(/\n\s*\n/).map(x => x.trim()).filter(Boolean).slice(0, 4);
+}
+// Monta e pede a sugestão. Devolve { mensagens, model, exemplos } — nunca envia nada.
+async function _iaSugere(owner, phone, forcar) {
+  const mem = await _iaMemoria(owner);
+  const { data: brutas } = await supabase.from('messages').select('id, direction, type, content, transcript, timestamp')
+    .in('phone', phoneVariants(phone)).eq('owner', owner || ' ').neq('type', 'note')
+    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(24);
+  const msgs = (brutas || []).slice().reverse();
+  if (!msgs.length) return { mensagens: [], motivo: 'sem conversa' };
+  const ult = msgs[msgs.length - 1];
+  const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
+  const c = _iaSugCache[chave];
+  if (c && !forcar && Date.now() - c.t < 10 * 60000) return c.r;
+  let lead = null;
+  try { const { data } = await supabase.from('contacts').select('name, stage_id, tags, notes').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); lead = (data || [])[0] || null; } catch (_) {}
+  let etapa = '';
+  try { if (lead && lead.stage_id) { const { data } = await supabase.from('pipeline_stages').select('name').eq('id', lead.stage_id).limit(1); etapa = ((data || [])[0] || {}).name || ''; } } catch (_) {}
+  // o que o lead disse por último (a sequência de mensagens dele desde a minha última)
+  const doLead = [];
+  for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
+  const textoLead = doLead.map(m => m.type === 'audio' && m.transcript ? m.transcript : (m.content || '')).join(' ');
+  const exemplos = _iaExemplosParecidos(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 8);
+  const nome = String((lead && lead.name) || '').trim();
+  const primeiro = nome.split(/\s+/)[0] || '';
+  const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
+    + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
+    + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
+    + '### REGRAS DE SAÍDA\n'
+    + '- Responda SOMENTE com JSON no formato {"mensagens":["...","..."]}: de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
+    + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
+    + '- Se a última coisa do lead foi áudio/foto/documento sem transcrição, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
+    + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
+    + '- Hoje é ' + _iaHoje() + '. Não escreva nada além do JSON.';
+  const exTxt = exemplos.map((e, i) => {
+    const ctx = [].concat(e.contexto || []).join('\n');
+    return '--- Exemplo ' + (i + 1) + ' ---\n' + (ctx ? ctx + '\n' : '') + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n');
+  }).join('\n');
+  const usr = (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
+    + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
+    + '\n\n### CONVERSA (mais antigas primeiro)\n' + msgs.map(_iaLinha).join('\n')
+    + '\n\nEscreva agora a sugestão de resposta dela para a última mensagem do lead.';
+  const { texto, model } = await _iaChamaGroq(sys, usr, owner);
+  const mensagens = _iaExtraiMensagens(texto).map(t => primeiro ? t.replace(/\{nome\}/g, primeiro) : t);
+  const r = { mensagens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha) };
+  _iaSugCache[chave] = { t: Date.now(), r };
+  return r;
+}
+
+// GET /ia/status — ligada? chave? quanta memória há
+app.get('/ia/status', async (req, res) => {
+  try {
+    const m = await _iaMemoria(req.owner);
+    res.json({ ligada: await _iaSugLigada(req.owner), chave: !!process.env.GROQ_API_KEY, model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
+      memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// GET /ia/memoria — os três textos (para exportar / levar para outra IA)
+app.get('/ia/memoria', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const m = await _iaMemoria(req.owner, true);
+  res.json({ estilo: m.estilo, fluxo: m.fluxo, exemplos: m.brutoExemplos, n_exemplos: m.exemplos.length });
+});
+// PUT /ia/memoria — importa (substitui) as partes enviadas: { estilo?, fluxo?, exemplos? }
+app.put('/ia/memoria', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const b = req.body || {}; const feito = {};
+  try {
+    for (const parte of ['estilo', 'fluxo', 'exemplos']) {
+      if (b[parte] === undefined) continue;
+      let v = String(b[parte] || '');
+      if (v.length > 2_000_000) return res.status(413).json({ error: parte + ' grande demais' });
+      if (parte === 'exemplos') { const ok = _iaLinhasJsonl(v); v = ok.map(o => JSON.stringify(o)).join('\n'); feito.exemplos = ok.length; }
+      else feito[parte] = v.length;
+      await _iaMemoriaGrava(req.owner, parte, v);
+    }
+    res.json({ ok: true, feito });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// POST /ia/sugerir { phone, forcar? } — devolve a sugestão; NUNCA envia
+app.post('/ia/sugerir', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  if (!process.env.GROQ_API_KEY) return res.json({ mensagens: [], motivo: 'sem chave GROQ_API_KEY no servidor' });
+  const phone = String((req.body && req.body.phone) || '').replace(/\D/g, '');
+  if (!phone) return res.status(400).json({ error: 'phone' });
+  if (!(await _iaSugLigada(req.owner))) return res.json({ mensagens: [], motivo: 'desligada' });
+  try { res.json(await _iaSugere(req.owner, phone, !!(req.body && req.body.forcar))); }
+  catch (e) { res.json({ mensagens: [], motivo: (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message }); }
+});
+// POST /ia/aprender { phone, chave, sugerido:[…], enviado:[…], usou, lead:[…], contexto:[…] }
+// Guarda o par "sugerido → enviado" como exemplo (anonimizado). Cada envio com o
+// cartão aberto manda a lista COMPLETA do que já foi enviado para aquela fala do
+// lead; o exemplo com a mesma chave é substituído (vira UM exemplo com N mensagens,
+// igual aos das conversas reais). É assim que a IA vai ficando com a cara dela.
+app.post('/ia/aprender', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  try {
+    const b = req.body || {};
+    const phone = String(b.phone || '').replace(/\D/g, '');
+    const enviadas = [].concat(b.enviado || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 8);
+    if (!phone || !enviadas.length) return res.status(400).json({ error: 'phone/enviado' });
+    const sugerido = [].concat(b.sugerido || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
+    let nome = '';
+    try { const { data } = await supabase.from('contacts').select('name').in('phone', phoneVariants(phone)).eq('owner', req.owner || ' ').limit(1); nome = String(((data || [])[0] || {}).name || ''); } catch (_) {}
+    let leadLinhas = [].concat(b.lead || []).map(x => String(x || '').replace(/^Lead: /, '').trim()).filter(Boolean).slice(0, 8);
+    let ctxLinhas = [].concat(b.contexto || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 6);
+    if (!leadLinhas.length) { // app antigo / sem contexto: lê do banco a última fala do lead
+      const { data: brutas } = await supabase.from('messages').select('id, direction, type, content, transcript, timestamp').in('phone', phoneVariants(phone)).eq('owner', req.owner || ' ').neq('type', 'note')
+        .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(16);
+      const msgs = (brutas || []).slice().reverse().filter(m => !(m.direction === 'outbound' && enviadas.includes(String(m.content || '').trim())));
+      const doLead = [];
+      for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
+      if (!doLead.length) return res.json({ ok: true, guardado: false, motivo: 'o lead não tinha falado' });
+      leadLinhas = doLead.map(m => _iaLinha(m).replace(/^Lead: /, ''));
+      ctxLinhas = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha);
+    }
+    const an = t => _iaAnonima(t, nome).slice(0, 1500);
+    // a chave identifica a fala do lead só para SUBSTITUIR o exemplo; guardada como resumo (sem o telefone)
+    const chave = require('crypto').createHash('sha1').update(String(b.chave || (phone + '|' + leadLinhas.join('|')))).digest('hex').slice(0, 12);
+    const ex = {
+      conversa: 'aprendido', chave, contexto: ctxLinhas.map(an), lead: leadLinhas.map(an), resposta: enviadas.map(an),
+      origem: enviadas.every(t => sugerido.includes(t)) ? 'aceita' : (b.usou ? 'editada' : 'propria'),
+      sugerido: sugerido.map(an), em: new Date().toISOString().slice(0, 10)
+    };
+    const mem = await _iaMemoria(req.owner, true);
+    const iguais = e => JSON.stringify([e.lead, e.resposta]) === JSON.stringify([ex.lead, ex.resposta]);
+    let lista = mem.exemplos.filter(e => !(e.chave && e.chave === chave)); // a versão anterior desta mesma fala sai
+    if (lista.some(iguais)) return res.json({ ok: true, guardado: false, motivo: 'repetido', total: mem.exemplos.length });
+    lista = lista.concat([ex]);
+    const cabe = lista.length > 3000 ? lista.slice(lista.length - 3000) : lista; // teto: as mais recentes ficam
+    await _iaMemoriaGrava(req.owner, 'exemplos', cabe.map(o => JSON.stringify(o)).join('\n'));
+    res.json({ ok: true, guardado: true, total: cabe.length, origem: ex.origem });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ═══════════════════════ Regra "contato errado" ═══════════════════════
 // Quando o cliente avisa que a mensagem foi para a pessoa errada, envia um
 // pedido de desculpas e aplica uma TAG no lead. Config via settings (dedicada,
@@ -7751,7 +8009,7 @@ let _settings = {};
 // configuração e fotos de fluxo de bot). Elas são grandes, ninguém lê da memória
 // (todas as rotas buscam direto no banco) e, sem esta exclusão, elas empurrariam
 // as configurações de verdade para fora do limite de linhas da consulta.
-const _SETTINGS_PESADAS = /^(bkp::|hist::|bot_snap::|msg_trash::)/;
+const _SETTINGS_PESADAS = /^(bkp::|hist::|bot_snap::|msg_trash::|ia_mem::)/;
 async function loadSettings() {
   if (!supabase) return;
   try {
@@ -7793,7 +8051,8 @@ const CHAVES_POR_CONTA = new Set([
   'lead_trash',  // lixeira de leads excluídos (30 dias)
   'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
   'onboarding',  // passos de estreia já concluídos/dispensados
-  'bots_fav'     // bots favoritos: sobem para o topo na hora de escolher
+  'bots_fav',    // bots favoritos: sobem para o topo na hora de escolher
+  'ia_sug_on', 'ia_sug_model' // sugestões de resposta por IA (cartão acima do campo)
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
@@ -8795,7 +9054,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|.*token.*|.*secret.*)$/i;
 // ── PÁGINA PÚBLICA (Termos e Privacidade) ──────────────────────────
 // privacy.html e terms.html ficam FORA do login: a Meta, o cliente e qualquer
 // pessoa precisam conseguir abrir. Estas páginas mostram a razão social, o CNPJ
@@ -10010,4 +10269,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos };
