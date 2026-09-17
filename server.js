@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 270;
+const SERVER_VER = 271;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1637,6 +1637,23 @@ async function _citacaoWamid(quotedId, owner, phone) {
 }
 // Envia pelo QR com a citação; se o WhatsApp recusar a mensagem citada, manda
 // sem ela — o arquivo nunca deixa de ir por causa da citação.
+// ÁLBUM no canal QR: várias fotos enviadas JUNTAS chegam grudadas (uma grade)
+// no WhatsApp do lead, em vez de uma por vez. O app manda cada foto com um
+// "lote" {id, total, fotos, videos, idx}; na primeira do lote o servidor cria a
+// mensagem-álbum e amarra todas as fotos a ela. (A API oficial da Meta não tem
+// álbum — lá cada foto continua sendo uma mensagem, decisão do WhatsApp do lead.)
+const _albunsQR = new Map(); // lote_id -> { key, ts }
+async function _albumPaiQR(sock, jid, lote) {
+  try {
+    if (!lote || !lote.id || !(Number(lote.total) > 1)) return null;
+    for (const [k, v] of _albunsQR) if (Date.now() - v.ts > 10 * 60000) _albunsQR.delete(k); // faxina
+    const c = _albunsQR.get(String(lote.id)); if (c) return c.key;
+    const fotos = Number(lote.fotos) || 0, videos = Number(lote.videos) || 0;
+    const m = await sock.sendMessage(jid, { album: { expectedImageCount: fotos || (Number(lote.total) - videos), expectedVideoCount: videos } });
+    if (m && m.key) { _albunsQR.set(String(lote.id), { key: m.key, ts: Date.now() }); return m.key; }
+  } catch (e) { console.error('álbum QR (segue com fotos soltas):', e.message); }
+  return null;
+}
 async function _qrEnvia(sock, jid, conteudo, opt) {
   if (opt && opt.quoted) {
     try { return await sock.sendMessage(jid, conteudo, opt); }
@@ -2009,7 +2026,8 @@ app.post("/send-media", async (req, res) => {
           ? '🎤 Mensagem de voz' + (durSecs ? ` (${_fmtDur(durSecs)})` : '')
           : `[Áudio: ${fileName}]`;
       } else if (baseMime.startsWith('image/')) {
-        sent = await _qrEnvia(sock, jid, { image: fileBuf, mimetype: baseMime, ...(mCaption ? { caption: mCaption } : {}) }, _optQR);
+        const _paiAlb = await _albumPaiQR(sock, jid, req.body.lote); // várias fotos juntas = álbum
+        sent = await _qrEnvia(sock, jid, { image: fileBuf, mimetype: baseMime, ...(mCaption ? { caption: mCaption } : {}), ...(_paiAlb ? { albumParentKey: _paiAlb } : {}) }, _optQR);
         msgType = 'image'; content = mCaption || `[Imagem: ${fileName}]`;
       } else if (baseMime.startsWith('video/')) {
         let vMime = 'video/mp4';
@@ -2017,7 +2035,8 @@ app.post("/send-media", async (req, res) => {
           try { fileBuf = await convertVideoToMp4(fileBuf); }
           catch (ve) { console.error('Conversão de vídeo falhou, enviando original:', ve.message); vMime = baseMime; }
         }
-        sent = await _qrEnvia(sock, jid, { video: fileBuf, mimetype: vMime, ...(mCaption ? { caption: mCaption } : {}) }, _optQR);
+        const _paiAlbV = await _albumPaiQR(sock, jid, req.body.lote);
+        sent = await _qrEnvia(sock, jid, { video: fileBuf, mimetype: vMime, ...(mCaption ? { caption: mCaption } : {}), ...(_paiAlbV ? { albumParentKey: _paiAlbV } : {}) }, _optQR);
         msgType = 'video'; qrSentMime = vMime; content = mCaption || `[Vídeo: ${fileName}]`;
       } else {
         sent = await _qrEnvia(sock, jid, { document: fileBuf, mimetype: baseMime, fileName }, _optQR);
@@ -9652,3 +9671,6 @@ app.post('/evolution-webhook', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
+// Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
+// mentira. Em produção a variável não existe e nada é exposto.
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState };
