@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 274;
+const SERVER_VER = 275;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -4278,8 +4278,10 @@ app.get("/messages/:phone", async (req, res) => {
   const _lim = Math.max(0, parseInt(req.query.limite, 10) || 0);
   let brutas, error;
   if (_lim) {
+    // (ordem ESTÁVEL: horário e depois id — duas linhas no mesmo horário vinham
+    //  em ordem diferente a cada pedido e a bolha era recriada na tela)
     const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
-      .order("timestamp", { ascending: false }).limit(_lim + 1);
+      .order("timestamp", { ascending: false }).order("id", { ascending: false }).limit(_lim + 1);
     error = r.error; brutas = (r.data || []).slice().reverse();
     let mais = 0;
     if (brutas.length > _lim) {
@@ -4294,20 +4296,26 @@ app.get("/messages/:phone", async (req, res) => {
     res.set('X-Mais-Antigas', String(mais));
   } else {
     const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
-      .order("timestamp", { ascending: true });
+      .order("timestamp", { ascending: true }).order("id", { ascending: true });
     error = r.error; brutas = r.data;
   }
   if (error) return res.status(500).json({ error: error.message });
   // CURA das duplicatas antigas: a mesma mensagem (mesmo id do WhatsApp, mesma
   // direção) gravada duas vezes aparece UMA vez — e a sobra é apagada do banco
   // em segundo plano, para a conversa ficar limpa de vez.
-  const data = [], _vistos = new Set(), _sobras = [];
+  // Entre as cópias fica SEMPRE a de menor id (não "a primeira que veio"): dois
+  // pedidos ao mesmo tempo escolhem a mesma cópia — senão um apagava uma e o
+  // outro apagava a outra, e a mensagem sumia de vez.
+  const _grupos = new Map();
   for (const m of (brutas || [])) {
     const k = m.wamid ? (String(m.wamid) + '|' + String(m.direction || '')) : null;
-    if (k && _vistos.has(k)) { _sobras.push(m.id); continue; }
-    if (k) _vistos.add(k);
-    data.push(m);
+    if (!k) continue;
+    if (!_grupos.has(k)) _grupos.set(k, []);
+    _grupos.get(k).push(m);
   }
+  const _sobras = [], _fora = new Set();
+  _grupos.forEach(g => { if (g.length < 2) return; g.sort((a, b) => String(a.id).localeCompare(String(b.id))); g.slice(1).forEach(m => { _sobras.push(m.id); _fora.add(m); }); });
+  const data = (brutas || []).filter(m => !_fora.has(m));
   res.json(data);
   if (_sobras.length) {
     (async () => { try {
@@ -5111,6 +5119,34 @@ async function _subscribeRecentPresence(owner) {
 // primeira cópia carimba a mensagem NA MEMÓRIA, sem esperar o banco; a
 // segunda vê o carimbo e vai embora. (Vale por 30 min; o banco segue como
 // segunda barreira para cópias mais tardias.)
+// Ids das mensagens enviadas PELO SERVIDOR (VETRA ou bot) no canal QR. O eco
+// delas volta pelo mesmo caminho das mensagens digitadas no celular — e era
+// tratado como "você respondeu pelo celular": zerava as não lidas. Um bot
+// respondendo NÃO é você lendo a conversa (igual WhatsApp: a conversa continua
+// não lida até você abrir e responder).
+const _ecoDoServidor = new Map();
+function _marcaEnvioDoServidor(id) {
+  if (!id) return;
+  const agora = Date.now();
+  if (_ecoDoServidor.size > 5000) for (const [k, t] of _ecoDoServidor) if (agora - t > 30 * 60000) _ecoDoServidor.delete(k);
+  _ecoDoServidor.set(String(id), agora);
+}
+function _ehEcoDoServidor(id) { const t = id && _ecoDoServidor.get(String(id)); return !!(t && Date.now() - t < 30 * 60000); }
+function _embrulhaEnvio(sock) {
+  try {
+    const _sendOrig = sock.sendMessage.bind(sock);
+    sock.sendMessage = async (jid, conteudo, opt) => {
+      const o = Object.assign({}, opt || {});
+      try {
+        if (!o.messageId && _baileys) o.messageId = (_baileys.generateMessageIDV2 ? _baileys.generateMessageIDV2(sock.user?.id) : (_baileys.generateMessageID ? _baileys.generateMessageID() : null));
+      } catch (_) {}
+      if (o.messageId) _marcaEnvioDoServidor(o.messageId);
+      const r = await _sendOrig(jid, conteudo, o);
+      try { if (r && r.key && r.key.id) _marcaEnvioDoServidor(r.key.id); } catch (_) {}
+      return r;
+    };
+  } catch (_) {}
+}
 const _carimbos = new Map();
 function _carimbaChegada(chave) {
   const agora = Date.now();
@@ -5532,7 +5568,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
       timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: wamid || null,
       owner: owner || null, media_id: _mediaPath, media_mime_type: _mediaMime,
     });
-    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
+    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
   };
   // 🔎 O WhatsApp baixa a foto pelo link. Se o link não abrir, o envio "vai" mas
   // chega sem imagem — então conferimos ANTES e avisamos com clareza.
@@ -5599,7 +5635,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
         const ts = new Date().toISOString();
         await supabase.from('messages').insert({ phone, content: text, type: 'text', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid, owner: owner || null });
         const prev = text.length > 80 ? text.substring(0, 80) + '…' : text;
-        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
+        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
       }
       return wamid || true;
     } catch (e) {
@@ -5624,7 +5660,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       // last_message_status: null é OBRIGATÓRIO — sem isso a prévia herdava o "lida"
       // da mensagem anterior e a cura retroativa pintava a mensagem do bot de azul
-      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null, unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' ');
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null }).eq('phone',phone).eq('owner',owner||' ');
     }
     return wamid;
   } catch(e) {
@@ -5745,7 +5781,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       const tWamid = r.data?.messages?.[0]?.id || null;
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
-      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ');
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
     }
     return true;
   } catch(e) {
@@ -6371,7 +6407,23 @@ async function fireStageBots(phone, stageId, owner, depth = 0) {
   } catch(e) { console.error('fireStageBots error:', e.message); }
 }
 
+// 🔒 Dois toques no MESMO instante: a checagem no banco (abaixo) não vê o
+// primeiro disparo porque ele ainda não foi gravado. Este carimbo em memória
+// resolve na hora: o segundo toque espera e recebe o MESMO disparo do primeiro.
+const _botDisparos = new Map();
 async function startBot(botId, phone, accountId, owner, seedAccount, emSegundoPlano) {
+  const chave = String(owner || '') + '|' + String(botId) + '|' + String(phone).replace(/\D/g, '');
+  const agora = Number(process.hrtime.bigint() / 1000000n); // relógio que só anda para a frente
+  const ja = _botDisparos.get(chave);
+  // (janela curta, só para o toque duplo: parar o bot e disparar de novo em
+  //  seguida continua funcionando — a checagem no banco cobre o resto)
+  if (ja && agora - ja.ts < 1500) { console.log('Disparo repetido ignorado (mesmo instante):', botId, phone); return ja.promessa; }
+  const promessa = _startBotInterno(botId, phone, accountId, owner, seedAccount, emSegundoPlano);
+  _botDisparos.set(chave, { ts: agora, promessa });
+  if (_botDisparos.size > 2000) for (const [k, v] of _botDisparos) if (agora - v.ts > 1500) _botDisparos.delete(k);
+  try { return await promessa; } catch (e) { _botDisparos.delete(chave); throw e; }
+}
+async function _startBotInterno(botId, phone, accountId, owner, seedAccount, emSegundoPlano) {
   if (!supabase) return null;
   let ownerEmail = owner;
   if (!ownerEmail) { const { data:b } = await supabase.from('bots').select('owner').eq('id',botId).maybeSingle(); ownerEmail = b?.owner || null; }
@@ -8900,6 +8952,9 @@ async function waStart(instanceName) {
   });
   _waSocks[instanceName] = sock;
   _waState[instanceName] = 'connecting';
+  // Todo envio pelo servidor ganha o id ANTES de sair (o eco pode voltar antes de
+  // o sendMessage terminar) — assim o eco é reconhecido como nosso, não do celular
+  _embrulhaEnvio(sock);
 
   sock.ev.on('creds.update', () => {
     // Credenciais registradas = o QR FOI LIDO no celular; a conexão ainda vai
@@ -9631,6 +9686,12 @@ app.post('/evolution-webhook', async (req, res) => {
         return;
       }
 
+      // Eco de uma mensagem que o PRÓPRIO servidor mandou (VETRA ou bot)? Dá
+      // tempo de o CRM gravar a dele (o eco costuma voltar antes) — a checagem
+      // "já existe" abaixo então a reconhece e nada duplica.
+      const ecoDoServidor = fromMe && _ehEcoDoServidor(wamid);
+      if (ecoDoServidor) await new Promise(r => setTimeout(r, 1500));
+
       // Busca account_id + dono (owner) — sem o owner a mensagem não aparece no CRM
       let accountId = null;
       let ownerEmail = null;
@@ -9692,7 +9753,8 @@ app.post('/evolution-webhook', async (req, res) => {
         if (accountId && (fromMe || !existC || existC.account_id == null)) contactData.account_id = accountId;
         // Você respondeu pelo CELULAR/WhatsApp Web → a conversa deixa de ser "não lida"
         // no CRM (mensagens enviadas pelo próprio CRM não passam por aqui — dedupe acima)
-        if (fromMe) { contactData.unread_count = 0; contactData.first_unread_at = null; }
+        // (eco do servidor — bot ou VETRA — NÃO conta: quem zera as não lidas é você)
+        if (fromMe && !ecoDoServidor) { contactData.unread_count = 0; contactData.first_unread_at = null; }
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
         if (cErr) console.error('Evolution: erro ao salvar contato:', cErr.message);
 
@@ -9750,4 +9812,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg };
