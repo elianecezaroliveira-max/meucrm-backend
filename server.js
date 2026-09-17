@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 280;
+const SERVER_VER = 281;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5915,6 +5915,67 @@ async function getNextNodeId(fromNodeId, edgeLabel) {
   return edges[0]?.to_node_id || null;
 }
 
+// ── EDITOU O BOT COM EXECUÇÕES EM ANDAMENTO ──
+// "Assinatura" de um passo: tipo + o que ele diz/pergunta (para achar o passo
+// equivalente quando o antigo foi recriado com outro id)
+function _botAssinatura(n) {
+  const c = (n && n.config) || {};
+  const txt = String(c.text || c.template_name || '').trim().toLowerCase().slice(0, 80);
+  const ops = Array.isArray(c.options) ? c.options.map(o => String((o && o.label) || o || '').toLowerCase()).join('|') : '';
+  return (n && n.type) + '::' + txt + '::' + ops;
+}
+// Para cada passo removido, decide onde a execução continua no fluxo novo:
+//  (a) um passo NOVO do mesmo tipo e mesma assinatura (recriou o passo);
+//  (b) o passo que agora está ligado à MESMA saída do mesmo pai (trocou o passo);
+//  (c) o único passo novo do mesmo tipo; senão null (a execução para, com aviso).
+function _botSubstituto(removido, nosAntes, ligAntes, novosNos, novasLig) {
+  const antigosIds = new Set(nosAntes.map(n => String(n.id)));
+  const novosDeVerdade = novosNos.filter(n => !antigosIds.has(String(n.id)));
+  const ass = _botAssinatura(removido);
+  let cand = novosDeVerdade.find(n => _botAssinatura(n) === ass);
+  if (cand) return cand;
+  const paiLig = ligAntes.find(e => String(e.to_node_id) === String(removido.id));
+  if (paiLig) {
+    const nova = novasLig.find(e => String(e.from_node_id) === String(paiLig.from_node_id) && String(e.label || '') === String(paiLig.label || ''));
+    const alvo = nova && novosNos.find(n => String(n.id) === String(nova.to_node_id));
+    if (alvo && String(alvo.id) !== String(removido.id)) return alvo;
+  }
+  const mesmoTipo = novosDeVerdade.filter(n => n.type === removido.type);
+  if (mesmoTipo.length === 1) return mesmoTipo[0];
+  return null;
+}
+async function _botRemapeiaExecucoes(botId, owner, nosAntes, ligAntes, novosNos, novasLig, nosForam) {
+  const ids = nosForam.map(n => n.id);
+  const { data: runs } = await supabase.from('bot_runs').select('*').eq('bot_id', botId).in('current_node_id', ids).in('status', ['running', 'waiting_reply', 'paused']);
+  if (!runs || !runs.length) return;
+  let paradas = 0;
+  for (const run of runs) {
+    const removido = nosForam.find(n => String(n.id) === String(run.current_node_id));
+    const sub = removido ? _botSubstituto(removido, nosAntes, ligAntes, novosNos, novasLig) : null;
+    if (!sub) { paradas++; await stopRun(run.id, 'stopped'); continue; }
+    const upd = { current_node_id: sub.id, updated_at: new Date().toISOString() };
+    // trocou por um passo que não espera resposta: segue o fluxo agora
+    const segue = run.status === 'waiting_reply' && sub.type !== 'wait_reply';
+    if (segue) { upd.status = 'running'; upd.pause_until = null; }
+    await supabase.from('bot_runs').update(upd).eq('id', run.id);
+    console.log(`Execução ${run.id} seguiu do passo removido ${removido.id} para ${sub.id} (${sub.type})`);
+    if (segue) { _botGraphLimpa(); processNode({ ...run, ...upd }).catch(e => console.error('processNode remap:', e.message)); }
+  }
+  if (paradas) { try { await addNotice(owner, `Ao salvar o bot, ${paradas} execução(ões) estava(m) num passo que foi removido e não tinha substituto — foram encerradas.`, 'bot-remap:' + botId, { tipo: 'aviso', alvo: 'bots' }); } catch (_) {} }
+}
+// A execução aponta para um passo que não existe mais (salvou o bot enquanto
+// ela esperava) e o remapeamento na hora do salvar não a alcançou: tenta o
+// passo de espera do fluxo (se houver um só) em vez de simplesmente parar
+async function _botRemapeiaTardio(run) {
+  try {
+    if (!run || !run.bot_id) return null;
+    const { data: nos } = await supabase.from('bot_nodes').select('*').eq('bot_id', run.bot_id);
+    if (!nos || !nos.length) return null;
+    const esperas = nos.filter(n => n.type === 'wait_reply');
+    if (run.status === 'waiting_reply' && esperas.length === 1) return esperas[0];
+    return null;
+  } catch (_) { return null; }
+}
 async function stopRun(runId, status='completed') {
   try { _runsTravados.delete(String(runId)); } catch (_) {}
   if (supabase) await supabase.from('bot_runs').update({ status, updated_at:new Date().toISOString() }).eq('id', runId);
@@ -6230,8 +6291,18 @@ async function handleBotReply(phone, text, owner) {
   // NUNCA dispara nada na conversa (a resposta segue para o atendimento normal).
   const ageMs = Date.now() - new Date(run.updated_at || run.created_at || 0).getTime();
   if (ageMs > 48*3600000) { await stopRun(run.id, 'stopped'); return false; }
-  const edges = await _edgesFrom(run.current_node_id);
-  if (!edges?.length) { await stopRun(run.id,'completed'); return true; }
+  let edges = await _edgesFrom(run.current_node_id);
+  if (!edges?.length) {
+    // o passo de espera sumiu (bot salvo enquanto esperava)? segue no passo equivalente
+    const noAtual = await _nodeById(run.current_node_id);
+    const sub = noAtual ? null : await _botRemapeiaTardio(run);
+    if (sub) {
+      run.current_node_id = sub.id;
+      await supabase.from('bot_runs').update({ current_node_id: sub.id, updated_at: new Date().toISOString() }).eq('id', run.id);
+      edges = await _edgesFrom(sub.id);
+    }
+    if (!edges?.length) { await stopRun(run.id,'completed'); return true; }
+  }
   const tl = text.toLowerCase().trim();
   let matched = null;
   for (const e of edges) {
@@ -7326,10 +7397,21 @@ app.put('/bots/:id/flow', async (req,res) => {
 
   try {
     _botGraphLimpa();
-    await supabase.from('bot_edges').delete().eq('bot_id',botId);
-    await supabase.from('bot_nodes').delete().eq('bot_id',botId);
-    if (nodes?.length) { const { error:ne } = await supabase.from('bot_nodes').insert(nodes.map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0), owner:req.owner||null }))); if (ne) throw ne; }
-    if (edges?.length) { const { error:ee } = await supabase.from('bot_edges').insert(edges.map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'', owner:req.owner||null }))); if (ee) throw ee; }
+    // GRAVA POR CIMA (upsert) e só depois apaga o que saiu. Antes apagava TUDO e
+    // inseria de novo: por um instante o bot ficava sem passos, e uma resposta do
+    // lead que chegasse nesse instante encerrava a execução — o bot "parava".
+    const novosNos = (nodes || []).map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0), owner:req.owner||null }));
+    const novasLig = (edges || []).map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'', owner:req.owner||null }));
+    if (novosNos.length) { const { error:ne } = await supabase.from('bot_nodes').upsert(novosNos, { onConflict: 'id' }); if (ne) throw ne; }
+    if (novasLig.length) { const { error:ee } = await supabase.from('bot_edges').upsert(novasLig, { onConflict: 'id' }); if (ee) throw ee; }
+    const idsNos = new Set(novosNos.map(n => String(n.id))), idsLig = new Set(novasLig.map(e => String(e.id)));
+    const nosForam = (nosAntes || []).filter(n => !idsNos.has(String(n.id)));
+    const ligForam = (ligAntes || []).filter(e => !idsLig.has(String(e.id)));
+    // Execuções em andamento que estavam num passo que SAIU: seguem no passo que
+    // entrou no lugar dele (a edição vale para quem já está no meio do fluxo)
+    if (nosForam.length) { try { await _botRemapeiaExecucoes(botId, req.owner, nosAntes || [], ligAntes || [], novosNos, novasLig, nosForam); } catch (e) { console.error('remapear execuções:', e.message); } }
+    if (ligForam.length) await supabase.from('bot_edges').delete().in('id', ligForam.map(e => e.id));
+    if (nosForam.length) await supabase.from('bot_nodes').delete().in('id', nosForam.map(n => n.id));
     _botGraphLimpa(); // limpa de novo DEPOIS de gravar (o fluxo novo entra em vigor na hora)
     res.json({success:true});
   } catch(err) {
