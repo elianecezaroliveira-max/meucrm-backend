@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 282;
+const SERVER_VER = 283;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7524,7 +7524,9 @@ app.post('/bots/:id/duplicate', async (req,res) => {
                       .filter(e => e.from_node_id && e.to_node_id);
     if (rows.length) { const { error } = await supabase.from('bot_edges').insert(rows); if (error) return res.status(500).json({error:error.message}); }
   }
-  res.json({ success:true, id:newBot.id });
+  // idMap (id antigo → id novo): o app usa para levar junto o que estava
+  // recolhido/escondido no editor — senão a cópia abria com ramos e passos à mostra
+  res.json({ success:true, id:newBot.id, idMap });
 });
 app.post('/bots/:id/start', async (req,res) => {
   const { phone,account_id } = req.body;
