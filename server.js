@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 287;
+const SERVER_VER = 288;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1755,12 +1755,39 @@ function _clientIdLembra(req, res) {
   const orig = res.json.bind(res);
   res.json = (body) => {
     const status = res.statusCode || 200;
-    if (status < 500) _enviosPorClientId.set(cid, { ts: Date.now(), status, body }); // 5xx não fica guardado: pode tentar de novo
+    if (status < 500 && status !== 422) _enviosPorClientId.set(cid, { ts: Date.now(), status, body }); // 5xx e recusa da Meta (422) não ficam guardados: o "tentar de novo" dela vai à Meta de verdade
     else _enviosPorClientId.delete(cid);
     resolve({ status, body });
     return orig(body);
   };
   return null;
+}
+// A Meta RECUSOU a mensagem (não é queda de rede): motivo em português, pelo código dela.
+// Devolvido com status 422 — o app mostra o motivo no ⚠ em vez de "Sem conexão com o
+// servidor" e NÃO fica reenviando sozinho (a recusa é da Meta, insistir não resolve).
+function _metaMotivo(meta) {
+  const c = Number(meta && meta.code);
+  const det = (meta && meta.error_data && meta.error_data.details) || (meta && meta.message) || '';
+  const M = {
+    131047: 'Passaram mais de 24h desde a última mensagem do lead — envie um modelo aprovado',
+    131026: 'Este número não recebe mensagens (sem WhatsApp, bloqueou ou não aceitou os termos)',
+    131049: 'A Meta segurou esta mensagem "para proteger o engajamento" (limite da Meta para este número)',
+    131056: 'Muitas mensagens para este número em pouco tempo — aguarde alguns minutos',
+    130429: 'Limite de envios da conta atingido na Meta — aguarde',
+    131031: 'A conta da Meta está com restrição/pendência (verifique no Gerenciador do WhatsApp)',
+    131042: 'Pendência de pagamento na conta da Meta',
+    131030: 'Este número não está na lista de teste da Meta (conta ainda em modo de teste)',
+    131008: 'A Meta não aceitou o formato da mensagem', 131009: 'A Meta não aceitou o formato da mensagem',
+    190: 'Token desta conta inválido ou vencido — cole o token de novo em Contas',
+    0: 'Token desta conta inválido ou vencido — cole o token de novo em Contas',
+  };
+  return 'A Meta recusou: ' + (M[c] || det || 'erro ' + c) + (M[c] && det ? ' (' + String(det).slice(0, 160) + ')' : '');
+}
+function _respostaDeEnvioFalhou(res, err, rotulo) {
+  const meta = err && err.response && err.response.data && err.response.data.error;
+  console.error(rotulo + ':', (err.response && err.response.data) || err.message);
+  if (meta && typeof meta === 'object') return res.status(422).json({ error: _metaMotivo(meta), detail: err.response.data, meta_code: meta.code });
+  res.status(500).json({ error: rotulo, detail: err.response && err.response.data });
 }
 app.post("/send", async (req, res) => {
   if (!_exigeLogin(req, res)) return;
@@ -1873,8 +1900,7 @@ app.post("/send", async (req, res) => {
     }
     res.json({ success: true, data: response.data });
   } catch (err) {
-    console.error("Erro ao enviar:", err.response?.data || err.message);
-    res.status(500).json({ error: "Falha ao enviar mensagem", detail: err.response?.data });
+    _respostaDeEnvioFalhou(res, err, "Falha ao enviar mensagem");
   }
 });
 
@@ -2275,8 +2301,7 @@ app.post("/send-media", async (req, res) => {
     // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
     res.json({ success: true, media_id: (typeof mediaId !== 'undefined' && mediaId) || null });
   } catch (err) {
-    console.error("Erro ao enviar mídia:", err.response?.data || err.message);
-    res.status(500).json({ error: "Falha ao enviar mídia", detail: err.response?.data });
+    _respostaDeEnvioFalhou(res, err, "Falha ao enviar mídia");
   }
 });
 
