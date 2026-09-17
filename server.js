@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 283;
+const SERVER_VER = 284;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -482,7 +482,10 @@ function _assinaturaMetaOk(req) {
   } catch (_) { return false; }
 }
 app.post("/webhook", async (req, res) => {
-  const okSig = _assinaturaMetaOk(req);
+  let okSig = _assinaturaMetaOk(req);
+  // A Meta SEMPRE assina. Com APP_SECRET configurado, pedido SEM assinatura não é
+  // da Meta — antes passava direto (qualquer um podia injetar mensagens/status).
+  if (okSig === null && process.env.APP_SECRET && req.rawBody && !req.headers['x-hub-signature-256']) { console.warn('Webhook sem assinatura — rejeitado'); return res.sendStatus(401); }
   if (okSig === false) {
     console.warn('Webhook da Meta com assinatura INVÁLIDA' + (process.env.WEBHOOK_STRICT === '1' ? ' — rejeitado' : ' — aceito (modo aviso; defina WEBHOOK_STRICT=1 para rejeitar)'));
     if (process.env.WEBHOOK_STRICT === '1') return res.sendStatus(401);
@@ -617,7 +620,8 @@ app.post("/webhook", async (req, res) => {
       // Processa TODAS as mensagens do lote (a Meta pode agrupar várias num só webhook)
       for (const message of value.messages) {
       const contact = value.contacts?.[0];
-      let from = message.from;
+      let from = String(message.from || '').replace(/\D/g, ''); // só dígitos: nada de texto vindo de fora vira "telefone"
+      if (from.length < 8 || from.length > 16) continue;         // telefone de verdade tem 8 a 16 dígitos
       const name = contact?.profile?.name || "Desconhecido";
       const timestamp = new Date(parseInt(message.timestamp) * 1000).toISOString();
       const phoneNumberId = value.metadata?.phone_number_id;
@@ -1759,6 +1763,7 @@ function _clientIdLembra(req, res) {
   return null;
 }
 app.post("/send", async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   if (_planoBarra(req, res)) return;
   const _rep = _clientIdLembra(req, res);
   if (_rep) { const r = _rep.promessa ? await _rep.promessa : _rep; return res.status(r.status).json({ ...(r.body || {}), repetido: true }); }
@@ -1893,7 +1898,7 @@ app.post("/react", async (req, res) => {
         await sock.sendMessage(jid, {
           react: { text: emoji || '', key: { remoteJid: jid, fromMe: msgRow?.direction === 'outbound', id: wamid } },
         });
-        await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid);
+        await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid).eq('owner', req.owner || ' ');
         return res.json({ success: true, via: 'qr' });
       } catch (e) {
         console.error('Reação via QR:', e.message);
@@ -1910,7 +1915,7 @@ app.post("/react", async (req, res) => {
       { messaging_product: "whatsapp", to, type: "reaction", reaction: { message_id: wamid, emoji: emoji || "" } },
       { headers: { Authorization: `Bearer ${acct.token}`, "Content-Type": "application/json" } }
     );
-    if (supabase) await supabase.from("messages").update({ reaction: emoji || null, reaction_by: 'me' }).eq("wamid", wamid);
+    if (supabase) await supabase.from("messages").update({ reaction: emoji || null, reaction_by: 'me' }).eq("wamid", wamid).eq('owner', req.owner || ' ');
     res.json({ success: true });
   } catch (err) {
     console.error("Erro ao reagir:", err.response?.data || err.message);
@@ -2058,6 +2063,7 @@ function convertVideoToMp4(buf) {
 
 // ── Enviar mídia (imagem, PDF, vídeo, etc.) ──
 app.post("/send-media", async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   if (_planoBarra(req, res)) return;
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
   const mCaption = String(req.body.caption || '').trim();
@@ -4992,8 +4998,8 @@ app.post('/edit-message', async (req, res) => {
   try {
     const jid = await waResolveJid(sock, to);
     await sock.sendMessage(jid, { text, edit: { remoteJid: jid, fromMe: true, id: wamid } });
-    const { error: eEd } = await supabase.from('messages').update({ content: text, edited: true }).eq('wamid', wamid).eq('phone', to);
-    if (eEd) await supabase.from('messages').update({ content: text }).eq('wamid', wamid).eq('phone', to);
+    const { error: eEd } = await supabase.from('messages').update({ content: text, edited: true }).eq('wamid', wamid).eq('phone', to).eq('owner', req.owner || ' ');
+    if (eEd) await supabase.from('messages').update({ content: text }).eq('wamid', wamid).eq('phone', to).eq('owner', req.owner || ' ');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: 'Falha ao editar: ' + (e.message || 'erro desconhecido') });
