@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 285;
+const SERVER_VER = 286;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7165,10 +7165,12 @@ function _iaExtraiMensagens(texto) {
 // Monta e pede a sugestão. Devolve { mensagens, model, exemplos } — nunca envia nada.
 async function _iaSugere(owner, phone, forcar) {
   const mem = await _iaMemoria(owner);
+  // (sem .neq('type','note') no banco: no Postgres, "type <> 'note'" DEIXA DE FORA as
+  //  linhas com type nulo — que são as mensagens de texto comuns — e a conversa vinha vazia)
   const { data: brutas } = await supabase.from('messages').select('id, direction, type, content, transcript, timestamp')
-    .in('phone', phoneVariants(phone)).eq('owner', owner || ' ').neq('type', 'note')
-    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(24);
-  const msgs = (brutas || []).slice().reverse();
+    .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
+    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(30);
+  const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 24).reverse();
   if (!msgs.length) return { mensagens: [], motivo: 'sem conversa' };
   const ult = msgs[msgs.length - 1];
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
@@ -7271,9 +7273,9 @@ app.post('/ia/aprender', async (req, res) => {
     let leadLinhas = [].concat(b.lead || []).map(x => String(x || '').replace(/^Lead: /, '').trim()).filter(Boolean).slice(0, 8);
     let ctxLinhas = [].concat(b.contexto || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 6);
     if (!leadLinhas.length) { // app antigo / sem contexto: lê do banco a última fala do lead
-      const { data: brutas } = await supabase.from('messages').select('id, direction, type, content, transcript, timestamp').in('phone', phoneVariants(phone)).eq('owner', req.owner || ' ').neq('type', 'note')
-        .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(16);
-      const msgs = (brutas || []).slice().reverse().filter(m => !(m.direction === 'outbound' && enviadas.includes(String(m.content || '').trim())));
+      const { data: brutas } = await supabase.from('messages').select('id, direction, type, content, transcript, timestamp').in('phone', phoneVariants(phone)).eq('owner', req.owner || ' ')
+        .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(20);
+      const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 16).reverse().filter(m => !(m.direction === 'outbound' && enviadas.includes(String(m.content || '').trim())));
       const doLead = [];
       for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
       if (!doLead.length) return res.json({ ok: true, guardado: false, motivo: 'o lead não tinha falado' });
