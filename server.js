@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 281;
+const SERVER_VER = 282;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -361,10 +361,48 @@ async function _mirrorContactStatus(wamid, status) {
     }
   } catch (_) {}
 }
+// ── Quem está esperando o destino de um envio (o bot, antes de avançar) ──
+// wamid → [resolvedores]. Avisado por updateMsgStatus assim que chega o status
+// (Meta: webhook "statuses"; QR: recibo do Baileys) — sem ficar consultando o banco.
+const _statusEsperas = {};
+function _avisaEsperaStatus(wamid, status) {
+  const lista = wamid && _statusEsperas[wamid];
+  if (!lista) return;
+  delete _statusEsperas[wamid];
+  lista.forEach(r => { try { r(status); } catch (_) {} });
+}
+// O bot só avança quando o envio NÃO falhou: espera o status da mensagem até
+// `ms` (padrão 12 s). "failed" → falha (o fluxo segue por "Falha no envio" ou
+// para). "delivered"/"read" → confirmado na hora. Sem notícia dentro do prazo →
+// vale como enviada (um tique). BOT_ESPERA_ENVIO_MS ajusta o prazo.
+async function _esperaEnvioDoBot(wamid, ms) {
+  if (!wamid || typeof wamid !== 'string' || !supabase) return true;
+  const prazo = ms != null ? Number(ms) : Number(process.env.BOT_ESPERA_ENVIO_MS != null ? process.env.BOT_ESPERA_ENVIO_MS : 12000);
+  const fim = Date.now() + Math.max(0, prazo);
+  const olha = async () => {
+    try { const { data } = await supabase.from('messages').select('status').eq('wamid', wamid).eq('direction', 'outbound').limit(1).maybeSingle(); return data && data.status ? String(data.status) : null; }
+    catch (_) { return null; }
+  };
+  const ok = (st) => st === 'failed' ? false : (st === 'delivered' || st === 'read') ? true : null;
+  let st = ok(await olha());
+  if (st === null && _pendingStatuses[wamid]) st = ok(_pendingStatuses[wamid].status);
+  if (st !== null) return st;
+  while (Date.now() < fim) {
+    const resto = fim - Date.now();
+    const chegou = await new Promise(r => {
+      const t = setTimeout(() => r(null), Math.min(resto, 2000));
+      (_statusEsperas[wamid] = _statusEsperas[wamid] || []).push(v => { clearTimeout(t); r(v); });
+    });
+    st = ok(chegou != null ? chegou : await olha()); // sem aviso: confere o banco de novo (status gravado por outro caminho)
+    if (st !== null) { delete _statusEsperas[wamid]; return st; }
+  }
+  delete _statusEsperas[wamid];
+  return true;
+}
 async function updateMsgStatus(wamid, upd) {
   if (!supabase || !wamid || !upd?.status) return;
   // Tique de entrega/leitura vale SÓ para mensagem enviada por mim (outbound)
-  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound'); _mirrorContactStatus(wamid, 'failed'); return; }
+  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound'); _mirrorContactStatus(wamid, 'failed'); _avisaEsperaStatus(wamid, 'failed'); return; }
   const rank = _ST_RANK[upd.status];
   if (rank === undefined) return;
   const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
@@ -379,6 +417,7 @@ async function updateMsgStatus(wamid, upd) {
       .or('status.is.null,status.in.(' + lower.join(',') + ')');
   }
   _mirrorContactStatus(wamid, upd.status);
+  _avisaEsperaStatus(wamid, upd.status);
 }
 
 // Buffer de status que chegam ANTES da mensagem ser salva (corrige ✓ que não vira ✓✓)
@@ -1696,8 +1735,33 @@ function _quotedQR(cit, phone) {
   };
 }
 
+// ── Reenvio sem duplicar: o app manda um client_id por mensagem. Se a internet
+// do celular cair DEPOIS de o envio ter saído, o app tenta de novo com o mesmo
+// client_id e recebe a resposta guardada — a mensagem nunca sai duas vezes.
+const _enviosPorClientId = new Map(); // owner|client_id → { ts, status, body } ou { ts, promessa }
+function _clientIdLembra(req, res) {
+  const cid = req.body && req.body.client_id ? String(req.owner || '') + '|' + String(req.body.client_id).slice(0, 80) : null;
+  if (!cid) return null;
+  const agora = Date.now();
+  for (const [k, v] of _enviosPorClientId) if (agora - v.ts > 15 * 60000) _enviosPorClientId.delete(k);
+  const ja = _enviosPorClientId.get(cid);
+  if (ja) return ja; // repetido: quem chamou devolve a resposta guardada (ou espera a que está em curso)
+  let resolve; const promessa = new Promise(r => { resolve = r; });
+  _enviosPorClientId.set(cid, { ts: agora, promessa });
+  const orig = res.json.bind(res);
+  res.json = (body) => {
+    const status = res.statusCode || 200;
+    if (status < 500) _enviosPorClientId.set(cid, { ts: Date.now(), status, body }); // 5xx não fica guardado: pode tentar de novo
+    else _enviosPorClientId.delete(cid);
+    resolve({ status, body });
+    return orig(body);
+  };
+  return null;
+}
 app.post("/send", async (req, res) => {
   if (_planoBarra(req, res)) return;
+  const _rep = _clientIdLembra(req, res);
+  if (_rep) { const r = _rep.promessa ? await _rep.promessa : _rep; return res.status(r.status).json({ ...(r.body || {}), repetido: true }); }
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
@@ -5814,6 +5878,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
+      return tWamid || true;
     }
     return true;
   } catch(e) {
@@ -6039,6 +6104,10 @@ async function processNode(run, depth=0) {
       // Passo pode ter FOTO (com o texto de legenda) — sem texto e sem foto = nada a fazer
       sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null) : true;
     }
+    // A Meta (e o QR) aceitam a mensagem e só DEPOIS avisam que falhou (fora da
+    // janela de 24 h, número inválido…). Regra: só avança se NÃO falhou — espera
+    // o status antes de escolher a saída ("Enviada ✓" ou "Falha no envio").
+    if (sendOk && typeof sendOk === 'string') sendOk = await _esperaEnvioDoBot(sendOk);
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
     const medges = await _edgesFrom(nodeId);
     const okNxt   = medges?.find(e=>!e.label||e.label===''||e.label==='default')?.to_node_id || null;
@@ -9112,12 +9181,13 @@ async function waStart(instanceName) {
     if (!supabase) return;
     for (const u of updates || []) {
       const st = u.update?.status, id = u.key?.id;
-      if (!st || !id) continue;
+      if (st == null || !id) continue; // (status 0 = ERRO do WhatsApp — precisa passar)
       // Só recibo do OUTRO lado sobre mensagem MINHA (key.fromMe). O "read-self"
       // (meu próprio celular abrindo a conversa) vem com fromMe=false — ignorado,
       // senão pintava de azul sem o lead ter lido.
       if (u.key && u.key.fromMe === false) continue;
-      const mapped = st === 4 || st === 'READ' ? 'read' : (st === 3 || st === 'DELIVERY_ACK' ? 'delivered' : null);
+      const mapped = st === 4 || st === 'READ' ? 'read' : (st === 3 || st === 'DELIVERY_ACK' ? 'delivered' : (st === 0 || st === 'ERROR' ? 'failed' : null));
+      if (mapped === 'failed') { try { await updateMsgStatus(id, { status: 'failed', error_info: 'O WhatsApp não aceitou esta mensagem (número inválido, bloqueio ou conexão do QR Code).' }); } catch (_) {} continue; }
       if (mapped) { try { await updateMsgStatus(id, { status: mapped }); } catch (_) {} }
     }
   });
