@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 295;
+const SERVER_VER = 296;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -322,9 +322,12 @@ async function _reacaoNaoLida(phone, owner, nome, previa) {
 async function _previaEnviada(owner, phone, status) {
   if (!supabase || !phone) return;
   try {
+    let tinhaNaoLida = false;
+    try { const { data: c } = await supabase.from('contacts').select('unread_count').eq('phone', phone).eq('owner', owner || ' ').maybeSingle(); tinhaNaoLida = !!(c && c.unread_count > 0); } catch (_) {}
     await supabase.from('contacts')
       .update({ last_message_status: status || null, unread_count: 0, first_unread_at: null })
       .eq('phone', phone).eq('owner', owner || ' ').eq('last_message_direction', 'outbound');
+    if (tinhaNaoLida) _badgeAvisa(owner, phone); // respondida (por mim ou pelo bot) → o celular tira o aviso
   } catch (e) { console.error('Prévia da conversa enviada:', e.message); }
 }
 
@@ -5594,9 +5597,13 @@ app.put("/contacts/bulk-tags", async (req, res) => {
 // ── Marcar conversa como lida ──
 app.put("/contacts/:phone/read", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  // (o app chama esta rota a cada envio, mesmo já lida: só avisa os celulares quando MUDOU)
+  let tinhaNaoLida = false;
+  try { const { data: c } = await supabase.from('contacts').select('unread_count').eq('phone', req.params.phone).eq('owner', req.owner || ' ').maybeSingle(); tinhaNaoLida = !!(c && c.unread_count > 0); } catch (_) {}
   const { error } = await supabase
     .from("contacts").update({ unread_count: 0, first_unread_at: null }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
+  if (tinhaNaoLida) _badgeAvisa(req.owner, req.params.phone);
   res.json({ success: true });
 });
 
@@ -9326,17 +9333,27 @@ async function sendPushToOwner(owner, payload, opt) {
     // As duas consultas (contador do ícone + aparelhos) vão JUNTAS, e o envio para
     // cada aparelho também: antes era um atrás do outro e cada passo somava atraso.
     const [rowsR, subsR] = await Promise.all([
-      supabase.from('contacts').select('unread_count').gt('unread_count', 0).eq('owner', owner).then(r => r, () => ({ data: null })),
+      supabase.from('contacts').select('phone, unread_count').gt('unread_count', 0).eq('owner', owner).then(r => r, () => ({ data: null })),
       supabase.from('push_subscriptions').select('endpoint, subscription').eq('owner', owner),
     ]);
-    try { payload.badge = ((rowsR && rowsR.data) || []).reduce((s, r) => s + (r.unread_count || 0), 0) + ((opt && opt.naoLidaMais) || 0); } catch (_) {}
-    const subs = (subsR && subsR.data) || [];
+    // Número no ícone = CONVERSAS não lidas (igual ao que o app mostra), não mensagens.
+    // A conversa que acabou de receber conta 1 mesmo se o banco ainda não gravou.
+    try {
+      const rows = (rowsR && rowsR.data) || [];
+      const fone = String(payload.phone || '').replace(/\D/g, '');
+      const jaConta = !!fone && rows.some(r => String(r.phone || '').replace(/\D/g, '') === fone);
+      payload.badge = rows.length + ((opt && opt.naoLidaMais && !jaConta) ? 1 : 0);
+    } catch (_) {}
+    let subs = (subsR && subsR.data) || [];
+    // Aviso SÓ de contador (conversa lida em outro aparelho): não vai para iPhone — o iOS
+    // exige uma notificação visível a cada push e cancela a inscrição depois de 3 "mudos".
+    if (opt && opt.soSemNotificacao) subs = subs.filter(s => !/web\.push\.apple\.com/i.test(String(s.endpoint || '')));
     await Promise.all(subs.map(async (s) => {
       try {
         // urgency 'high': sem isso o Google/Apple entregam com prioridade normal e o celular
         // em economia de bateria segura o aviso por MINUTOS (chegava atrasado). Alta = acorda o
         // aparelho na hora, como o WhatsApp. TTL 1h: mensagem velha não vale mais aviso.
-        await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: 3600, urgency: 'high' });
+        await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: payload.tipo === 'badge' ? 600 : 3600, urgency: 'high' });
       } catch (e) {
         if (e.statusCode === 404 || e.statusCode === 410) {
           await supabase.from('push_subscriptions').delete().eq('endpoint', s.endpoint);
@@ -9347,6 +9364,22 @@ async function sendPushToOwner(owner, payload, opt) {
       }
     }));
   } catch (e) { console.error('Push error:', e.message); }
+}
+
+// Conversa ficou LIDA (respondida/lida em outro aparelho): avisa os celulares para tirar a
+// notificação daquela conversa e acertar o número do ícone — antes o celular ficava com o
+// contador antigo até abrir o app. Junta avisos seguidos (2 s) para não disparar um por clique.
+const _badgeAvisoT = {};
+function _badgeAvisa(owner, phone) {
+  if (!owner) return;
+  const k = String(owner);
+  const fones = (_badgeAvisoT[k] && _badgeAvisoT[k].fones) || new Set();
+  if (phone) fones.add(String(phone));
+  if (_badgeAvisoT[k]) clearTimeout(_badgeAvisoT[k].t);
+  _badgeAvisoT[k] = { fones, t: setTimeout(() => {
+    delete _badgeAvisoT[k];
+    sendPushToOwner(owner, { tipo: 'badge', fechar: Array.from(fones).map(f => 'chat-' + f) }, { soSemNotificacao: true }).catch(() => {});
+  }, 2000) };
 }
 
 // Teste de conexão N8N — envia evento de teste para o webhook configurado
@@ -10415,4 +10448,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada };
