@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 290;
+const SERVER_VER = 291;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6926,7 +6926,17 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
 }
 
 // ── CRUD de FAQ (perguntas/respostas da IA) ──
+// 🔒 A aba "IA" (respostas automáticas + sugestões) é SÓ da conta principal (a dona do VETRA
+// e a equipe dela). Outras contas: a tela não aparece e estas rotas recusam.
+const _CONTA_IA = 'elianecezaroliveira@gmail.com';
+function _soContaIA(req, res) {
+  if (!req.owner) { res.status(401).json({ error: 'Faça login no CRM' }); return false; }
+  if (String(req.owner || '').toLowerCase() === _CONTA_IA) return true;
+  res.status(403).json({ error: 'A IA está liberada só para a conta principal' });
+  return false;
+}
 app.get('/faqs', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!supabase) return res.json([]);
   const { data, error } = await supabase.from('faqs')
     .select('*').eq('owner', req.owner || ' ').order('created_at', { ascending: false });
@@ -6935,6 +6945,7 @@ app.get('/faqs', async (req, res) => {
 });
 
 app.post('/faqs', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   const { question, answer, triggers, enabled } = req.body || {};
   if (!question || !answer) return res.status(400).json({ error: 'pergunta e resposta são obrigatórias' });
@@ -6950,6 +6961,7 @@ app.post('/faqs', async (req, res) => {
 });
 
 app.put('/faqs/:id', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   const upd = { updated_at: new Date().toISOString() };
   if (req.body.question !== undefined) upd.question = String(req.body.question).trim();
@@ -6963,6 +6975,7 @@ app.put('/faqs/:id', async (req, res) => {
 });
 
 app.delete('/faqs/:id', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   const { error } = await supabase.from('faqs')
     .delete().eq('id', req.params.id).eq('owner', req.owner || ' ');
@@ -6972,6 +6985,7 @@ app.delete('/faqs/:id', async (req, res) => {
 
 // Teste rápido: "o que a IA responderia para esta mensagem?" (não envia nada)
 app.post('/faqs/test', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   const text = (req.body && req.body.text) || '';
   const m = await matchFaq(text, req.owner || null);
   if (!m) return res.json({ match: false });
@@ -7043,6 +7057,7 @@ async function matchFaqLLM(phone, text, owner) {
 
 // GET /faqs/ai-status — modo atual, se a chave está no servidor, e o modelo
 app.get('/faqs/ai-status', (req, res) => {
+  if (!_soContaIA(req, res)) return;
   res.json({
     mode: _cfg('faq_mode', req.owner) || 'text',
     keyConfigured: !!process.env.GROQ_API_KEY,
@@ -7052,6 +7067,7 @@ app.get('/faqs/ai-status', (req, res) => {
 
 // POST /faqs/ai-test — testa a classificação por IA com uma mensagem de exemplo
 app.post('/faqs/ai-test', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!process.env.GROQ_API_KEY) return res.json({ ok: false, error: 'Chave GROQ_API_KEY não configurada no servidor.' });
   const text = (req.body && req.body.text) || 'quanto tempo demora pra liberar o dinheiro?';
   // diagnóstico: quantas perguntas ativas existem para este dono
@@ -7214,7 +7230,52 @@ async function _iaTranscreveSePrecisar(m) {
     return texto || '';
   } catch (e) { console.warn('IA: transcrição do áudio falhou:', e.message); return ''; }
 }
-// Monta e pede a sugestão. Devolve { mensagens, model, exemplos } — nunca envia nada.
+// ⚡🤖 O que ela já tem pronto: respostas rápidas (settings quick_replies::dona) e bots ativos
+const _iaCatCache = {};
+async function _iaCatalogo(owner) {
+  const c = _iaCatCache[owner || ' '];
+  if (c && Date.now() - c.t < 60000) return c;
+  const out = { t: Date.now(), rapidas: [], bots: [] };
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'quick_replies::' + (owner || ' ')).maybeSingle();
+    const arr = data && data.value ? JSON.parse(data.value) : [];
+    out.rapidas = (Array.isArray(arr) ? arr : []).filter(r => r && r.title && r.message).slice(0, 40)
+      .map(r => ({ atalho: String(r.title).toLowerCase(), texto: String(r.message), previa: String(r.message).replace(/\s+/g, ' ').slice(0, 90), anexo: !!r.media_url }));
+  } catch (_) {}
+  try {
+    const { data } = await supabase.from('bots').select('id, name, active').eq('owner', owner || ' ');
+    out.bots = (data || []).filter(b => b && b.active !== false && b.name).slice(0, 30).map(b => ({ id: String(b.id), nome: String(b.name) }));
+  } catch (_) {}
+  _iaCatCache[owner || ' '] = out;
+  return out;
+}
+// Itens da sugestão: texto, {rapida:"/atalho"} ou {bot:"Nome"} — só os que existem de verdade
+function _iaExtraiItens(texto, rapidas, bots) {
+  const t = String(texto || '');
+  let brutos = null;
+  const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
+  if (ini >= 0 && fim > ini) { try { const o = JSON.parse(t.slice(ini, fim + 1)); if (o && Array.isArray(o.mensagens)) brutos = o.mensagens; } catch (_) {} }
+  if (!brutos) return _iaExtraiMensagens(t).map(x => ({ tipo: 'texto', texto: x }));
+  const norm = x => String(x || '').trim().toLowerCase().replace(/^\//, '');
+  const out = [];
+  for (const b of brutos) {
+    if (out.length >= 4) break;
+    if (b && typeof b === 'object') {
+      if (b.rapida != null) { const r = (rapidas || []).find(x => x.atalho === norm(b.rapida)); if (r) out.push({ tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
+      if (b.bot != null) { const al = String(b.bot).trim().toLowerCase(); const bt = (bots || []).find(x => x.nome.toLowerCase() === al || x.id === String(b.bot)); if (bt) out.push({ tipo: 'bot', id: bt.id, nome: bt.nome }); continue; }
+      continue;
+    }
+    const s = String(b || '').trim();
+    if (!s) continue;
+    // texto igualzinho a uma resposta rápida (ou "/atalho" escrito como texto) vira a rápida
+    const mAt = s.match(/^\/([\w-]+)$/); const r2 = (rapidas || []).find(x => (mAt && x.atalho === mAt[1].toLowerCase()) || x.texto.trim() === s);
+    if (r2) { out.push({ tipo: 'rapida', atalho: r2.atalho, texto: r2.texto, previa: r2.previa, anexo: r2.anexo }); continue; }
+    const limpo = _iaExtraiMensagens('{"mensagens":' + JSON.stringify([s]) + '}')[0];
+    if (limpo) out.push({ tipo: 'texto', texto: limpo });
+  }
+  return out;
+}
+// Monta e pede a sugestão. Devolve { mensagens, itens, model } — nunca envia nada.
 async function _iaSugere(owner, phone, forcar) {
   const mem = await _iaMemoria(owner);
   // (sem .neq('type','note') no banco: no Postgres, "type <> 'note'" DEIXA DE FORA as
@@ -7244,11 +7305,16 @@ async function _iaSugere(owner, phone, forcar) {
   const exemplos = _iaExemplosParecidos(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6);
   const nome = String((lead && lead.name) || '').trim();
   const primeiro = nome.split(/\s+/)[0] || '';
+  // ⚡ respostas rápidas e 🤖 bots dela: a IA sugere USAR o que já existe em vez de reescrever o bloco padrão
+  const { rapidas, bots } = await _iaCatalogo(owner);
+  const catTxt = (rapidas.length ? '### RESPOSTAS RÁPIDAS DELA (prontas — prefira-as quando o sentido for o mesmo)\n' + rapidas.map(r => '/' + r.atalho + ' — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '')).join('\n') + '\n\n' : '')
+    + (bots.length ? '### BOTS DELA (fluxos automáticos que ela dispara na conversa)\n' + bots.map(b => b.nome).join('\n') + '\n\n' : '');
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
     + '### REGRAS DE SAÍDA\n'
     + '- Responda SOMENTE com JSON no formato {"mensagens":["...","..."]}: de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + (rapidas.length || bots.length ? '- Um item de "mensagens" também pode ser {"rapida":"/atalho"} (uma resposta rápida dela, pelo atalho exato) ou {"bot":"Nome"} (um bot dela, pelo nome exato). Quando a mensagem certa é um bloco padrão que existe como resposta rápida, use {"rapida":…} em vez de reescrever; quando a próxima etapa é um fluxo que ela costuma disparar como bot, sugira {"bot":…}. Nos exemplos, "[rapida: /x]" e "[bot: Y]" mostram quando ela usou isso.\n' : '')
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
     + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, foto ou documento, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
@@ -7259,20 +7325,22 @@ async function _iaSugere(owner, phone, forcar) {
     const ctx = [].concat(e.contexto || []).slice(-3).map(x => String(x).slice(0, 220)).join('\n');
     return '--- Exemplo ' + (i + 1) + ' ---\n' + (ctx ? ctx + '\n' : '') + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n');
   }).join('\n');
-  const usr = (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
+  const usr = catTxt + (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
     + '\n\n### CONVERSA (mais antigas primeiro)\n' + msgs.slice(-16).map(m => _iaLinha(m).slice(0, 400)).join('\n')
     + '\n\nEscreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
-  const mensagens = _iaExtraiMensagens(texto).map(t => primeiro ? t.replace(/\{nome\}/g, primeiro) : t);
-  const r = { mensagens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
+  const itens = _iaExtraiItens(texto, rapidas, bots).map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
+  const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
+  const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
     transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)) }; // o app mostra o que o lead disse no áudio
-  if (mensagens.length) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
+  if (itens.length) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
   return r;
 }
 
 // GET /ia/status — ligada? chave? quanta memória há
 app.get('/ia/status', async (req, res) => {
+  if (String(req.owner || '').toLowerCase() !== _CONTA_IA) return res.json({ ligada: false, liberada: false, chave: false, memoria: { estilo: false, fluxo: false, exemplos: 0, aprendidos: 0 } });
   try {
     const m = await _iaMemoria(req.owner);
     res.json({ ligada: await _iaSugLigada(req.owner), chave: !!process.env.GROQ_API_KEY, model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
@@ -7281,12 +7349,14 @@ app.get('/ia/status', async (req, res) => {
 });
 // GET /ia/memoria — os três textos (para exportar / levar para outra IA)
 app.get('/ia/memoria', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!_exigeLogin(req, res)) return;
   const m = await _iaMemoria(req.owner, true);
   res.json({ estilo: m.estilo, fluxo: m.fluxo, exemplos: m.brutoExemplos, n_exemplos: m.exemplos.length });
 });
 // PUT /ia/memoria — importa (substitui) as partes enviadas: { estilo?, fluxo?, exemplos? }
 app.put('/ia/memoria', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   const b = req.body || {}; const feito = {};
@@ -7304,6 +7374,7 @@ app.put('/ia/memoria', async (req, res) => {
 });
 // POST /ia/sugerir { phone, forcar? } — devolve a sugestão; NUNCA envia
 app.post('/ia/sugerir', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   if (!process.env.GROQ_API_KEY) return res.json({ mensagens: [], motivo: 'sem chave GROQ_API_KEY no servidor' });
@@ -7319,6 +7390,7 @@ app.post('/ia/sugerir', async (req, res) => {
 // lead; o exemplo com a mesma chave é substituído (vira UM exemplo com N mensagens,
 // igual aos das conversas reais). É assim que a IA vai ficando com a cara dela.
 app.post('/ia/aprender', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
   if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   try {
