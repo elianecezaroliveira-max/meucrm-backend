@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 291;
+const SERVER_VER = 292;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7307,14 +7307,14 @@ async function _iaSugere(owner, phone, forcar) {
   const primeiro = nome.split(/\s+/)[0] || '';
   // ⚡ respostas rápidas e 🤖 bots dela: a IA sugere USAR o que já existe em vez de reescrever o bloco padrão
   const { rapidas, bots } = await _iaCatalogo(owner);
-  const catTxt = (rapidas.length ? '### RESPOSTAS RÁPIDAS DELA (prontas — prefira-as quando o sentido for o mesmo)\n' + rapidas.map(r => '/' + r.atalho + ' — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '')).join('\n') + '\n\n' : '')
+  const catTxt = (rapidas.length ? '### RESPOSTAS RÁPIDAS DELA (prontas — use só quando for exatamente o que ela mandaria)\n' + rapidas.map(r => '/' + r.atalho + ' — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '')).join('\n') + '\n\n' : '')
     + (bots.length ? '### BOTS DELA (fluxos automáticos que ela dispara na conversa)\n' + bots.map(b => b.nome).join('\n') + '\n\n' : '');
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
     + '### REGRAS DE SAÍDA\n'
     + '- Responda SOMENTE com JSON no formato {"mensagens":["...","..."]}: de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
-    + (rapidas.length || bots.length ? '- Um item de "mensagens" também pode ser {"rapida":"/atalho"} (uma resposta rápida dela, pelo atalho exato) ou {"bot":"Nome"} (um bot dela, pelo nome exato). Quando a mensagem certa é um bloco padrão que existe como resposta rápida, use {"rapida":…} em vez de reescrever; quando a próxima etapa é um fluxo que ela costuma disparar como bot, sugira {"bot":…}. Nos exemplos, "[rapida: /x]" e "[bot: Y]" mostram quando ela usou isso.\n' : '')
+    + (rapidas.length || bots.length ? '- Um item de "mensagens" também pode ser {"rapida":"/atalho"} (uma resposta rápida dela, pelo atalho exato) ou {"bot":"Nome"} (um bot dela, pelo nome exato). Escolha o que MELHOR encaixa na situação: texto livre, resposta rápida ou bot — não é obrigatório usar rápida/bot. Use {"rapida":…} só quando o bloco padrão é exatamente a mensagem certa (em vez de reescrevê-lo); sugira {"bot":…} só quando a próxima etapa é um fluxo que ela costuma disparar. Se o lead fez uma pergunta específica, responda em texto. Nos exemplos, "[rapida: /x]" e "[bot: Y]" mostram quando ela usou isso.\n' : '')
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
     + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, foto ou documento, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
