@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 288;
+const SERVER_VER = 289;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7175,17 +7175,21 @@ async function _iaChamaGroq(sys, usr, owner) {
   }
   throw ultimoErro || new Error('sem modelo');
 }
+// Marcador de mídia copiado dos exemplos ("[image] [Imagem]", "[document] …"): não é texto
+// para enviar — a imagem ela manda à mão. Sai da sugestão.
+const _iaEhMarcador = (t) => /^\s*\[(image|imagem|document|documento|audio|áudio|video|vídeo|sticker|figurinha|link|imagem recebida)\b[^\]]*\]\s*(\[[^\]]*\]\s*)*$/i.test(String(t || ''));
 function _iaExtraiMensagens(texto) {
   const t = String(texto || '');
+  const limpa = (arr) => arr.map(x => String(x || '').replace(/^\s*\[(image|imagem|document|documento)\]\s*(\[[^\]]*\])?\s*/i, '').trim()).filter(x => x && !_iaEhMarcador(x)).slice(0, 4);
   const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
   if (ini >= 0 && fim > ini) {
     try {
       const o = JSON.parse(t.slice(ini, fim + 1));
-      if (o && Array.isArray(o.mensagens)) return o.mensagens.map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
+      if (o && Array.isArray(o.mensagens)) return limpa(o.mensagens);
     } catch (_) {}
   }
   // sem JSON: cada parágrafo vira uma mensagem
-  return t.replace(/```[a-z]*/g, '').split(/\n\s*\n/).map(x => x.trim()).filter(Boolean).slice(0, 4);
+  return limpa(t.replace(/```[a-z]*/g, '').split(/\n\s*\n/));
 }
 // Monta e pede a sugestão. Devolve { mensagens, model, exemplos } — nunca envia nada.
 async function _iaSugere(owner, phone, forcar) {
@@ -7224,6 +7228,7 @@ async function _iaSugere(owner, phone, forcar) {
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
     + '- Se a última coisa do lead foi áudio/foto/documento sem transcrição, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
     + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
+    + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
     + '- Hoje é ' + _iaHoje() + '. Não escreva nada além do JSON.';
   const exTxt = exemplos.map((e, i) => {
     const ctx = [].concat(e.contexto || []).join('\n');
@@ -7236,7 +7241,7 @@ async function _iaSugere(owner, phone, forcar) {
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
   const mensagens = _iaExtraiMensagens(texto).map(t => primeiro ? t.replace(/\{nome\}/g, primeiro) : t);
   const r = { mensagens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha) };
-  _iaSugCache[chave] = { t: Date.now(), r };
+  if (mensagens.length) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
   return r;
 }
 
