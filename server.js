@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 293;
+const SERVER_VER = 294;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -372,18 +372,21 @@ function _avisaEsperaStatus(wamid, status) {
   lista.forEach(r => { try { r(status); } catch (_) {} });
 }
 // O bot só avança quando o envio NÃO falhou: espera o status da mensagem até
-// `ms` (padrão 12 s). "failed" → falha (o fluxo segue por "Falha no envio" ou
-// para). "delivered"/"read" → confirmado na hora. Sem notícia dentro do prazo →
-// vale como enviada (um tique). BOT_ESPERA_ENVIO_MS ajusta o prazo.
+// `ms` (padrão 6 s). "failed" → falha (o fluxo segue por "Falha no envio" ou
+// para). "sent" (um tique: o WhatsApp ACEITOU) já basta para seguir — antes só
+// "delivered"/"read" contavam, e o bot ficava parado até o CELULAR DO LEAD
+// receber a mensagem (ou até o prazo de 12 s): era isso que fazia cada passo
+// demorar muito mais do que o cronômetro configurado. Sem notícia dentro do
+// prazo → vale como enviada. BOT_ESPERA_ENVIO_MS ajusta o prazo.
 async function _esperaEnvioDoBot(wamid, ms) {
   if (!wamid || typeof wamid !== 'string' || !supabase) return true;
-  const prazo = ms != null ? Number(ms) : Number(process.env.BOT_ESPERA_ENVIO_MS != null ? process.env.BOT_ESPERA_ENVIO_MS : 12000);
+  const prazo = ms != null ? Number(ms) : Number(process.env.BOT_ESPERA_ENVIO_MS != null ? process.env.BOT_ESPERA_ENVIO_MS : 6000);
   const fim = Date.now() + Math.max(0, prazo);
   const olha = async () => {
     try { const { data } = await supabase.from('messages').select('status').eq('wamid', wamid).eq('direction', 'outbound').limit(1).maybeSingle(); return data && data.status ? String(data.status) : null; }
     catch (_) { return null; }
   };
-  const ok = (st) => st === 'failed' ? false : (st === 'delivered' || st === 'read') ? true : null;
+  const ok = (st) => st === 'failed' ? false : (st === 'sent' || st === 'delivered' || st === 'read') ? true : null;
   let st = ok(await olha());
   if (st === null && _pendingStatuses[wamid]) st = ok(_pendingStatuses[wamid].status);
   if (st !== null) return st;
@@ -9589,7 +9592,8 @@ async function waStart(instanceName) {
       // (meu próprio celular abrindo a conversa) vem com fromMe=false — ignorado,
       // senão pintava de azul sem o lead ter lido.
       if (u.key && u.key.fromMe === false) continue;
-      const mapped = st === 4 || st === 'READ' ? 'read' : (st === 3 || st === 'DELIVERY_ACK' ? 'delivered' : (st === 0 || st === 'ERROR' ? 'failed' : null));
+      // (2 = SERVER_ACK: o WhatsApp aceitou = um tique "sent" — é o que libera o bot para o próximo passo sem esperar o lead receber)
+      const mapped = st === 4 || st === 'READ' ? 'read' : (st === 3 || st === 'DELIVERY_ACK' ? 'delivered' : (st === 2 || st === 'SERVER_ACK' ? 'sent' : (st === 0 || st === 'ERROR' ? 'failed' : null)));
       if (mapped === 'failed') { try { await updateMsgStatus(id, { status: 'failed', error_info: 'O WhatsApp não aceitou esta mensagem (número inválido, bloqueio ou conexão do QR Code).' }); } catch (_) {} continue; }
       if (mapped) { try { await updateMsgStatus(id, { status: mapped }); } catch (_) {} }
     }
