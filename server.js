@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 294;
+const SERVER_VER = 295;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7198,9 +7198,14 @@ async function _iaChamaGroq(sys, usr, owner) {
 // Marcador de mídia copiado dos exemplos ("[image] [Imagem]", "[document] …"): não é texto
 // para enviar — a imagem ela manda à mão. Sai da sugestão.
 const _iaEhMarcador = (t) => /^\s*\[(image|imagem|document|documento|audio|áudio|video|vídeo|sticker|figurinha|link|imagem recebida)\b[^\]]*\]\s*(\[[^\]]*\]\s*)*$/i.test(String(t || ''));
+// 🔒 NUNCA sugerir link: o link de aceite é gerado por ela em outro sistema e é único por
+// cliente — a IA não tem como saber o certo e um link inventado/de outro cliente iria
+// para o lead errado. Qualquer mensagem com endereço (http, www, domínio) ou com o
+// marcador {link}/[link] dos exemplos é descartada inteira.
+const _iaTemLink = (t) => /https?:\/\/|www\.|\{link\}|\[link\]|\b[a-z0-9-]+\.(io|com|br|net|app|link|me)\b\/?/i.test(String(t || ''));
 function _iaExtraiMensagens(texto) {
   const t = String(texto || '');
-  const limpa = (arr) => arr.map(x => String(x || '').replace(/^\s*\[(image|imagem|document|documento)\]\s*(\[[^\]]*\])?\s*/i, '').trim()).filter(x => x && !_iaEhMarcador(x)).slice(0, 4);
+  const limpa = (arr) => arr.map(x => String(x || '').replace(/^\s*\[(image|imagem|document|documento)\]\s*(\[[^\]]*\])?\s*/i, '').trim()).filter(x => x && !_iaEhMarcador(x) && !_iaTemLink(x)).slice(0, 4);
   const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
   if (ini >= 0 && fim > ini) {
     try {
@@ -7264,7 +7269,7 @@ function _iaExtraiItens(texto, rapidas, bots) {
   for (const b of brutos) {
     if (out.length >= 4) break;
     if (b && typeof b === 'object') {
-      if (b.rapida != null) { const r = (rapidas || []).find(x => x.atalho === norm(b.rapida)); if (r) out.push({ tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
+      if (b.rapida != null) { const r = (rapidas || []).find(x => x.atalho === norm(b.rapida)); if (r && !_iaTemLink(r.texto)) out.push({ tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
       if (b.bot != null) { const al = String(b.bot).trim().toLowerCase(); const bt = (bots || []).find(x => x.nome.toLowerCase() === al || x.id === String(b.bot)); if (bt) out.push({ tipo: 'bot', id: bt.id, nome: bt.nome }); continue; }
       continue;
     }
@@ -7272,8 +7277,8 @@ function _iaExtraiItens(texto, rapidas, bots) {
     if (!s) continue;
     // texto igualzinho a uma resposta rápida (ou "/atalho" escrito como texto) vira a rápida
     const mAt = s.match(/^\/([\w-]+)$/); const r2 = (rapidas || []).find(x => (mAt && x.atalho === mAt[1].toLowerCase()) || x.texto.trim() === s);
-    if (r2) { out.push({ tipo: 'rapida', atalho: r2.atalho, texto: r2.texto, previa: r2.previa, anexo: r2.anexo }); continue; }
-    const limpo = _iaExtraiMensagens('{"mensagens":' + JSON.stringify([s]) + '}')[0];
+    if (r2) { if (!_iaTemLink(r2.texto)) out.push({ tipo: 'rapida', atalho: r2.atalho, texto: r2.texto, previa: r2.previa, anexo: r2.anexo }); continue; }
+    const limpo = _iaExtraiMensagens('{"mensagens":' + JSON.stringify([s]) + '}')[0]; // (já sem marcador e sem link)
     if (limpo) out.push({ tipo: 'texto', texto: limpo });
   }
   return out;
@@ -7322,7 +7327,8 @@ async function _iaSugere(owner, phone, forcar) {
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
     + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, foto ou documento, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
     + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
-    + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
+    + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]"/"{link}" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
+    + '- NUNCA escreva link/endereço nenhum (http, www, id.unico…): o link de aceite é gerado por ela em outro sistema e é único por cliente. Quando o passo é enviar um aceite, sugira só o aviso ("Vou digitar a proposta e já te envio aqui o aceite 🙌🏼" / "{nome}, segue aceite:") — nunca o bloco do aceite com link.\n'
     + '- Hoje é ' + _iaHoje() + '. Não escreva nada além do JSON.';
   const exTxt = exemplos.map((e, i) => {
     const ctx = [].concat(e.contexto || []).slice(-3).map(x => String(x).slice(0, 220)).join('\n');
