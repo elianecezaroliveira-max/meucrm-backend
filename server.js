@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 292;
+const SERVER_VER = 293;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9292,7 +9292,7 @@ app.post('/push/test', async (req, res) => {
     for (const s of subs || []) {
       try {
         await webpush.sendNotification(s.subscription,
-          JSON.stringify({ title: 'VETRA', body: 'Notificações funcionando!', tag: 'push-test' }), { TTL: 300 });
+          JSON.stringify({ title: 'VETRA', body: 'Notificações funcionando!', tag: 'push-test' }), { TTL: 300, urgency: 'high' });
         results.push({ ok: true });
       } catch (e) {
         results.push({ ok: false, status: e.statusCode || null, msg: String(e.body || e.message || '').substring(0, 150) });
@@ -9324,7 +9324,10 @@ async function sendPushToOwner(owner, payload, opt) {
     const subs = (subsR && subsR.data) || [];
     await Promise.all(subs.map(async (s) => {
       try {
-        await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: 3600 });
+        // urgency 'high': sem isso o Google/Apple entregam com prioridade normal e o celular
+        // em economia de bateria segura o aviso por MINUTOS (chegava atrasado). Alta = acorda o
+        // aparelho na hora, como o WhatsApp. TTL 1h: mensagem velha não vale mais aviso.
+        await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: 3600, urgency: 'high' });
       } catch (e) {
         if (e.statusCode === 404 || e.statusCode === 410) {
           await supabase.from('push_subscriptions').delete().eq('endpoint', s.endpoint);
