@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 289;
+const SERVER_VER = 290;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7168,8 +7168,9 @@ async function _iaChamaGroq(sys, usr, owner) {
       ultimoErro = e;
       const st = e.response && e.response.status;
       const em = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message || '');
-      // modelo desligado/fora do ar → tenta o próximo; outro erro (chave, cota) → para
-      if (st === 404 || st === 400 && /model/i.test(em) || st === 503) continue;
+      // modelo desligado/fora do ar OU no limite de uso por minuto (429, cada modelo tem o seu)
+      // → tenta o próximo; outro erro (chave inválida) → para
+      if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429) continue;
       throw e;
     }
   }
@@ -7190,6 +7191,28 @@ function _iaExtraiMensagens(texto) {
   }
   // sem JSON: cada parágrafo vira uma mensagem
   return limpa(t.replace(/```[a-z]*/g, '').split(/\n\s*\n/));
+}
+// Áudio do lead sem transcrição: transcreve na hora (Groq Whisper, mesma chave) para a IA
+// responder ao que ele DISSE. Guarda em memória (o banco dela pode não ter a coluna) e
+// tenta gravar no banco também.
+const _iaTranscritos = new Map(); // id da mensagem → texto
+async function _iaTranscreveSePrecisar(m) {
+  if (!m) return '';
+  if (m.transcript) return m.transcript;
+  const mime = String(m.media_mime_type || '');
+  if (m.type !== 'audio' && !mime.startsWith('audio/')) return '';
+  const k = String(m.id);
+  if (_iaTranscritos.has(k)) { m.transcript = _iaTranscritos.get(k); return m.transcript; }
+  try {
+    const bruto = await _bytesDaMidia(m);
+    let mp3 = bruto, ehMp3 = false;
+    try { mp3 = await _paraMp3(bruto); ehMp3 = (mp3 !== bruto); } catch (_) {}
+    const texto = await _transcreverBuffer(mp3, ehMp3, mime);
+    _iaTranscritos.set(k, texto || '');
+    if (_iaTranscritos.size > 500) _iaTranscritos.delete(_iaTranscritos.keys().next().value);
+    if (texto) { m.transcript = texto; try { await supabase.from('messages').update({ transcript: texto }).eq('id', m.id); } catch (_) {} }
+    return texto || '';
+  } catch (e) { console.warn('IA: transcrição do áudio falhou:', e.message); return ''; }
 }
 // Monta e pede a sugestão. Devolve { mensagens, model, exemplos } — nunca envia nada.
 async function _iaSugere(owner, phone, forcar) {
@@ -7215,8 +7238,10 @@ async function _iaSugere(owner, phone, forcar) {
   // o que o lead disse por último (a sequência de mensagens dele desde a minha última)
   const doLead = [];
   for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
+  for (const m of doLead.slice(-3)) await _iaTranscreveSePrecisar(m); // os últimos áudios do lead viram texto
   const textoLead = doLead.map(m => m.type === 'audio' && m.transcript ? m.transcript : (m.content || '')).join(' ');
-  const exemplos = _iaExemplosParecidos(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 8);
+  // 6 exemplos (eram 8) e conversa mais curta: o plano grátis da Groq limita tokens por minuto
+  const exemplos = _iaExemplosParecidos(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6);
   const nome = String((lead && lead.name) || '').trim();
   const primeiro = nome.split(/\s+/)[0] || '';
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
@@ -7226,21 +7251,22 @@ async function _iaSugere(owner, phone, forcar) {
     + '- Responda SOMENTE com JSON no formato {"mensagens":["...","..."]}: de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
-    + '- Se a última coisa do lead foi áudio/foto/documento sem transcrição, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
+    + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, foto ou documento, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
     + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
     + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
     + '- Hoje é ' + _iaHoje() + '. Não escreva nada além do JSON.';
   const exTxt = exemplos.map((e, i) => {
-    const ctx = [].concat(e.contexto || []).join('\n');
+    const ctx = [].concat(e.contexto || []).slice(-3).map(x => String(x).slice(0, 220)).join('\n');
     return '--- Exemplo ' + (i + 1) + ' ---\n' + (ctx ? ctx + '\n' : '') + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n');
   }).join('\n');
   const usr = (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
-    + '\n\n### CONVERSA (mais antigas primeiro)\n' + msgs.map(_iaLinha).join('\n')
+    + '\n\n### CONVERSA (mais antigas primeiro)\n' + msgs.slice(-16).map(m => _iaLinha(m).slice(0, 400)).join('\n')
     + '\n\nEscreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
   const mensagens = _iaExtraiMensagens(texto).map(t => primeiro ? t.replace(/\{nome\}/g, primeiro) : t);
-  const r = { mensagens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha) };
+  const r = { mensagens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
+    transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)) }; // o app mostra o que o lead disse no áudio
   if (mensagens.length) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
   return r;
 }
