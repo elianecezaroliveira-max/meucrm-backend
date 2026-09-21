@@ -151,7 +151,7 @@ function _exigeLogin(req, res) {
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 296;
+const SERVER_VER = 297;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3110,16 +3110,21 @@ app.get('/search/messages', async (req, res) => {
   const like = `%${term}%`;
   const { account_id } = req.query;
   const OW = req.owner || ' ';
+  // "Mostrar mais mensagens": continua a partir da mais antiga que já apareceu
+  const antes = String(req.query.antes || '').trim();
+  const antesOk = antes && !isNaN(Date.parse(antes)) ? antes : null;
   try {
     let q = supabase.from('messages').select('id, phone, content, transcript, direction, timestamp, type, account_id')
       .eq('owner', OW).or(`content.ilike.${like},transcript.ilike.${like}`)
       .order('timestamp', { ascending: false }).limit(60);
     if (account_id) q = q.eq('account_id', account_id);
+    if (antesOk) q = q.lt('timestamp', antesOk);
     let { data, error } = await q;
     if (error && /transcript/i.test(error.message || '')) { // sem a coluna ainda
       let q2 = supabase.from('messages').select('id, phone, content, direction, timestamp, type, account_id')
         .eq('owner', OW).ilike('content', like).order('timestamp', { ascending: false }).limit(60);
       if (account_id) q2 = q2.eq('account_id', account_id);
+      if (antesOk) q2 = q2.lt('timestamp', antesOk);
       ({ data, error } = await q2);
     }
     if (error) return res.status(500).json({ error: error.message });
