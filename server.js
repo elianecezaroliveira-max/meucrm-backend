@@ -184,7 +184,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 298;
+const SERVER_VER = 299;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2026,6 +2026,59 @@ function convertAudioToOpus(buf) {
 
 // Formata segundos como M:SS (para "🎤 Mensagem de voz (0:07)")
 function _fmtDur(s) { s = Math.max(0, Math.round(s || 0)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
+// ═══════════════════════════════════════════════════════════════════
+// 📩 MENSAGENS DO QR CODE EM CAIXAS ESPECIAIS (modelo aprovado com botões, lista,
+//    "ver uma vez", temporária, editada). Sem isto elas chegavam no VETRA como
+//    "[Mensagem recebida]", sem o texto — foi o caso do código de verificação.
+// ═══════════════════════════════════════════════════════════════════
+function _qrDentro(m) {
+  let x = m || {}, n = 0;
+  while (n++ < 6) {
+    const d = (x.ephemeralMessage && x.ephemeralMessage.message) || (x.viewOnceMessage && x.viewOnceMessage.message)
+           || (x.viewOnceMessageV2 && x.viewOnceMessageV2.message) || (x.viewOnceMessageV2Extension && x.viewOnceMessageV2Extension.message)
+           || (x.documentWithCaptionMessage && x.documentWithCaptionMessage.message) || (x.editedMessage && x.editedMessage.message)
+           || (x.deviceSentMessage && x.deviceSentMessage.message);
+    if (!d || d === x) break;
+    x = d;
+  }
+  return x || {};
+}
+function _qrBotoesTxt(botoes) {
+  const nomes = (botoes || []).map(b => String(b == null ? '' : b).replace(/\s+/g, ' ').trim()).filter(Boolean);
+  return nomes.length ? '\n' + nomes.map(b => '▫️ ' + b).join('\n') : '';
+}
+function _qrJuntaTexto(corpo, rodape, botoes) {
+  return String((corpo || '[Mensagem]') + (rodape ? '\n' + rodape : '') + _qrBotoesTxt(botoes)).trim();
+}
+function _qrTemplateTxt(msg) {
+  try {
+    const t = msg.templateMessage || {};
+    const h = t.hydratedTemplate || t.hydratedFourRowTemplate || t.fourRowTemplate || {};
+    let corpo = h.hydratedContentText || (h.content && h.content.text) || '';
+    if (!corpo && h.imageMessage)    corpo = h.imageMessage.caption || '[Imagem]';
+    if (!corpo && h.videoMessage)    corpo = h.videoMessage.caption || '[Vídeo]';
+    if (!corpo && h.documentMessage) corpo = '[Documento: ' + (h.documentMessage.fileName || 'arquivo') + ']';
+    const bts = (h.hydratedButtons || []).map(b => (b.quickReplyButton && b.quickReplyButton.displayText)
+      || (b.urlButton && b.urlButton.displayText) || (b.callButton && b.callButton.displayText) || '');
+    return _qrJuntaTexto(corpo, h.hydratedFooterText || '', bts);
+  } catch (_) { return ''; }
+}
+function _qrInterativaTxt(msg) {
+  try {
+    const i = msg.interactiveMessage || {};
+    const corpo = (i.body && i.body.text) || (i.header && (i.header.title || i.header.subtitle)) || '';
+    let bts = [];
+    if (i.nativeFlowMessage && i.nativeFlowMessage.buttons) {
+      bts = i.nativeFlowMessage.buttons.map(b => {
+        try { const p = JSON.parse(b.buttonParamsJson || '{}'); return p.display_text || p.title || b.name || ''; }
+        catch (_) { return b.name || ''; }
+      });
+    }
+    if (i.buttons) bts = bts.concat(i.buttons.map(b => (b.buttonText && b.buttonText.displayText) || ''));
+    return _qrJuntaTexto(corpo, (i.footer && i.footer.text) || '', bts);
+  } catch (_) { return ''; }
+}
+
 
 // Mede a duração de um áudio recebido (a Meta não envia a duração no webhook)
 async function getAudioDurationSecs(mediaId, token) {
@@ -9836,8 +9889,9 @@ async function waStart(instanceName) {
       // Baixa a mídia (foto/áudio/vídeo/documento) e guarda no Supabase Storage
       let mediaPath = null, mediaMime = null;
       try {
-        const mm = m.message.imageMessage || m.message.audioMessage || m.message.videoMessage
-                || m.message.documentMessage || m.message.stickerMessage;
+        const _mDentro = _qrDentro(m.message || {}); // mídia dentro de embrulho ("ver uma vez", temporária)
+        const mm = _mDentro.imageMessage || _mDentro.audioMessage || _mDentro.videoMessage
+                || _mDentro.documentMessage || _mDentro.stickerMessage;
         // 📦 Arquivo acima do limite não entra no cofre (mesma regra da API oficial):
         // a mensagem aparece no chat, só sem o arquivo anexado.
         const _fl = mm && mm.fileLength;
@@ -9847,7 +9901,7 @@ async function waStart(instanceName) {
         } else if (mm && supabase && _cofreCheio) {
           console.log('Cofre no limite — mídia QR não guardada');
         } else if (mm && supabase) {
-          const buf = await _baileys.downloadMediaMessage(m, 'buffer', {}, {
+          const buf = await _baileys.downloadMediaMessage(Object.assign({}, m, { message: _mDentro }), 'buffer', {}, {
             logger: _pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
           mediaMime = (mm.mimetype || 'application/octet-stream').split(';')[0];
           const ext = mediaMime.split('/')[1] || 'bin';
@@ -10309,7 +10363,7 @@ app.post('/evolution-webhook', async (req, res) => {
 
       // Extrai conteúdo
       let content = fromMe ? '[Mensagem enviada]' : '[Mensagem recebida]', type = 'text';
-      const msg = data.message || {};
+      const msg = _qrDentro(data.message || {}); // tira o embrulho (temporária, "ver uma vez", editada…)
       // Sinal INTERNO do WhatsApp (sem conteúdo de verdade)? Ignora — não vira bolha
       const _reais = Object.keys(msg).filter(k => k !== 'messageContextInfo' && k !== 'senderKeyDistributionMessage' && k !== 'deviceSentMessage');
       if (!_reais.length) return;
@@ -10329,6 +10383,24 @@ app.post('/evolution-webhook', async (req, res) => {
       else if (msg.contactMessage)        { content = `👤 ${msg.contactMessage.displayName || 'Contato'}`; type = 'contact'; }
       else if (msg.contactsArrayMessage)  { content = `👤 ${(msg.contactsArrayMessage.contacts || []).map(c => c.displayName).filter(Boolean).join(', ') || 'Contatos'}`; type = 'contact'; }
       else if (msg.pollCreationMessage || msg.pollCreationMessageV3) { const pl = msg.pollCreationMessage || msg.pollCreationMessageV3; content = `📊 ${pl.name}\n` + (pl.options || []).map(o => '▫️ ' + o.optionName).join('\n'); type = 'poll'; }
+      // MODELO APROVADO COM BOTÕES (ex.: "Seu código de verificação é 1234" + "Copiar código"),
+      // listas e caixas interativas: o texto e os botões viram a bolha da conversa
+      else if (msg.templateMessage)       { content = _qrTemplateTxt(msg) || '[Mensagem]'; type = 'text'; }
+      else if (msg.interactiveMessage)    { content = _qrInterativaTxt(msg) || '[Mensagem]'; type = 'text'; }
+      else if (msg.buttonsMessage)        { const b = msg.buttonsMessage; content = _qrJuntaTexto(b.contentText || b.headerText || '', b.footerText || '', (b.buttons || []).map(x => x.buttonText && x.buttonText.displayText)); type = 'text'; }
+      else if (msg.listMessage)           { const l = msg.listMessage; const ops = []; (l.sections || []).forEach(sc => (sc.rows || []).forEach(rw => ops.push(rw.title))); content = _qrJuntaTexto(l.description || l.title || '', l.footerText || '', ops); type = 'text'; }
+      // O LEAD TOCOU num botão/opção: vale como a resposta dele (inclusive para os bots)
+      else if (msg.templateButtonReplyMessage) { content = msg.templateButtonReplyMessage.selectedDisplayText || '[Botão]'; type = 'text'; }
+      else if (msg.buttonsResponseMessage)     { content = msg.buttonsResponseMessage.selectedDisplayText || msg.buttonsResponseMessage.selectedButtonId || '[Botão]'; type = 'text'; }
+      else if (msg.listResponseMessage)        { content = msg.listResponseMessage.title || (msg.listResponseMessage.singleSelectReply && msg.listResponseMessage.singleSelectReply.selectedRowId) || '[Opção escolhida]'; type = 'text'; }
+      else if (msg.interactiveResponseMessage) {
+        let t = '';
+        try { const p = JSON.parse((msg.interactiveResponseMessage.nativeFlowResponseMessage || {}).paramsJson || '{}'); t = p.display_text || p.title || ''; } catch (_) {}
+        content = t || (msg.interactiveResponseMessage.body && msg.interactiveResponseMessage.body.text) || '[Resposta]'; type = 'text';
+      }
+      else if (msg.productMessage)        { const pr = msg.productMessage.product || {}; content = '🛍 ' + (pr.title || (pr.productImage && pr.productImage.caption) || 'Produto'); type = 'text'; }
+      else if (msg.orderMessage)          { content = '🧾 ' + (msg.orderMessage.message || 'Pedido pelo catálogo'); type = 'text'; }
+      else if (msg.liveLocationMessage)   { const l = msg.liveLocationMessage; content = '📍 Localização em tempo real\nhttps://maps.google.com/?q=' + l.degreesLatitude + ',' + l.degreesLongitude; type = 'location'; }
       else if (msg.pollUpdateMessage) {
         // VOTO na enquete: decifra e mostra a opção escolhida
         let escolha = '';
