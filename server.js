@@ -150,8 +150,41 @@ function _exigeLogin(req, res) {
   return false;
 }
 app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
+// ═══════════════════════════════════════════════════════════════════
+// 🔑 ENTREGA DO LOGIN (iPhone com o VETRA na tela inicial)
+// ═══════════════════════════════════════════════════════════════════
+// No iPhone, o app da tela inicial abre o login do Google numa janela do Safari que
+// tem um "cofre" SEPARADO: o login acontecia lá, mas o app continuava sem sessão e
+// pedia login de novo — o loop. Agora a janela do login ENTREGA a sessão por aqui e o
+// app (que ficou esperando com um código aleatório) a busca. Uso único, vale 5 min.
+const _entregasLogin = new Map(); // codigo -> { access_token, refresh_token, ts }
+const _ENTREGA_VALE_MS = 5 * 60 * 1000;
+function _entregaLimpa() { const agora = Date.now(); for (const [k, v] of _entregasLogin) if (agora - v.ts > _ENTREGA_VALE_MS) _entregasLogin.delete(k); }
+const _codigoEntregaOk = c => /^[a-f0-9]{32,64}$/.test(String(c || ''));
+app.post('/auth-handoff', (req, res) => {
+  try {
+    _entregaLimpa();
+    const { nonce, access_token, refresh_token } = req.body || {};
+    if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+    const bearer = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    // só entrega a PRÓPRIA sessão (o token do corpo tem de ser o mesmo que veio no cabeçalho)
+    if (!_codigoEntregaOk(nonce) || !access_token || !refresh_token || access_token !== bearer) return res.status(400).json({ error: 'dados inválidos' });
+    if (_entregasLogin.size > 500) return res.status(429).json({ error: 'muitas entregas' });
+    _entregasLogin.set(String(nonce), { access_token: String(access_token), refresh_token: String(refresh_token), ts: Date.now() });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/auth-handoff/:nonce', (req, res) => {
+  _entregaLimpa();
+  const c = String(req.params.nonce || '');
+  if (!_codigoEntregaOk(c)) return res.status(400).json({ error: 'código inválido' });
+  const v = _entregasLogin.get(c);
+  if (!v) return res.json({ pronto: false });
+  _entregasLogin.delete(c); // uso único
+  res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
+});
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 297;
+const SERVER_VER = 298;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
