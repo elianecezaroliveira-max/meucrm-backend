@@ -184,7 +184,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 300;
+const SERVER_VER = 301;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7260,6 +7260,29 @@ function _iaLinha(m) {
   return quem + ': ' + (txt || '(vazio)').slice(0, 600);
 }
 const _iaHoje = () => { const d = new Date(Date.now() - 3 * 3600000); return ['domingo', 'segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado'][d.getUTCDay()] + ', ' + String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + d.getUTCFullYear(); };
+// ═══════════════════════════════════════════════════════════════════
+// 🧪 CONVERSAS DE TESTE: a IA não sugere nada nelas e NUNCA aprende com elas
+// (o número de teste dela é usado para experimentar bots e envios — o que sai ali
+//  não é atendimento de verdade e sujaria a memória da IA)
+// ═══════════════════════════════════════════════════════════════════
+const _IA_FONES_TESTE_PADRAO = ['5515981651975'];
+function _iaFonesTeste(owner) {
+  const extra = String(_cfg('ia_fones_teste', owner) || '').split(/[,;\s]+/).map(x => String(x || '').replace(/\D/g, '')).filter(Boolean);
+  const todos = _IA_FONES_TESTE_PADRAO.concat(extra);
+  const set = new Set();
+  for (const f of todos) for (const v of phoneVariants(f)) set.add(String(v).replace(/\D/g, ''));
+  return set;
+}
+function _iaEhTeste(phone, owner) {
+  const f = String(phone || '').replace(/\D/g, '');
+  if (!f) return false;
+  const set = _iaFonesTeste(owner);
+  if (set.has(f)) return true;
+  // compara também pelos 8 últimos dígitos (com e sem o nono)
+  const fim = f.slice(-8);
+  for (const v of set) if (v.slice(-8) === fim) return true;
+  return false;
+}
 // 📅 DATA de cada mensagem e DIAS ÚTEIS entre elas: a operação dela leva ~7 dias úteis e
 // cada dia é uma fase diferente. Sem as datas a IA sugeria a fase errada (pedia de novo um
 // documento já enviado, ou dava um prazo que já venceu).
@@ -7425,6 +7448,7 @@ function _iaExtraiItens(texto, rapidas, bots, soTexto) {
 }
 // Monta e pede a sugestão. Devolve { mensagens, itens, model } — nunca envia nada.
 async function _iaSugere(owner, phone, forcar) {
+  if (_iaEhTeste(phone, owner)) return { mensagens: [], itens: [], motivo: 'conversa de teste' };
   const mem = await _iaMemoria(owner);
   // (sem .neq('type','note') no banco: no Postgres, "type <> 'note'" DEIXA DE FORA as
   //  linhas com type nulo — que são as mensagens de texto comuns — e a conversa vinha vazia)
@@ -7499,6 +7523,53 @@ async function _iaSugere(owner, phone, forcar) {
   return r;
 }
 
+// 🧹 Limpa da memória o que já tinha sido aprendido NA CONVERSA DE TESTE. A chave de cada
+// exemplo é o sha1 de "telefone|id da última mensagem do lead" — dá para achar quais vieram
+// de lá sem guardar telefone nenhum na memória.
+async function _iaLimpaTestes(owner) {
+  if (!supabase || !owner) return { tirados: 0 };
+  try {
+    const fones = Array.from(_iaFonesTeste(owner));
+    if (!fones.length) return { tirados: 0 };
+    const { data: msgs } = await supabase.from('messages').select('id, phone').in('phone', fones).eq('owner', owner)
+      .order('timestamp', { ascending: false }).limit(1000);
+    if (!msgs || !msgs.length) return { tirados: 0 };
+    const cr = require('crypto');
+    const chaves = new Set();
+    for (const m of msgs) for (const f of fones) chaves.add(cr.createHash('sha1').update(f + '|' + m.id).digest('hex').slice(0, 12));
+    const mem = await _iaMemoria(owner, true);
+    const ficam = mem.exemplos.filter(e => !(e && e.chave && chaves.has(e.chave)));
+    const tirados = mem.exemplos.length - ficam.length;
+    if (tirados > 0) {
+      await _iaMemoriaGrava(owner, 'exemplos', ficam.map(o => JSON.stringify(o)).join('\n'));
+      console.log('IA: ' + tirados + ' exemplo(s) da conversa de TESTE tirados da memória');
+    }
+    return { tirados, total: ficam.length };
+  } catch (e) { console.error('IA limpar testes:', e.message); return { tirados: 0, erro: e.message }; }
+}
+// Roda sozinho um tempo depois de subir (e dá para chamar na mão pela rota abaixo)
+setTimeout(() => { _iaLimpaTestes(_CONTA_IA).catch(() => {}); }, 30000);
+// POST /ia/esquecer { phone } — tira da memória tudo o que veio daquela conversa
+app.post('/ia/esquecer', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  try {
+    const phone = String((req.body || {}).phone || '').replace(/\D/g, '');
+    if (!phone) return res.status(400).json({ error: 'phone' });
+    const fones = phoneVariants(phone).map(x => String(x).replace(/\D/g, ''));
+    const { data: msgs } = await supabase.from('messages').select('id').in('phone', fones).eq('owner', req.owner)
+      .order('timestamp', { ascending: false }).limit(1000);
+    const cr = require('crypto');
+    const chaves = new Set();
+    for (const m of (msgs || [])) for (const f of fones) chaves.add(cr.createHash('sha1').update(f + '|' + m.id).digest('hex').slice(0, 12));
+    const mem = await _iaMemoria(req.owner, true);
+    const ficam = mem.exemplos.filter(e => !(e && e.chave && chaves.has(e.chave)));
+    const tirados = mem.exemplos.length - ficam.length;
+    if (tirados > 0) await _iaMemoriaGrava(req.owner, 'exemplos', ficam.map(o => JSON.stringify(o)).join('\n'));
+    res.json({ ok: true, tirados, total: ficam.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 // GET /ia/status — ligada? chave? quanta memória há
 app.get('/ia/status', async (req, res) => {
   if (String(req.owner || '').toLowerCase() !== _CONTA_IA) return res.json({ ligada: false, liberada: false, chave: false, memoria: { estilo: false, fluxo: false, exemplos: 0, aprendidos: 0 } });
@@ -7559,6 +7630,7 @@ app.post('/ia/aprender', async (req, res) => {
     const phone = String(b.phone || '').replace(/\D/g, '');
     const enviadas = [].concat(b.enviado || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 8);
     if (!phone || !enviadas.length) return res.status(400).json({ error: 'phone/enviado' });
+    if (_iaEhTeste(phone, req.owner)) return res.json({ ok: true, guardado: false, motivo: 'conversa de teste' }); // nada de teste entra na memória
     const sugerido = [].concat(b.sugerido || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
     let nome = '';
     try { const { data } = await supabase.from('contacts').select('name').in('phone', phoneVariants(phone)).eq('owner', req.owner || ' ').limit(1); nome = String(((data || [])[0] || {}).name || ''); } catch (_) {}
