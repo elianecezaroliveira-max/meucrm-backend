@@ -184,7 +184,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 299;
+const SERVER_VER = 300;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7260,6 +7260,46 @@ function _iaLinha(m) {
   return quem + ': ' + (txt || '(vazio)').slice(0, 600);
 }
 const _iaHoje = () => { const d = new Date(Date.now() - 3 * 3600000); return ['domingo', 'segunda-feira', 'terça-feira', 'quarta-feira', 'quinta-feira', 'sexta-feira', 'sábado'][d.getUTCDay()] + ', ' + String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + d.getUTCFullYear(); };
+// 📅 DATA de cada mensagem e DIAS ÚTEIS entre elas: a operação dela leva ~7 dias úteis e
+// cada dia é uma fase diferente. Sem as datas a IA sugeria a fase errada (pedia de novo um
+// documento já enviado, ou dava um prazo que já venceu).
+const _BRT_MS = 3 * 3600000;
+function _iaDataHora(ts) {
+  try { const d = new Date(new Date(ts).getTime() - _BRT_MS);
+    return String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + ' ' + String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+  } catch (_) { return ''; }
+}
+function _iaDiaBRT(ts) { try { return new Date(new Date(ts).getTime() - _BRT_MS).toISOString().slice(0, 10); } catch (_) { return ''; } }
+// Dias ÚTEIS (segunda a sexta) entre duas datas — feriado não entra na conta
+function _iaDiasUteis(de, ate) {
+  try {
+    let a = new Date(new Date(de).getTime() - _BRT_MS), b = new Date(new Date(ate || Date.now()).getTime() - _BRT_MS);
+    a = Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate());
+    b = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate());
+    if (!(b > a)) return 0;
+    let n = 0;
+    for (let t = a + 86400000; t <= b; t += 86400000) { const d = new Date(t).getUTCDay(); if (d !== 0 && d !== 6) n++; }
+    return n;
+  } catch (_) { return 0; }
+}
+function _iaDiasCorridos(de, ate) { try { return Math.max(0, Math.round((new Date(ate || Date.now()) - new Date(de)) / 86400000)); } catch (_) { return 0; } }
+// Linha da conversa PARA A IA: com data/hora na frente
+function _iaLinhaData(m) { const q = _iaDataHora(m.timestamp); return (q ? '[' + q + '] ' : '') + _iaLinha(m); }
+// Conversa com as datas e as "viradas de dia" marcadas (com quantos dias úteis se passaram)
+function _iaConversaComDatas(msgs) {
+  const out = [];
+  let diaAnt = null, tsAnt = null;
+  for (const m of msgs) {
+    const dia = _iaDiaBRT(m.timestamp);
+    if (diaAnt && dia !== diaAnt) {
+      const uteis = _iaDiasUteis(tsAnt, m.timestamp), corridos = _iaDiasCorridos(tsAnt, m.timestamp);
+      out.push('--- passaram ' + corridos + ' dia(s) (' + uteis + ' útil(eis)) ---');
+    }
+    out.push(_iaLinhaData(m).slice(0, 400));
+    diaAnt = dia; tsAnt = m.timestamp;
+  }
+  return out.join('\n');
+}
 // Tira o que identifica o lead antes de guardar na memória
 function _iaAnonima(txt, nomeLead) {
   let t = String(txt || '');
@@ -7356,7 +7396,7 @@ async function _iaCatalogo(owner) {
   return out;
 }
 // Itens da sugestão: texto, {rapida:"/atalho"} ou {bot:"Nome"} — só os que existem de verdade
-function _iaExtraiItens(texto, rapidas, bots) {
+function _iaExtraiItens(texto, rapidas, bots, soTexto) {
   const t = String(texto || '');
   let brutos = null;
   const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
@@ -7367,15 +7407,17 @@ function _iaExtraiItens(texto, rapidas, bots) {
   for (const b of brutos) {
     if (out.length >= 4) break;
     if (b && typeof b === 'object') {
-      if (b.rapida != null) { const r = (rapidas || []).find(x => x.atalho === norm(b.rapida)); if (r && !_iaTemLink(r.texto)) out.push({ tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
-      if (b.bot != null) { const al = String(b.bot).trim().toLowerCase(); const bt = (bots || []).find(x => x.nome.toLowerCase() === al || x.id === String(b.bot)); if (bt) out.push({ tipo: 'bot', id: bt.id, nome: bt.nome }); continue; }
+      // soTexto: a sugestão é só mensagem personalizada — atalho vira o TEXTO da resposta
+      // rápida e bot é descartado (ela dispara pelo "/" e pelo "#" quando quiser)
+      if (b.rapida != null) { const r = (rapidas || []).find(x => x.atalho === norm(b.rapida)); if (r && !_iaTemLink(r.texto)) out.push(soTexto ? { tipo: 'texto', texto: r.texto } : { tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
+      if (b.bot != null) { if (soTexto) continue; const al = String(b.bot).trim().toLowerCase(); const bt = (bots || []).find(x => x.nome.toLowerCase() === al || x.id === String(b.bot)); if (bt) out.push({ tipo: 'bot', id: bt.id, nome: bt.nome }); continue; }
       continue;
     }
     const s = String(b || '').trim();
     if (!s) continue;
     // texto igualzinho a uma resposta rápida (ou "/atalho" escrito como texto) vira a rápida
     const mAt = s.match(/^\/([\w-]+)$/); const r2 = (rapidas || []).find(x => (mAt && x.atalho === mAt[1].toLowerCase()) || x.texto.trim() === s);
-    if (r2) { if (!_iaTemLink(r2.texto)) out.push({ tipo: 'rapida', atalho: r2.atalho, texto: r2.texto, previa: r2.previa, anexo: r2.anexo }); continue; }
+    if (r2) { if (!_iaTemLink(r2.texto)) out.push(soTexto ? { tipo: 'texto', texto: r2.texto } : { tipo: 'rapida', atalho: r2.atalho, texto: r2.texto, previa: r2.previa, anexo: r2.anexo }); continue; }
     const limpo = _iaExtraiMensagens('{"mensagens":' + JSON.stringify([s]) + '}')[0]; // (já sem marcador e sem link)
     if (limpo) out.push({ tipo: 'texto', texto: limpo });
   }
@@ -7390,9 +7432,9 @@ async function _iaSugere(owner, phone, forcar) {
   //  a consulta inteira em quem ainda não rodou o SQL da transcrição — e vinha "sem conversa")
   const { data: brutas, error: erroMsgs } = await supabase.from('messages').select('*')
     .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
-    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(30);
+    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(60);
   if (erroMsgs) return { mensagens: [], motivo: 'banco: ' + erroMsgs.message };
-  const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 24).reverse();
+  const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 40).reverse();
   if (!msgs.length) return { mensagens: [], motivo: 'sem conversa' };
   const ult = msgs[msgs.length - 1];
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
@@ -7413,31 +7455,43 @@ async function _iaSugere(owner, phone, forcar) {
   const primeiro = nome.split(/\s+/)[0] || '';
   // ⚡ respostas rápidas e 🤖 bots dela: a IA sugere USAR o que já existe em vez de reescrever o bloco padrão
   const { rapidas, bots } = await _iaCatalogo(owner);
-  const catTxt = (rapidas.length ? '### RESPOSTAS RÁPIDAS DELA (prontas — use só quando for exatamente o que ela mandaria)\n' + rapidas.map(r => '/' + r.atalho + ' — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '')).join('\n') + '\n\n' : '')
-    + (bots.length ? '### BOTS DELA (fluxos automáticos que ela dispara na conversa)\n' + bots.map(b => b.nome).join('\n') + '\n\n' : '');
+  const _SO_TEXTO = true; // sugestão = SÓ mensagem personalizada (sem resposta rápida e sem bot)
+  const catTxt = (!_SO_TEXTO && rapidas.length ? '### RESPOSTAS RÁPIDAS DELA (prontas — use só quando for exatamente o que ela mandaria)\n' + rapidas.map(r => '/' + r.atalho + ' — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '')).join('\n') + '\n\n' : '')
+    + (!_SO_TEXTO && bots.length ? '### BOTS DELA (fluxos automáticos que ela dispara na conversa)\n' + bots.map(b => b.nome).join('\n') + '\n\n' : '');
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
     + '### REGRAS DE SAÍDA\n'
     + '- Responda SOMENTE com JSON no formato {"mensagens":["...","..."]}: de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
-    + (rapidas.length || bots.length ? '- Um item de "mensagens" também pode ser {"rapida":"/atalho"} (uma resposta rápida dela, pelo atalho exato) ou {"bot":"Nome"} (um bot dela, pelo nome exato). Escolha o que MELHOR encaixa na situação: texto livre, resposta rápida ou bot — não é obrigatório usar rápida/bot. Use {"rapida":…} só quando o bloco padrão é exatamente a mensagem certa (em vez de reescrevê-lo); sugira {"bot":…} só quando a próxima etapa é um fluxo que ela costuma disparar. Se o lead fez uma pergunta específica, responda em texto. Nos exemplos, "[rapida: /x]" e "[bot: Y]" mostram quando ela usou isso.\n' : '')
+    + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
     + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, foto ou documento, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
     + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
     + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]"/"{link}" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
     + '- NUNCA escreva link/endereço nenhum (http, www, id.unico…): o link de aceite é gerado por ela em outro sistema e é único por cliente. Quando o passo é enviar um aceite, sugira só o aviso ("Vou digitar a proposta e já te envio aqui o aceite 🙌🏼" / "{nome}, segue aceite:") — nunca o bloco do aceite com link.\n'
+    + '- CADA CLIENTE É ÚNICO e cada dia da operação é uma fase diferente (o processo leva cerca de 7 dias úteis). Antes de sugerir, leia a conversa INTEIRA com as datas: veja o que já foi feito, quantos dias úteis se passaram desde a última etapa e em que fase este cliente está HOJE.\n'
+    + '- Nunca peça de novo algo que o lead já mandou, nem repita uma etapa já concluída, nem antecipe uma etapa que ainda não chegou. Se o prazo que ela deu já venceu, a resposta tem de reconhecer isso.\n'
+    + '- Fale do tempo pelo que está na conversa (ex.: "desde terça", "faz 3 dias úteis"), nunca invente data, prazo novo ou fase que não apareça na conversa nem no manual.\n'
     + '- Hoje é ' + _iaHoje() + '. Não escreva nada além do JSON.';
   const exTxt = exemplos.map((e, i) => {
     const ctx = [].concat(e.contexto || []).slice(-3).map(x => String(x).slice(0, 220)).join('\n');
     return '--- Exemplo ' + (i + 1) + ' ---\n' + (ctx ? ctx + '\n' : '') + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n');
   }).join('\n');
+  // Quanto tempo esta operação já leva — a IA precisa disso para saber a FASE do cliente
+  const _pri = msgs[0], _ultLead = [...msgs].reverse().find(m => m.direction === 'inbound'), _ultMinha = [...msgs].reverse().find(m => m.direction === 'outbound');
+  const tempoTxt = '\n\n### TEMPO DESTA OPERAÇÃO (cada cliente está num dia/fase diferente)\n'
+    + 'Hoje: ' + _iaHoje() + '\n'
+    + (_pri ? 'Primeira mensagem desta conversa: ' + _iaDataHora(_pri.timestamp) + ' (há ' + _iaDiasCorridos(_pri.timestamp) + ' dia(s), ' + _iaDiasUteis(_pri.timestamp) + ' útil(eis))\n' : '')
+    + (_ultMinha ? 'Última mensagem DELA: ' + _iaDataHora(_ultMinha.timestamp) + ' (há ' + _iaDiasCorridos(_ultMinha.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultMinha.timestamp) + ' útil(eis))\n' : '')
+    + (_ultLead ? 'Última mensagem do LEAD: ' + _iaDataHora(_ultLead.timestamp) + ' (há ' + _iaDiasCorridos(_ultLead.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultLead.timestamp) + ' útil(eis))\n' : '');
   const usr = catTxt + (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
-    + '\n\n### CONVERSA (mais antigas primeiro)\n' + msgs.slice(-16).map(m => _iaLinha(m).slice(0, 400)).join('\n')
-    + '\n\nEscreva agora a sugestão de resposta dela para a última mensagem do lead.';
+    + tempoTxt
+    + '\n\n### CONVERSA (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs.slice(-24))
+    + '\n\nAntes de escrever: olhe as DATAS acima, veja em que ponto da operação este cliente está e o que já foi feito. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
-  const itens = _iaExtraiItens(texto, rapidas, bots).map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
+  const itens = _iaExtraiItens(texto, rapidas, bots, _SO_TEXTO).map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
   const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
     transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)) }; // o app mostra o que o lead disse no áudio
