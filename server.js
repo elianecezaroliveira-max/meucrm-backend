@@ -184,7 +184,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 301;
+const SERVER_VER = 303;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3411,7 +3411,21 @@ app.get("/search", async (req, res) => {
     // Número digitado com máscara — "(15) 98165-1975", "15 98165 1975", "+55 15…" —
     // tem de achar o contato: compara só os dígitos
     const soDig = raw.replace(/\D/g, '');
-    if (soDig.length >= 4 && soDig.length >= raw.replace(/\s/g, '').length * 0.5) orCond += `,phone.ilike.%${soDig}%`;
+    if (soDig.length >= 4 && soDig.length >= raw.replace(/\s/g, '').length * 0.5) {
+      // O MESMO número é guardado de jeitos diferentes: com e sem o 55, com e sem o nono
+      // dígito. Buscar "46999116591" não achava o lead guardado como "554699116591".
+      // Agora procuramos por todas as formas — e pelos 8 últimos dígitos, que nunca mudam.
+      const formas = new Set();
+      const base = new Set([soDig, soDig.replace(/^55/, '')]);
+      for (const p0 of base) {
+        if (!p0) continue;
+        formas.add(p0);
+        if (/^\d{2}9\d{8}$/.test(p0)) formas.add(p0.slice(0, 2) + p0.slice(3)); // tira o nono
+        if (/^\d{10}$/.test(p0))       formas.add(p0.slice(0, 2) + '9' + p0.slice(2)); // põe o nono
+      }
+      if (soDig.length >= 8) formas.add(soDig.slice(-8));
+      for (const f of formas) if (f && f.length >= 4) orCond += `,phone.ilike.%${f}%`;
+    }
     if (phones.length) orCond += `,phone.in.(${phones.join(",")})`;
     let cq = supabase.from("contacts")
       .select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
@@ -6178,6 +6192,46 @@ async function stopRun(runId, status='completed') {
   if (supabase) await supabase.from('bot_runs').update({ status, updated_at:new Date().toISOString() }).eq('id', runId);
 }
 
+// Passos que NÃO falam com o lead: acontecem mesmo com a execução já encerrada
+async function _executaPassoSilencioso(node, run) {
+  const cfg = (node && node.config) || {};
+  const phone = run.contact_phone, OW = run.owner || ' ';
+  if (node.type === 'task') return _criaTarefaDoBot(cfg, run);
+  if (node.type === 'tags') {
+    const { data: ct } = await supabase.from('contacts').select('tags').eq('phone', phone).eq('owner', OW).maybeSingle();
+    let tags = Array.isArray(ct?.tags) ? ct.tags.slice() : [];
+    (cfg.add || []).forEach(t => { if (t && !tags.includes(t)) tags.push(t); });
+    if (cfg.remove?.length) tags = tags.filter(t => !cfg.remove.includes(t));
+    await supabase.from('contacts').update({ tags }).eq('phone', phone).eq('owner', OW);
+    return;
+  }
+  if (node.type === 'move_stage' && cfg.stage_id) { await supabase.from('contacts').update({ stage_id: cfg.stage_id }).eq('phone', phone).eq('owner', OW); return; }
+  if (node.type === 'complete_task') {
+    let q = supabase.from('tasks').update({ done: true }).eq('phone', phone).eq('done', false).eq('owner', OW);
+    if (cfg.title_filter) q = q.ilike('title', '%' + cfg.title_filter + '%');
+    await q; return;
+  }
+  if (node.type === 'mark_read') { await supabase.from('contacts').update({ unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', OW); return; }
+}
+// CRIAR A TAREFA DO BOT — com conferência e nova tentativa. Antes, se o banco recusasse a
+// gravação, ninguém ficava sabendo: o bot seguia e a tarefa simplesmente não existia.
+async function _criaTarefaDoBot(cfg, run) {
+  const phone = run.contact_phone, OW = run.owner || ' ';
+  let nome = phone;
+  try { const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle(); nome = (ct && ct.name) || phone; } catch (_) {}
+  const title = applyVars(cfg.title || 'Tarefa', nome, phone);
+  const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours) * 3600000).toISOString() : null;
+  const linha = { phone, account_id: run.account_id || null, title, due_at: due, owner: run.owner || null, created_at: new Date().toISOString() };
+  for (let tent = 1; tent <= 3; tent++) {
+    const { error } = await supabase.from('tasks').insert(linha);
+    if (!error) return true;
+    console.error('Tarefa do bot NÃO gravou (tentativa ' + tent + '):', error.message);
+    await new Promise(r => setTimeout(r, 800 * tent));
+  }
+  // 3 tentativas e nada: ela PRECISA saber (senão a tarefa some em silêncio)
+  try { await addNotice(run.owner, 'A tarefa "' + title + '" do bot não foi criada para ' + nome + ' (' + phone + '). Crie na mão e me avise.', 'tarefa-bot:' + phone + ':' + title, { tipo: 'erro' }); } catch (_) {}
+  return false;
+}
 async function processNode(run, depth=0) {
   if (!supabase) return;
   // Recupera a trava do número quando a execução volta do banco (após uma pausa)
@@ -6198,7 +6252,20 @@ async function processNode(run, depth=0) {
   if (runId) {
     try {
       const { data: _vivo } = await supabase.from('bot_runs').select('status').eq('id', runId).maybeSingle();
-      if (!_vivo || _vivo.status === 'stopped' || _vivo.status === 'completed') return;
+      if (!_vivo || _vivo.status === 'stopped' || _vivo.status === 'completed') {
+        // A trava existe para não MANDAR mensagem duas vezes. Mas os passos que não falam
+        // com o lead (criar tarefa, etiqueta, mudar etapa…) precisam acontecer assim mesmo:
+        // quando você manda uma mensagem na conversa, a execução é encerrada na hora — e a
+        // TAREFA do fluxo ficava para trás. Faz este passo e para aqui (não segue o fluxo).
+        try {
+          const _n = await _nodeById(run.current_node_id);
+          if (_n && ['task', 'tags', 'move_stage', 'complete_task', 'mark_read'].includes(_n.type)) {
+            console.log('Bot encerrado, mas o passo "' + _n.type + '" foi executado assim mesmo (' + run.contact_phone + ')');
+            await _executaPassoSilencioso(_n, run);
+          }
+        } catch (e) { console.error('passo silencioso pós-encerramento:', e.message); }
+        return;
+      }
     } catch (_) {}
   }
   const OW = botOwner || ' '; // sentinela p/ escopo por dono
@@ -6274,10 +6341,7 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'task') {
-    const { data:ct } = await supabase.from('contacts').select('name').eq('phone',phone).eq('owner',OW).maybeSingle();
-    const title = applyVars(cfg.title || 'Tarefa', ct?.name || phone, phone);
-    const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours)*3600000).toISOString() : null;
-    await supabase.from('tasks').insert({ phone, account_id:acctId||null, title, due_at:due, owner:botOwner||null, created_at:new Date().toISOString() });
+    await _criaTarefaDoBot(cfg, { ...run, account_id: acctId || run.account_id || null });
     const nxt = await getNextNodeId(nodeId, null);
     if (nxt) { await supabase.from('bot_runs').update({ current_node_id:nxt, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt}, depth+1); }
     else await stopRun(runId,'completed');
