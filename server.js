@@ -184,7 +184,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 305;
+const SERVER_VER = 306;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7373,16 +7373,21 @@ function _iaDiasCorridos(de, ate) { try { return Math.max(0, Math.round((new Dat
 // Linha da conversa PARA A IA: com data/hora na frente
 function _iaLinhaData(m) { const q = _iaDataHora(m.timestamp); return (q ? '[' + q + '] ' : '') + _iaLinha(m); }
 // Conversa com as datas e as "viradas de dia" marcadas (com quantos dias úteis se passaram)
-function _iaConversaComDatas(msgs) {
+// `recentes`: quantas mensagens do fim vão INTEIRAS. As mais antigas vão encurtadas — assim a IA
+// enxerga a conversa desde o começo (ela pediu: entender TODO o contexto antes de sugerir) sem
+// estourar o limite de tokens por minuto do plano da Groq.
+function _iaConversaComDatas(msgs, recentes) {
   const out = [];
-  let diaAnt = null, tsAnt = null;
+  const corte = Math.max(0, msgs.length - (recentes || msgs.length));
+  let diaAnt = null, tsAnt = null, n = -1;
   for (const m of msgs) {
+    n++;
     const dia = _iaDiaBRT(m.timestamp);
     if (diaAnt && dia !== diaAnt) {
       const uteis = _iaDiasUteis(tsAnt, m.timestamp), corridos = _iaDiasCorridos(tsAnt, m.timestamp);
       out.push('--- passaram ' + corridos + ' dia(s) (' + uteis + ' útil(eis)) ---');
     }
-    out.push(_iaLinhaData(m).slice(0, 400));
+    out.push(_iaLinhaData(m).slice(0, n < corte ? 160 : 400));
     diaAnt = dia; tsAnt = m.timestamp;
   }
   return out.join('\n');
@@ -7520,9 +7525,9 @@ async function _iaSugere(owner, phone, forcar) {
   //  a consulta inteira em quem ainda não rodou o SQL da transcrição — e vinha "sem conversa")
   const { data: brutas, error: erroMsgs } = await supabase.from('messages').select('*')
     .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
-    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(60);
+    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(80);
   if (erroMsgs) return { mensagens: [], motivo: 'banco: ' + erroMsgs.message };
-  const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 40).reverse();
+  const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 50).reverse();
   if (!msgs.length) return { mensagens: [], motivo: 'sem conversa' };
   const ult = msgs[msgs.length - 1];
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
@@ -7577,7 +7582,7 @@ async function _iaSugere(owner, phone, forcar) {
   const usr = catTxt + (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
     + tempoTxt
-    + '\n\n### CONVERSA (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs.slice(-24))
+    + '\n\n### CONVERSA INTEIRA, do começo (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada; as mais antigas vêm encurtadas)\n' + _iaConversaComDatas(msgs, 24)
     + '\n\nAntes de escrever: olhe as DATAS acima, veja em que ponto da operação este cliente está e o que já foi feito. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
   const itens = _iaExtraiItens(texto, rapidas, bots, _SO_TEXTO).map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
