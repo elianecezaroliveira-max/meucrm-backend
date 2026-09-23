@@ -184,7 +184,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 304;
+const SERVER_VER = 305;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7691,44 +7691,129 @@ app.post('/ia/aprender', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
   try {
-    const b = req.body || {};
-    const phone = String(b.phone || '').replace(/\D/g, '');
-    const enviadas = [].concat(b.enviado || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 8);
-    if (!phone || !enviadas.length) return res.status(400).json({ error: 'phone/enviado' });
-    if (_iaEhTeste(phone, req.owner)) return res.json({ ok: true, guardado: false, motivo: 'conversa de teste' }); // nada de teste entra na memória
-    const sugerido = [].concat(b.sugerido || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
-    let nome = '';
-    try { const { data } = await supabase.from('contacts').select('name').in('phone', phoneVariants(phone)).eq('owner', req.owner || ' ').limit(1); nome = String(((data || [])[0] || {}).name || ''); } catch (_) {}
-    let leadLinhas = [].concat(b.lead || []).map(x => String(x || '').replace(/^Lead: /, '').trim()).filter(Boolean).slice(0, 8);
-    let ctxLinhas = [].concat(b.contexto || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 6);
-    if (!leadLinhas.length) { // app antigo / sem contexto: lê do banco a última fala do lead
-      const { data: brutas } = await supabase.from('messages').select('*').in('phone', phoneVariants(phone)).eq('owner', req.owner || ' ')
-        .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(20);
-      const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 16).reverse().filter(m => !(m.direction === 'outbound' && enviadas.includes(String(m.content || '').trim())));
-      const doLead = [];
-      for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
-      if (!doLead.length) return res.json({ ok: true, guardado: false, motivo: 'o lead não tinha falado' });
-      leadLinhas = doLead.map(m => _iaLinha(m).replace(/^Lead: /, ''));
-      ctxLinhas = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha);
-    }
-    const an = t => _iaAnonima(t, nome).slice(0, 1500);
-    // a chave identifica a fala do lead só para SUBSTITUIR o exemplo; guardada como resumo (sem o telefone)
-    const chave = require('crypto').createHash('sha1').update(String(b.chave || (phone + '|' + leadLinhas.join('|')))).digest('hex').slice(0, 12);
-    const ex = {
-      conversa: 'aprendido', chave, contexto: ctxLinhas.map(an), lead: leadLinhas.map(an), resposta: enviadas.map(an),
-      origem: enviadas.every(t => sugerido.includes(t)) ? 'aceita' : (b.usou ? 'editada' : 'propria'),
-      sugerido: sugerido.map(an), em: new Date().toISOString().slice(0, 10)
-    };
-    const mem = await _iaMemoria(req.owner, true);
-    const iguais = e => JSON.stringify([e.lead, e.resposta]) === JSON.stringify([ex.lead, ex.resposta]);
-    let lista = mem.exemplos.filter(e => !(e.chave && e.chave === chave)); // a versão anterior desta mesma fala sai
-    if (lista.some(iguais)) return res.json({ ok: true, guardado: false, motivo: 'repetido', total: mem.exemplos.length });
-    lista = lista.concat([ex]);
-    const cabe = lista.length > 3000 ? lista.slice(lista.length - 3000) : lista; // teto: as mais recentes ficam
-    await _iaMemoriaGrava(req.owner, 'exemplos', cabe.map(o => JSON.stringify(o)).join('\n'));
-    res.json({ ok: true, guardado: true, total: cabe.length, origem: ex.origem });
+    const r = await _iaGuardaExemplo(req.owner, req.body || {});
+    if (r.erro) return res.status(400).json({ error: r.erro });
+    res.json(r);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Uma gravação de exemplos por vez: o cartão ✨ e a varredura automática escrevem na MESMA
+// linha da memória — sem fila, uma podia apagar o que a outra tinha acabado de guardar.
+let _iaMemFila = Promise.resolve();
+const _iaMemNaFila = (fn) => { const p = _iaMemFila.then(fn, fn); _iaMemFila = p.then(() => {}, () => {}); return p; };
+// Guarda UM exemplo "o lead disse → ela respondeu" (miolo da rota, usado também pela varredura).
+// b: { phone, enviado:[…], sugerido?, lead?, contexto?, chave?, usou?, auto? }
+async function _iaGuardaExemplo(owner, b) {
+  const phone = String(b.phone || '').replace(/\D/g, '');
+  const enviadas = [].concat(b.enviado || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 8);
+  if (!phone || !enviadas.length) return { erro: 'phone/enviado' };
+  if (_iaEhTeste(phone, owner)) return { ok: true, guardado: false, motivo: 'conversa de teste' }; // nada de teste entra na memória
+  const sugerido = [].concat(b.sugerido || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
+  let nome = '';
+  try { const { data } = await supabase.from('contacts').select('name').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); nome = String(((data || [])[0] || {}).name || ''); } catch (_) {}
+  let leadLinhas = [].concat(b.lead || []).map(x => String(x || '').replace(/^Lead: /, '').trim()).filter(Boolean).slice(0, 8);
+  let ctxLinhas = [].concat(b.contexto || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 6);
+  if (!leadLinhas.length) { // app antigo / varredura: lê do banco a última fala do lead
+    const { data: brutas } = await supabase.from('messages').select('*').in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
+      .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(20);
+    const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 16).reverse().filter(m => !(m.direction === 'outbound' && enviadas.includes(String(m.content || '').trim())));
+    const doLead = [];
+    for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
+    if (!doLead.length) return { ok: true, guardado: false, motivo: 'o lead não tinha falado' };
+    leadLinhas = doLead.map(m => _iaLinha(m).replace(/^Lead: /, ''));
+    ctxLinhas = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha);
+  }
+  const an = t => _iaAnonima(t, nome).slice(0, 1500);
+  // a chave identifica a fala do lead só para SUBSTITUIR o exemplo; guardada como resumo (sem o telefone)
+  const chave = require('crypto').createHash('sha1').update(String(b.chave || (phone + '|' + leadLinhas.join('|')))).digest('hex').slice(0, 12);
+  const ex = {
+    conversa: b.auto ? 'aprendido-sozinho' : 'aprendido', chave, contexto: ctxLinhas.map(an), lead: leadLinhas.map(an), resposta: enviadas.map(an),
+    origem: enviadas.every(t => sugerido.includes(t)) && sugerido.length ? 'aceita' : (b.usou ? 'editada' : 'propria'),
+    sugerido: sugerido.map(an), em: new Date().toISOString().slice(0, 10)
+  };
+  return await _iaMemNaFila(async () => {
+    const mem = await _iaMemoria(owner, true);
+    const iguais = e => JSON.stringify([e.lead, e.resposta]) === JSON.stringify([ex.lead, ex.resposta]);
+    const antigo = mem.exemplos.find(e => e.chave && e.chave === chave);
+    // o cartão ✨ guarda também o que foi SUGERIDO; a varredura não sobrescreve isso
+    if (b.auto && antigo && (antigo.origem === 'aceita' || antigo.origem === 'editada')) return { ok: true, guardado: false, motivo: 'o cartão já aprendeu esta fala', total: mem.exemplos.length };
+    let lista = mem.exemplos.filter(e => !(e.chave && e.chave === chave)); // a versão anterior desta mesma fala sai
+    if (lista.some(iguais)) return { ok: true, guardado: false, motivo: 'repetido', total: mem.exemplos.length };
+    lista = lista.concat([ex]);
+    const cabe = lista.length > 3000 ? lista.slice(lista.length - 3000) : lista; // teto: as mais recentes ficam
+    await _iaMemoriaGrava(owner, 'exemplos', cabe.map(o => JSON.stringify(o)).join('\n'));
+    return { ok: true, guardado: true, total: cabe.length, origem: ex.origem };
+  });
+}
+
+// ═════════ 🧠 A IA APRENDE COM CADA RESPOSTA DELA (não só pelo cartão ✨) ═════════
+// Ela pediu: "ele tem que aprender com cada resposta ou edição minha". Antes só entrava na
+// memória o que passava pelo cartão de sugestão; respondendo direto (PC, celular ou pelo
+// próprio WhatsApp) nada era aprendido. A cada 3 minutos esta varredura olha as conversas,
+// acha a resposta DELA escrita à mão (não é bot, não é resposta rápida, não é modelo, não tem
+// link) que já parou há 2 minutos (a rajada terminou) e guarda o par "o lead disse → ela
+// respondeu". A chave é a MESMA do cartão (telefone|id da última fala do lead), então o mesmo
+// diálogo nunca vira dois exemplos.
+const _iaAutoCache = {};
+async function _iaTextosAutomaticos(owner) {
+  const c = _iaAutoCache[owner || ' '];
+  if (c && Date.now() - c.t < 5 * 60000) return c.fixos;
+  const fixos = [];
+  const junta = (t) => { const fixo = String(t || '').split(/\{\{|\{/)[0].replace(/\s+/g, ' ').trim().toLowerCase(); if (fixo.length >= 12) fixos.push(fixo.slice(0, 60)); };
+  try { const { data } = await supabase.from('bot_nodes').select('config').eq('owner', owner || ' ');
+    for (const n of (data || [])) { let cfg = {}; try { cfg = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); } catch (_) {} junta(cfg.text); }
+  } catch (_) {}
+  try { const cat = await _iaCatalogo(owner); for (const r of (cat.rapidas || [])) junta(r.texto); } catch (_) {}
+  _iaAutoCache[owner || ' '] = { t: Date.now(), fixos };
+  return fixos;
+}
+const _iaEhAutomatica = (txt, fixos) => {
+  const t = String(txt || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!t) return true;
+  return (fixos || []).some(f => f === t || (f.length >= 20 && t.startsWith(f.slice(0, 40))));
+};
+let _iaVarridoAte = 0;
+async function _iaVarreRespostas() {
+  const owner = _CONTA_IA;
+  if (!supabase) return { novos: 0 };
+  if (!await _iaSugLigada(owner)) return { novos: 0 };
+  const agora = Date.now();
+  const desde = _iaVarridoAte || (agora - 30 * 60000);
+  const { data: brutas } = await supabase.from('messages').select('id, phone, direction, type, content, timestamp')
+    .eq('owner', owner || ' ').order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(300);
+  const quando = (ts) => { const d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(ts)) ? ts : String(ts) + 'Z'); return isNaN(d) ? 0 : d.getTime(); };
+  const porFone = new Map();
+  for (const m of (brutas || [])) { if (!m || m.type === 'note') continue; if (!porFone.has(m.phone)) porFone.set(m.phone, []); porFone.get(m.phone).push(m); }
+  const fixos = await _iaTextosAutomaticos(owner);
+  let novos = 0;
+  for (const [fone, lista] of porFone) { // lista: da mais nova para a mais antiga
+    let k = 0;
+    while (k < lista.length && lista[k].direction === 'inbound') k++; // o lead pode ter falado DEPOIS: a resposta dela continua valendo
+    if (k >= lista.length) continue;
+    const t = quando(lista[k].timestamp);
+    if (agora - t < 2 * 60000) continue; // a rajada dela pode não ter acabado
+    if (t <= desde) continue;            // esta conversa já foi olhada
+    const enviadas = []; let i = k, ok = true;
+    for (; i < lista.length && lista[i].direction === 'outbound'; i++) {
+      const m = lista[i], txt = String(m.content || '').trim();
+      if ((m.type && m.type !== 'text') || !txt || _iaTemLink(txt) || _iaEhAutomatica(txt, fixos)) { ok = false; break; } // bot, rápida, modelo, áudio, foto ou link: não é texto dela para aprender
+      enviadas.unshift(txt);
+    }
+    if (!ok || !enviadas.length || i >= lista.length || lista[i].direction !== 'inbound') continue;
+    // o que o lead disse ANTES desta resposta (e não o que ele mandou depois dela) + 4 linhas de contexto
+    let j = i; const doLead = [];
+    for (; j < lista.length && lista[j].direction === 'inbound'; j++) doLead.unshift(lista[j]);
+    const ctx = lista.slice(j, j + 4).slice().reverse().map(_iaLinha);
+    try {
+      const r = await _iaGuardaExemplo(owner, { phone: fone, enviado: enviadas, chave: fone + '|' + lista[i].id, auto: true,
+        lead: doLead.map(m => _iaLinha(m).replace(/^Lead: /, '')), contexto: ctx });
+      if (r && r.guardado) novos++;
+    } catch (e) { console.error('IA aprender sozinha:', e.message); }
+  }
+  _iaVarridoAte = agora - 2 * 60000;
+  if (novos) console.log('IA aprendeu sozinha com ' + novos + ' resposta(s) dela');
+  return { novos };
+}
+setTimeout(() => { _iaVarreRespostas().catch(() => {}); setInterval(() => { _iaVarreRespostas().catch(() => {}); }, 3 * 60000); }, 90000);
 
 // ═══════════════════════ Regra "contato errado" ═══════════════════════
 // Quando o cliente avisa que a mensagem foi para a pessoa errada, envia um
@@ -10749,4 +10834,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo };
