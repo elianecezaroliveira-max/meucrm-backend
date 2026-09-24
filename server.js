@@ -267,7 +267,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 315;
+const SERVER_VER = 316;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -435,8 +435,12 @@ async function _reacaoNaoLida(phone, owner, nome, previa) {
 // tique dela (nada de "Você: ...") e a conversa fica lida.
 // O filtro por last_message_direction evita atropelar uma mensagem do cliente
 // que tenha chegado no meio do caminho.
-async function _previaEnviada(owner, phone, status) {
+async function _previaEnviada(owner, phone, status, automatico) {
   if (!supabase || !phone) return;
+  if (automatico) { // envio de integração: só o tique da prévia; as não lidas ficam
+    try { await supabase.from('contacts').update({ last_message_status: status || null }).eq('phone', phone).eq('owner', owner || ' ').eq('last_message_direction', 'outbound'); } catch (_) {}
+    return;
+  }
   try {
     let tinhaNaoLida = false;
     try { const { data: c } = await supabase.from('contacts').select('unread_count').eq('phone', phone).eq('owner', owner || ' ').maybeSingle(); tinhaNaoLida = !!(c && c.unread_count > 0); } catch (_) {}
@@ -1973,7 +1977,7 @@ app.post("/send", async (req, res) => {
         // Inclui owner — sem ele a mensagem não aparece no CRM (o GET /messages filtra por owner)
         await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
         await supabase.from('messages').insert(await _comAutor({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, status: wamid ? 'sent' : 'pending', wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null }, req));
-        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', !!req._viaApiToken);
       }
       return res.json({ success: true, via: 'evolution' });
     } catch(e) {
@@ -2031,7 +2035,7 @@ app.post("/send", async (req, res) => {
         console.error("Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
       } else {
         await applyPendingStatus(wamid);
-        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', !!req._viaApiToken);
         console.log("Mensagem enviada salva no banco:", message.substring(0, 50));
       }
     }
@@ -2381,7 +2385,7 @@ app.post("/send-media", async (req, res) => {
           if (req._wfOut && req._wfOut.length && wamid)
             await supabase.from('messages').update({ waveform: JSON.stringify(Array.from(req._wfOut)) }).eq('wamid', wamid).eq('phone', to);
         } catch (_) {}
-        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', !!req._viaApiToken);
       }
       console.log(`Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
       // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
@@ -2484,7 +2488,7 @@ app.post("/send-media", async (req, res) => {
         media_id: mediaId, media_mime_type: sendMime, // permite exibir a mídia no CRM
       }, req));
       await applyPendingStatus(mediaWamid);
-      await _previaEnviada(req.owner, to, mediaWamid ? 'sent' : 'pending');
+      await _previaEnviada(req.owner, to, mediaWamid ? 'sent' : 'pending', !!req._viaApiToken);
     }
     // 🗄️ Guarda uma cópia do que EU enviei por 6 meses (a Meta apaga em ~30 dias)
     try { if (mediaId && token) arquivaMidiaApi(mediaId, token, sendMime).catch(() => {}); } catch (_) {}
@@ -5031,7 +5035,7 @@ app.post("/send-template", async (req, res) => {
       status: tplWamid ? 'sent' : 'pending', wamid: tplWamid, owner: req.owner || null,
     }, req));
     await applyPendingStatus(tplWamid);
-    await _previaEnviada(req.owner, to, tplWamid ? 'sent' : 'pending');
+    await _previaEnviada(req.owner, to, tplWamid ? 'sent' : 'pending', !!req._viaApiToken);
     console.log("Template enviado:", template_name, "→", to, "wamid:", tplWamid);
     res.json({ success: true, data: response.data });
   } catch (err) {
@@ -5345,18 +5349,9 @@ async function botTypingPulse(phone, accountId) {
       await sock.sendPresenceUpdate('composing', jid);
       return 'qr';
     }
-    if (acct.phone_number_id && acct.token) {
-      const { data: lastIn } = await supabase.from('messages').select('wamid')
-        .eq('phone', phone).eq('direction', 'inbound').eq('account_id', accountId)
-        .not('wamid', 'is', null).order('timestamp', { ascending: false }).limit(1).maybeSingle();
-      if (lastIn?.wamid) {
-        await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`, {
-          messaging_product: 'whatsapp', status: 'read', message_id: lastIn.wamid,
-          typing_indicator: { type: 'text' }
-        }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } }).catch(() => {});
-        return 'cloud';
-      }
-    }
+    // API oficial: o "digitando…" da Meta só existe junto com MARCAR COMO LIDA a mensagem
+    // do lead (ele vê os tiques azuis). O bot nunca lê por você — então na API oficial o
+    // bot não mostra "digitando…" (no QR mostra, porque lá não marca nada).
   } catch (_) {}
   return null;
 }
@@ -5367,7 +5362,7 @@ async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
   const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
   await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
   await supabase.from('messages').insert(await _comAutor({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, status: wamid ? 'sent' : 'pending', wamid: wamid || null, owner: req.owner || null }, req));
-  await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+  await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', !!req._viaApiToken);
 }
 
 // 📍 Enviar localização (QR e API oficial)
@@ -5965,7 +5960,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
       timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: wamid || null,
       owner: owner || null, media_id: _mediaPath, media_mime_type: _mediaMime,
     });
-    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
+    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
   };
   // 🔎 O WhatsApp baixa a foto pelo link. Se o link não abrir, o envio "vai" mas
   // chega sem imagem — então conferimos ANTES e avisamos com clareza.
@@ -6033,7 +6028,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
         const ts = new Date().toISOString();
         await supabase.from('messages').insert({ phone, content: text, type: 'text', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid, owner: owner || null });
         const prev = text.length > 80 ? text.substring(0, 80) + '…' : text;
-        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
+        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
       }
       return wamid || true;
     } catch (e) {
@@ -6058,7 +6053,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       // last_message_status: null é OBRIGATÓRIO — sem isso a prévia herdava o "lida"
       // da mensagem anterior e a cura retroativa pintava a mensagem do bot de azul
-      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null, unread_count:0, first_unread_at:null }).eq('phone',phone).eq('owner',owner||' '); // enviou de verdade → a conversa fica lida
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null }).eq('phone',phone).eq('owner',owner||' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
     }
     return wamid;
   } catch(e) {
@@ -6183,7 +6178,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       const tWamid = r.data?.messages?.[0]?.id || null;
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
-      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
       return tWamid || true;
     }
     return true;
@@ -11077,7 +11072,7 @@ app.post('/evolution-webhook', async (req, res) => {
       // Eco de uma mensagem que o PRÓPRIO servidor mandou (VETRA ou bot)? Dá
       // tempo de o CRM gravar a dele (o eco costuma voltar antes) — a checagem
       // "já existe" abaixo então a reconhece e nada duplica.
-      const ecoDoServidor = fromMe && _ehEcoDoServidor(wamid);
+      const ecoDoServidor = fromMe && (_ehEcoDoServidor(wamid) || (!!wamid && await _jaGravada(wamid, null))); // já gravada pelo servidor = envio do VETRA/bot, não resposta sua pelo celular
       if (ecoDoServidor) await new Promise(r => setTimeout(r, 1500));
 
       // Busca account_id + dono (owner) — sem o owner a mensagem não aparece no CRM
