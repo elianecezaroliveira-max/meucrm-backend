@@ -228,7 +228,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 310;
+const SERVER_VER = 311;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -4690,7 +4690,18 @@ async function _agLer(owner) {
   try { const v = data?.value ? JSON.parse(data.value) : []; return Array.isArray(v) ? v : []; } catch (_) { return []; }
 }
 async function _agSalvar(owner, lista) {
-  await supabase.from('settings').upsert({ key: _AG_CHAVE(owner), value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+  await supabase.from('settings').upsert({ key: _AG_CHAVE(owner), value: JSON.stringify(lista), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+}
+// 🔒 UMA alteração por dono de cada vez. A lista inteira é lida, mudada e regravada — e o
+// motor (que tira as que já saíram) mexia nela ao mesmo tempo que a tela (que agenda ou
+// cancela). No segundo exato do disparo, o agendamento novo sumia; ou uma já enviada
+// voltava para a lista e saía DE NOVO. Agora cada mexida espera a anterior e relê a lista
+// fresca aqui dentro, nunca uma cópia velha.
+const _agFila = {};
+function _agNaFila(chave, fn) {
+  const p = (_agFila[chave] || Promise.resolve()).then(fn, fn);
+  _agFila[chave] = p.then(() => {}, () => {});
+  return p;
 }
 app.get('/scheduled', async (req, res) => {
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
@@ -4711,47 +4722,58 @@ app.post('/scheduled', async (req, res) => {
   if (!account_id) return res.status(400).json({ error: 'Escolha por qual número a mensagem vai sair' });
   const { data: a } = await supabase.from('accounts').select('id').eq('id', account_id).eq('owner', req.owner).maybeSingle();
   if (!a) return res.status(400).json({ error: 'Esse número não é desta conta' });
-  const lista = await _agLer(req.owner);
-  if (lista.length >= 200) return res.status(400).json({ error: 'Limite de 200 mensagens agendadas ao mesmo tempo' });
   const item = {
     id: 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
     phone: to, text: message, account_id,
     at: new Date(quando).toISOString(),
     criada_em: new Date().toISOString(), por: req.usuario || null
   };
-  lista.push(item);
-  await _agSalvar(req.owner, lista);
+  const erro = await _agNaFila(_AG_CHAVE(req.owner), async () => {
+    const lista = await _agLer(req.owner);
+    if (lista.length >= 200) return 'Limite de 200 mensagens agendadas ao mesmo tempo';
+    lista.push(item);
+    await _agSalvar(req.owner, lista);
+    return null;
+  });
+  if (erro) return res.status(400).json({ error: erro });
   res.json({ success: true, item });
 });
 app.delete('/scheduled/:id', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
-  const lista = await _agLer(req.owner);
-  const nova = lista.filter(x => String(x.id) !== String(req.params.id));
-  if (nova.length === lista.length) return res.status(404).json({ error: 'Agendamento não encontrado' });
-  await _agSalvar(req.owner, nova);
+  const achou = await _agNaFila(_AG_CHAVE(req.owner), async () => {
+    const lista = await _agLer(req.owner);
+    const nova = lista.filter(x => String(x.id) !== String(req.params.id));
+    if (nova.length === lista.length) return false;
+    await _agSalvar(req.owner, nova);
+    return true;
+  });
+  if (!achou) return res.status(404).json({ error: 'Agendamento não encontrado' });
   res.json({ success: true });
 });
 // Motor: a cada 30s manda o que já venceu. A lista é gravada ANTES do envio,
 // para que uma queda do servidor no meio nunca mande a mesma mensagem duas vezes.
 let _agRodando = false;
-setInterval(async () => {
+async function _agTick() {
   if (!supabase || _agRodando) return;
   _agRodando = true;
   try {
     const { data } = await supabase.from('settings').select('key, value').like('key', 'agendadas::%');
     for (const linha of (data || [])) {
-      let lista = [];
-      try { lista = JSON.parse(linha.value || '[]'); } catch (_) { continue; }
-      if (!Array.isArray(lista) || !lista.length) continue;
-      const agora = Date.now();
-      const vencidas = lista.filter(x => new Date(x.at).getTime() <= agora);
-      if (!vencidas.length) continue;
-      const restam = lista.filter(x => new Date(x.at).getTime() > agora);
-      await supabase.from('settings').upsert({ key: linha.key, value: JSON.stringify(restam), updated_at: new Date().toISOString() });
       const donoBruto = linha.key.slice('agendadas::'.length);
       const dono = donoBruto === ' ' ? null : donoBruto;
-      for (const it of vencidas) {
+      // dentro da fila: relê a lista fresca, tira as que venceram e grava ANTES de enviar
+      // (queda do servidor no meio nunca manda a mesma mensagem duas vezes)
+      const vencidas = await _agNaFila(linha.key, async () => {
+        const lista = await _agLer(dono);
+        if (!lista.length) return [];
+        const agora = Date.now();
+        const venc = lista.filter(x => new Date(x.at).getTime() <= agora);
+        if (!venc.length) return [];
+        await _agSalvar(dono, lista.filter(x => new Date(x.at).getTime() > agora));
+        return venc;
+      });
+      for (const it of (vencidas || [])) {
         try {
           stopBotRunsForPhone(it.phone, dono); // é um envio seu: o bot deste lead para
           await sendBotMsg(it.phone, it.account_id, it.text, dono, it.account_id, null);
@@ -4761,7 +4783,8 @@ setInterval(async () => {
     }
   } catch (e) { console.error('tick agendadas:', e.message); }
   finally { _agRodando = false; }
-}, 30000);
+}
+setInterval(_soMaestro(_agTick), 30000);
 
 app.put('/messages/:id/pin', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -6698,33 +6721,36 @@ async function _acoesPendLer(owner) {
   try { const v = data?.value ? JSON.parse(data.value) : []; return Array.isArray(v) ? v : []; } catch (_) { return []; }
 }
 async function _acoesPendSalvar(owner, lista) {
-  await supabase.from('settings').upsert({ key: 'acoes_agendadas::' + (owner || ' '), value: JSON.stringify(lista), updated_at: new Date().toISOString() });
+  await supabase.from('settings').upsert({ key: 'acoes_agendadas::' + (owner || ' '), value: JSON.stringify(lista), updated_at: new Date().toISOString() }, { onConflict: 'key' });
 }
 let _acoesRodando = false;
-setInterval(async () => {
+async function _acoesTick() {
   if (!supabase || _acoesRodando) return;
   _acoesRodando = true;
   try {
     const { data } = await supabase.from('settings').select('key, value').like('key', 'acoes_agendadas::%');
     for (const linha of (data || [])) {
-      let lista = []; try { lista = JSON.parse(linha.value || '[]'); } catch (_) { continue; }
-      if (!Array.isArray(lista) || !lista.length) continue;
-      const agora = Date.now();
-      const vencidas = lista.filter(x => new Date(x.at).getTime() <= agora);
-      if (!vencidas.length) continue;
-      const restam = lista.filter(x => new Date(x.at).getTime() > agora);
       const donoBruto = linha.key.slice('acoes_agendadas::'.length);
       const dono = donoBruto === ' ' ? null : donoBruto;
-      // grava PRIMEIRO: queda do servidor no meio não repete a ação
-      await _acoesPendSalvar(dono, restam);
-      for (const it of vencidas) {
+      // mesma fila das agendadas: relê aqui dentro e grava ANTES de executar
+      const vencidas = await _agNaFila(linha.key, async () => {
+        const lista = await _acoesPendLer(dono);
+        if (!lista.length) return [];
+        const agora = Date.now();
+        const venc = lista.filter(x => new Date(x.at).getTime() <= agora);
+        if (!venc.length) return [];
+        await _acoesPendSalvar(dono, lista.filter(x => new Date(x.at).getTime() > agora));
+        return venc;
+      });
+      for (const it of (vencidas || [])) {
         try { await _execAcaoEtapa(it.acao, it.phone, it.stage_id, dono, 1); }
         catch (e) { console.error('ação com espera falhou:', e.message); }
       }
     }
   } catch (e) { console.error('ciclo das ações com espera:', e.message); }
   finally { _acoesRodando = false; }
-}, 30000);
+}
+setInterval(_soMaestro(_acoesTick), 30000);
 
 // Executa UMA ação de etapa (usada na hora e também pelas ações com espera)
 async function _execAcaoEtapa(a, phone, stageId, owner, depth = 0) {
@@ -11036,4 +11062,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _maestroReset: () => { _maestroChecado = 0; }, _EU };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU };
