@@ -21,6 +21,50 @@ if (SUPABASE_URL && SUPABASE_KEY) {
   console.log("Supabase conectado!");
 }
 
+// ═══════ 🔑 UM MAESTRO SÓ (para poder rodar mais de um servidor ao mesmo tempo) ═══════
+// Os trabalhos de fundo (gotejamento, agendadas, ações agendadas, lembretes, planilha,
+// backup, faxina, aprendizado da IA) NÃO podem rodar em dois processos ao mesmo tempo:
+// o lead seria movido duas vezes e o agendamento sairia em dobro. O primeiro processo que
+// carimba a chave 'maestro_bg' no banco manda; os outros ficam de reserva e assumem
+// sozinhos se o maestro sumir por mais de 90 segundos. Atender o app e o webhook continua
+// em TODOS os processos (isso pode e deve ser paralelo).
+const _EU = 'p' + process.pid + '-' + Math.random().toString(36).slice(2, 7);
+const _MAESTRO_K = 'maestro_bg';
+let _souMaestro = false, _maestroChecado = 0;
+async function _euSouMaestro() {
+  if (!supabase) return true;                        // sem banco (bancada/local): faz tudo
+  if (process.env.SEM_MAESTRO === '1') return true;  // escape, se um dia atrapalhar
+  const agora = Date.now();
+  if (agora - _maestroChecado < 20000) return _souMaestro;
+  _maestroChecado = agora;
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', _MAESTRO_K).maybeSingle();
+    let v = {}; try { v = JSON.parse((data && data.value) || '{}'); } catch (_) {}
+    if (v.quem && v.quem !== _EU && agora - (Number(v.em) || 0) < 90000) { _souMaestro = false; return false; }
+    await supabase.from('settings').upsert({ key: _MAESTRO_K, value: JSON.stringify({ quem: _EU, em: agora }), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    await new Promise(r => setTimeout(r, 400)); // se dois assumirem juntos, o último a gravar fica
+    const { data: d2 } = await supabase.from('settings').select('value').eq('key', _MAESTRO_K).maybeSingle();
+    let v2 = {}; try { v2 = JSON.parse((d2 && d2.value) || '{}'); } catch (_) {}
+    const era = _souMaestro;
+    _souMaestro = v2.quem === _EU;
+    if (_souMaestro !== era) console.log(_souMaestro ? 'Este servidor assumiu os trabalhos de fundo' : 'Outro servidor está com os trabalhos de fundo (' + v2.quem + ') — este fica de reserva');
+    return _souMaestro;
+  } catch (e) { console.error('maestro:', e.message); return _souMaestro; } // erro de banco: mantém o que era
+}
+const _soMaestro = (fn) => async (...a) => { try { if (!await _euSouMaestro()) return; } catch (_) {} return fn(...a); };
+// Já gravada? O carimbo de chegada vive na MEMÓRIA do processo — com dois servidores no ar
+// um não enxerga o carimbo do outro e a mesma mensagem entrava duas vezes. O wamid no banco
+// enxerga (e também pega a reentrega da Meta depois de um reinício).
+async function _jaGravada(wamid, owner) {
+  if (!supabase || !wamid) return false;
+  try {
+    let q = supabase.from('messages').select('id').eq('wamid', wamid).limit(1);
+    if (owner) q = q.eq('owner', owner);
+    const { data } = await q;
+    return !!(data && data.length);
+  } catch (_) { return false; }
+}
+
 // ── Multi-tenant: identifica o usuário logado (dono) a partir do token do Supabase ──
 const SUPABASE_ANON = process.env.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_xoU54iyT3KyxNR6i7fh3aw_1qpEKpua';
 const _tokenOwner = {}; // cache token -> { email, ts }
@@ -184,7 +228,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 308;
+const SERVER_VER = 310;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -843,6 +887,7 @@ app.post("/webhook", async (req, res) => {
         if (accountId) messageData.account_id = accountId; // só inclui se não for null
         if (ownerEmail) messageData.owner = ownerEmail;
 
+        if (message.id && await _jaGravada(message.id, ownerEmail)) { console.log('↩️ Mensagem já gravada (outro servidor ou reentrega):', message.id); continue; }
         const { error: msgErr } = await supabase.from("messages").insert(messageData);
 
         // 🗄️ Guarda uma cópia do arquivo por 6 meses (a Meta apaga em ~30 dias)
@@ -2623,7 +2668,7 @@ async function _faxinaCompleta() {
   await _limpaMidiasAntigas().catch(() => {});
   return await _podaPorEspaco();
 }
-setTimeout(() => { _faxinaCompleta(); setInterval(_faxinaCompleta, 24 * 3600 * 1000); }, 5 * 60000);
+setTimeout(() => { _soMaestro(_faxinaCompleta)(); setInterval(_soMaestro(_faxinaCompleta), 24 * 3600 * 1000); }, 5 * 60000);
 
 // 🔑 Quem pode ver/forçar a faxina: quem está logada no CRM, quem manda o token
 // de integração, ou — e isso é o socorro quando o Supabase restringe o projeto e
@@ -3936,7 +3981,7 @@ setTimeout(async () => {
     }
   } catch (e) { console.error('migração das regras antigas:', e.message); }
 }, 20000);
-setTimeout(() => { _dripTick(); setInterval(_dripTick, 2000); }, 30000);
+setTimeout(() => { _soMaestro(_dripTick)(); setInterval(_soMaestro(_dripTick), 2000); }, 30000);
 
 app.get('/drip', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -7859,7 +7904,7 @@ async function _iaVarreRespostas() {
   if (novos) console.log('IA aprendeu sozinha com ' + novos + ' resposta(s) dela');
   return { novos };
 }
-setTimeout(() => { _iaVarreRespostas().catch(() => {}); setInterval(() => { _iaVarreRespostas().catch(() => {}); }, 3 * 60000); }, 90000);
+setTimeout(() => { _soMaestro(_iaVarreRespostas)().catch(() => {}); setInterval(() => { _soMaestro(_iaVarreRespostas)().catch(() => {}); }, 3 * 60000); }, 90000);
 
 // ═══════════════════════ Regra "contato errado" ═══════════════════════
 // Quando o cliente avisa que a mensagem foi para a pessoa errada, envia um
@@ -8975,7 +9020,7 @@ async function _backupAutoTodos() {
   } catch (e) { console.error('Backup automático:', e.message); }
 }
 // 10 min depois de subir e depois 1x por dia
-setTimeout(() => { _backupAutoTodos(); setInterval(_backupAutoTodos, 24 * 3600 * 1000); }, 10 * 60000);
+setTimeout(() => { _soMaestro(_backupAutoTodos)(); setInterval(_soMaestro(_backupAutoTodos), 24 * 3600 * 1000); }, 10 * 60000);
 
 app.get('/backup/auto', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
@@ -9622,7 +9667,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(maestro_bg|owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|.*token.*|.*secret.*)$/i;
 // ── PÁGINA PÚBLICA (Termos e Privacidade) ──────────────────────────
 // privacy.html e terms.html ficam FORA do login: a Meta, o cliente e qualquer
 // pessoa precisam conseguir abrir. Estas páginas mostram a razão social, o CNPJ
@@ -9665,6 +9710,87 @@ app.put('/settings/:key', async (req, res) => {
   _settings[k] = value;
   res.json({ success: true });
 });
+
+
+// ═══════════ 🩺 O BANCO ESTÁ COMPLETO? (para um cliente novo entrar sozinho) ═══════════
+// Cada recurso que chegou depois do começo precisou de uma coluna/tabela nova no Supabase.
+// Antes, quem instalava tinha de saber quais arquivos .sql rodar e em que ordem — se
+// esquecesse um, a tela quebrava sem dizer por quê. Agora o próprio servidor confere e
+// entrega o SQL do que falta, pronto para colar no Supabase (Configurações ▸ Diagnóstico).
+const _ESQUEMA = [
+  { tabela: 'settings', para: 'guardar os ajustes (é a base de tudo)', sql: "create table if not exists settings (key text primary key, value text, updated_at timestamptz default now());" },
+  { tabela: 'accounts', para: 'os números de WhatsApp', sql: null },
+  { tabela: 'contacts', para: 'as conversas', sql: null },
+  { tabela: 'messages', para: 'as mensagens', sql: null },
+  { tabela: 'tasks', para: 'as tarefas', sql: null },
+  { tabela: 'bots', para: 'os bots', sql: null },
+  { tabela: 'bot_nodes', para: 'os passos dos bots', sql: null },
+  { tabela: 'bot_edges', para: 'as ligações dos bots', sql: null },
+  { tabela: 'bot_runs', para: 'os bots em andamento', sql: null },
+  { tabela: 'pipeline_stages', para: 'as etapas do funil', sql: null },
+  { tabela: 'push_subscriptions', para: 'o aviso no celular (push)', sql: "create table if not exists push_subscriptions (endpoint text primary key, owner text, subscription jsonb not null, updated_at timestamptz default now());" },
+  { tabela: 'wa_sessions', para: 'a conexão por QR Code sobreviver a reinícios', sql: "create table if not exists wa_sessions (instance text not null, key text not null, data jsonb not null, updated_at timestamptz default now(), primary key (instance, key));" },
+  { tabela: 'faqs', para: 'as respostas automáticas', sql: "create table if not exists faqs (id bigserial primary key, owner text, question text not null, triggers text not null default '', answer text not null, enabled boolean not null default true, created_at timestamptz default now(), updated_at timestamptz default now());\ncreate index if not exists faqs_owner_idx on faqs(owner);" },
+  { tabela: 'faq_replies', para: 'não repetir a mesma resposta automática', sql: "create table if not exists faq_replies (id bigserial primary key, owner text, phone text not null, faq_id bigint not null, sent_at timestamptz default now());\ncreate unique index if not exists faq_replies_unq on faq_replies(owner, phone, faq_id);" },
+  { tabela: 'contacts', coluna: 'favorite', para: 'favoritar conversa', sql: 'alter table contacts add column if not exists favorite boolean default false;' },
+  { tabela: 'contacts', coluna: 'pinned', para: 'fixar conversa no topo', sql: 'alter table contacts add column if not exists pinned boolean default false;' },
+  { tabela: 'contacts', coluna: 'muted', para: 'silenciar conversa', sql: 'alter table contacts add column if not exists muted boolean default false;' },
+  { tabela: 'contacts', coluna: 'email', para: 'e-mail do lead nas anotações', sql: 'alter table contacts add column if not exists email text;' },
+  { tabela: 'contacts', coluna: 'created_at', para: 'a data em que o lead entrou', sql: 'alter table contacts add column if not exists created_at timestamptz default now();\nupdate contacts set created_at = coalesce(created_at, last_message_at, now()) where created_at is null;' },
+  { tabela: 'contacts', coluna: 'last_message_status', para: 'os tiques na lista de conversas', sql: 'alter table contacts add column if not exists last_message_status text;' },
+  { tabela: 'messages', coluna: 'transcript', para: 'a transcrição dos áudios', sql: 'alter table messages add column if not exists transcript text;' },
+  { tabela: 'messages', coluna: 'sent_by', para: 'mostrar quem da equipe enviou', sql: 'alter table messages add column if not exists sent_by text;\ncreate index if not exists messages_sent_by_idx on messages (sent_by);' },
+  { tabela: 'messages', coluna: 'starred', para: 'favoritar mensagem', sql: 'alter table messages add column if not exists starred boolean default false;' },
+  { tabela: 'messages', coluna: 'pinned', para: 'fixar mensagem', sql: 'alter table messages add column if not exists pinned boolean default false;' },
+  { tabela: 'messages', coluna: 'delivered_at', para: 'a hora da entrega', sql: 'alter table messages add column if not exists delivered_at timestamptz;' },
+  { tabela: 'messages', coluna: 'read_at', para: 'a hora da leitura', sql: 'alter table messages add column if not exists read_at timestamptz;' },
+  { tabela: 'messages', coluna: 'edited', para: 'o selo "editada"', sql: 'alter table messages add column if not exists edited boolean default false;' },
+  { tabela: 'messages', coluna: 'waveform', para: 'o desenho do áudio', sql: 'alter table messages add column if not exists waveform text;' },
+  { tabela: 'messages', coluna: 'forwarded', para: 'a etiqueta "Encaminhada"', sql: 'alter table messages add column if not exists forwarded boolean default false;' },
+  { tabela: 'tasks', coluna: 'created_at', para: 'a data de criação da tarefa', sql: 'alter table tasks add column if not exists created_at timestamptz default now();' },
+  { rpc: 'rr_next', para: 'o rodízio de números não repetir com dois leads ao mesmo tempo', sql: "create or replace function rr_next(p_key text) returns bigint language plpgsql as $$\ndeclare cur bigint;\nbegin\n  insert into settings(key, value, updated_at) values (p_key, '1', now())\n    on conflict (key) do update set value = (coalesce(nullif(settings.value, '')::bigint, 0) + 1)::text, updated_at = now()\n    returning (settings.value::bigint - 1) into cur;\n  return cur;\nend;\n$$;" },
+];
+let _bancoCache = null;
+async function _confereBanco(semCache) {
+  if (!supabase) return { ok: false, motivo: 'sem banco', faltando: [] };
+  if (_bancoCache && !semCache && Date.now() - _bancoCache.t < 10 * 60000) return _bancoCache.r;
+  const faltando = [];
+  for (const item of _ESQUEMA) {
+    try {
+      if (item.rpc) {
+        const { error } = await supabase.rpc(item.rpc, { p_key: 'diag_rr::conferencia' });
+        if (error && /function|does not exist|schema cache/i.test(error.message || '')) faltando.push(item);
+        continue;
+      }
+      const { error } = await supabase.from(item.tabela).select(item.coluna || '*').limit(1);
+      if (!error) continue;
+      const m = String(error.message || '') + ' ' + String(error.code || '');
+      if (/does not exist|schema cache|42P01|42703|PGRST20[0-9]/i.test(m)) faltando.push(item);
+    } catch (_) {}
+  }
+  const r = {
+    ok: faltando.length === 0,
+    faltando: faltando.map(f => ({ o_que: f.coluna ? (f.tabela + '.' + f.coluna) : (f.tabela || ('função ' + f.rpc)), para: f.para, sql: f.sql || null, sem_conserto: !f.sql })),
+    sql: faltando.filter(f => f.sql).map(f => '-- ' + (f.coluna ? f.tabela + '.' + f.coluna : (f.rpc || f.tabela)) + ' — ' + f.para + '\n' + f.sql).join('\n\n'),
+    sql_tudo: _ESQUEMA.filter(f => f.sql).map(f => '-- ' + (f.coluna ? f.tabela + '.' + f.coluna : (f.rpc || f.tabela)) + ' — ' + f.para + '\n' + f.sql).join('\n\n'),
+    conferido_em: new Date().toISOString(),
+  };
+  _bancoCache = { t: Date.now(), r };
+  return r;
+}
+// GET /diagnostico/banco — o que falta no Supabase (e o SQL pronto para colar)
+app.get('/diagnostico/banco', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  try { res.json(await _confereBanco(String(req.query.forcar || '') === '1')); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Na subida: avisa no log o que falta (só o maestro, para não repetir com vários servidores)
+setTimeout(() => { _soMaestro(async () => {
+  const r = await _confereBanco(true);
+  if (!r || r.ok) return console.log('Banco completo: nada a atualizar no Supabase');
+  console.log('⚠️ Faltam ' + r.faltando.length + ' item(ns) no banco: ' + r.faltando.map(f => f.o_que).join(', ')
+    + ' — abra Configurações ▸ Diagnóstico e copie o SQL.');
+})().catch(() => {}); }, 25000);
 
 // ═══════════════════════════════════════
 // NOTIFICAÇÕES PUSH (Web Push / PWA)
@@ -10865,6 +10991,7 @@ app.post('/evolution-webhook', async (req, res) => {
         if (accountId) msgData.account_id = accountId;
         if (ownerEmail) msgData.owner = ownerEmail;
         if (data.mediaPath) { msgData.media_id = data.mediaPath; msgData.media_mime_type = data.mediaMime || null; }
+        if (wamid && await _jaGravada(wamid, ownerEmail)) { console.log('↩️ Mensagem já gravada (outro servidor ou reentrega):', wamid); return; }
         const { error: mErr } = await supabase.from('messages').insert(msgData);
         if (mErr) { console.error('Evolution: erro ao salvar mensagem:', mErr.message); if (_carimboQR) _carimbos.delete(_carimboQR); } // não gravou: uma reentrega pode tentar de novo
         // Extras opcionais (não quebram se as colunas não existirem no banco)
@@ -10909,4 +11036,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _maestroReset: () => { _maestroChecado = 0; }, _EU };
