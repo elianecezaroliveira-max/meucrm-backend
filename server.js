@@ -267,7 +267,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 316;
+const SERVER_VER = 317;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5349,9 +5349,20 @@ async function botTypingPulse(phone, accountId) {
       await sock.sendPresenceUpdate('composing', jid);
       return 'qr';
     }
-    // API oficial: o "digitando…" da Meta só existe junto com MARCAR COMO LIDA a mensagem
-    // do lead (ele vê os tiques azuis). O bot nunca lê por você — então na API oficial o
-    // bot não mostra "digitando…" (no QR mostra, porque lá não marca nada).
+    // API oficial: o "digitando…" da Meta vem junto com LIDA na mensagem do lead. Só roda
+    // na pausa antes de uma MENSAGEM DO BOT — e mensagem do bot marca a conversa como lida.
+    if (acct.phone_number_id && acct.token) {
+      const { data: lastIn } = await supabase.from('messages').select('wamid')
+        .eq('phone', phone).eq('direction', 'inbound').eq('account_id', accountId)
+        .not('wamid', 'is', null).order('timestamp', { ascending: false }).limit(1).maybeSingle();
+      if (lastIn?.wamid) {
+        await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`, {
+          messaging_product: 'whatsapp', status: 'read', message_id: lastIn.wamid,
+          typing_indicator: { type: 'text' }
+        }, { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } }).catch(() => {});
+        return 'cloud';
+      }
+    }
   } catch (_) {}
   return null;
 }
@@ -5936,7 +5947,7 @@ async function _acctPadraoDoLead(phone, owner) {
 }
 
 // 📷 FOTO DO BOT: envia a imagem (link público) com o texto como legenda
-async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
+async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner, doBot) {
   const ts = new Date().toISOString();
   const prev = legenda ? (legenda.length > 80 ? legenda.slice(0, 80) + '…' : legenda) : '[Imagem]';
   // Caminho da foto no NOSSO cofre (o link é .../bot-media/<arquivo>): guardar isso
@@ -5960,7 +5971,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
       timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: wamid || null,
       owner: owner || null, media_id: _mediaPath, media_mime_type: _mediaMime,
     });
-    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
+    await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, ...(doBot ? { unread_count: 0, first_unread_at: null } : {}) }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // SÓ o BOT marca como lida ao enviar (IA, agendada e integração não)
   };
   // 🔎 O WhatsApp baixa a foto pelo link. Se o link não abrir, o envio "vai" mas
   // chega sem imagem — então conferimos ANTES e avisamos com clareza.
@@ -5989,7 +6000,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
   return wamid;
 }
 
-async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) {
+async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, doBot) { // doBot = enviado por um passo do BOT (marca a conversa como lida)
   let acct, usedAcctId;
   if (nodeAccountId) {
     // Nó com número CONFIGURADO: obedece exatamente — sem troca automática
@@ -6012,7 +6023,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
   const phoneNumberId = acct.phone_number_id, token = acct.token;
   // 📷 Passo com FOTO: manda a imagem (o texto vira legenda)
   if (imgUrl) {
-    try { return await sendBotFoto(phone, acct, usedAcctId, imgUrl, text, owner); }
+    try { return await sendBotFoto(phone, acct, usedAcctId, imgUrl, text, owner, doBot); }
     catch (e) {
       console.error('Bot foto:', e.response?.data || e.message);
       await _recordBotFail(phone, text || '[Imagem]', 'Falha ao enviar a foto do bot: ' + (metaErrorText(e.response?.data?.error) || e.message || ''), usedAcctId, owner, 'text');
@@ -6028,7 +6039,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
         const ts = new Date().toISOString();
         await supabase.from('messages').insert({ phone, content: text, type: 'text', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid, owner: owner || null });
         const prev = text.length > 80 ? text.substring(0, 80) + '…' : text;
-        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
+        await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, ...(doBot ? { unread_count: 0, first_unread_at: null } : {}) }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // SÓ o BOT marca como lida ao enviar (IA, agendada e integração não)
       }
       return wamid || true;
     } catch (e) {
@@ -6053,7 +6064,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
       const prev = text.length>80 ? text.substring(0,80)+'…' : text;
       // last_message_status: null é OBRIGATÓRIO — sem isso a prévia herdava o "lida"
       // da mensagem anterior e a cura retroativa pintava a mensagem do bot de azul
-      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null }).eq('phone',phone).eq('owner',owner||' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
+      await supabase.from('contacts').update({ last_message_at:ts, last_message_preview:prev, last_message_direction:'outbound', last_message_status:null, ...(doBot ? { unread_count:0, first_unread_at:null } : {}) }).eq('phone',phone).eq('owner',owner||' '); // enviou de verdade → a conversa fica lida // SÓ o BOT marca como lida ao enviar (IA, agendada e integração não)
     }
     return wamid;
   } catch(e) {
@@ -6128,7 +6139,7 @@ function renderTemplateBody(bodyText, vars) {
 }
 
 // Envia um MODELO aprovado pelo bot (com variáveis no corpo)
-async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
+async function sendBotTemplate(phone, accountId, cfg, name, notes, owner, doBot) {
   let acct, usedAcctId;
   if (cfg.account_id) {
     // Nó com número CONFIGURADO: obedece exatamente — ou envia por ele, ou FALHA.
@@ -6178,7 +6189,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       const tWamid = r.data?.messages?.[0]?.id || null;
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
-      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // envio AUTOMÁTICO não lê a conversa por você: as não lidas ficam
+      await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, ...(doBot ? { unread_count: 0, first_unread_at: null } : {}) }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida // SÓ o BOT marca como lida ao enviar (IA, agendada e integração não)
       return tWamid || true;
     }
     return true;
@@ -6452,11 +6463,11 @@ async function processNode(run, depth=0) {
       run.account_id = cfg.account_id; // os próximos passos herdam este número
     }
     if (cfg.mode === 'template' && cfg.template_name) {
-      sendOk = await sendBotTemplate(phone, acctId, { ...cfg, account_id: nodeAcct }, name, notes, botOwner);
+      sendOk = await sendBotTemplate(phone, acctId, { ...cfg, account_id: nodeAcct }, name, notes, botOwner, true);
     } else {
       const text = applyVars(cfg.text || '', name, phone, notes);
       // Passo pode ter FOTO (com o texto de legenda) — sem texto e sem foto = nada a fazer
-      sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null) : true;
+      sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null, true) : true;
     }
     // A Meta (e o QR) aceitam a mensagem e só DEPOIS avisam que falhou (fora da
     // janela de 24 h, número inválido…). Regra: só avança se NÃO falhou — espera
