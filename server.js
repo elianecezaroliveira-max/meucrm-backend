@@ -267,7 +267,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 317;
+const SERVER_VER = 318;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3313,8 +3313,8 @@ app.get('/search/messages', async (req, res) => {
   if (!supabase) return res.json([]);
   const raw = String(req.query.q || '').trim();
   if (raw.length < 2) return res.json([]);
-  const term = raw.replace(/[,()%]/g, ' ').trim();
-  const like = `%${term}%`;
+  const term = raw.replace(/[,()%_]/g, ' ').trim();
+  const like = `%${_padraoBusca(term)}%`; // com ou sem acento acha igual
   const { account_id } = req.query;
   const OW = req.owner || ' ';
   // "Mostrar mais mensagens": continua a partir da mais antiga que já apareceu
@@ -3323,19 +3323,20 @@ app.get('/search/messages', async (req, res) => {
   try {
     let q = supabase.from('messages').select('id, phone, content, transcript, direction, timestamp, type, account_id')
       .eq('owner', OW).or(`content.ilike.${like},transcript.ilike.${like}`)
-      .order('timestamp', { ascending: false }).limit(60);
+      .order('timestamp', { ascending: false }).limit(120); // pede mais: parte cai na peneira
     if (account_id) q = q.eq('account_id', account_id);
     if (antesOk) q = q.lt('timestamp', antesOk);
     let { data, error } = await q;
     if (error && /transcript/i.test(error.message || '')) { // sem a coluna ainda
       let q2 = supabase.from('messages').select('id, phone, content, direction, timestamp, type, account_id')
-        .eq('owner', OW).ilike('content', like).order('timestamp', { ascending: false }).limit(60);
+        .eq('owner', OW).ilike('content', like).order('timestamp', { ascending: false }).limit(120);
       if (account_id) q2 = q2.eq('account_id', account_id);
       if (antesOk) q2 = q2.lt('timestamp', antesOk);
       ({ data, error } = await q2);
     }
     if (error) return res.status(500).json({ error: error.message });
-    const rows = data || [];
+    // peneira: o "_" casa com qualquer letra, então confere de verdade (sem acento)
+    const rows = (data || []).filter(r => _bateSemAcento(r.content, term) || _bateSemAcento(r.transcript, term)).slice(0, 60);
     const phones = [...new Set(rows.map(r => r.phone).filter(Boolean))];
     let nomes = {};
     if (phones.length) {
@@ -3513,30 +3514,42 @@ app.post('/contacts/unify-duplicates', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ═══════════ 🔤 BUSCA SEM ACENTO ═══════════
+// O banco compara letra por letra: quem digitava "simulacao" não achava "simulação"
+// (e quem digitava "Joao" não achava "João"). Truque, sem precisar mexer no Supabase:
+// no filtro, toda letra que PODE ter acento vira "_" — no ilike o "_" casa com qualquer
+// letra e o tamanho da palavra não muda, então as duas formas entram. O que sobra de
+// errado (um "somulaçao" da vida) é peneirado aqui em JS, comparando sem acento.
+const _semAcento = (t) => String(t || '').normalize('NFC').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const _PODE_ACENTO = /[aeiouncáàâãäéèêëíìîïóòôõöúùûüçñ]/i;
+const _padraoBusca = (q) => String(q || '').normalize('NFC').split('').map(ch => _PODE_ACENTO.test(ch) ? '_' : ch).join('');
+const _bateSemAcento = (texto, q) => _semAcento(texto).includes(_semAcento(q));
+
 app.get("/search", async (req, res) => {
   if (!supabase) return res.json([]);
   const raw = (req.query.q || "").trim();
   if (!raw) return res.json([]);
   const { account_id } = req.query;
-  const term = raw.replace(/[,()]/g, " ").trim(); // evita quebrar a sintaxe do filtro
-  const like = `%${term}%`;
+  const term = raw.replace(/[,()%_]/g, " ").trim(); // evita quebrar a sintaxe do filtro
+  const like = `%${_padraoBusca(term)}%`;            // com ou sem acento acha igual
   try {
     // 1. Telefones que têm alguma mensagem contendo o termo
-    let mq = supabase.from("messages").select("phone").ilike("content", like).eq("owner", req.owner || ' ').limit(500);
+    let mq = supabase.from("messages").select("phone, content").ilike("content", like).eq("owner", req.owner || ' ').limit(500);
     if (account_id) mq = mq.eq("account_id", account_id);
     const { data: msgRows } = await mq;
-    const phones = [...new Set((msgRows || []).map(m => m.phone).filter(Boolean))];
+    // peneira: o "_" casa com qualquer letra, então confere de verdade (sem acento) aqui
+    const phones = [...new Set((msgRows || []).filter(m => _bateSemAcento(m.content, term)).map(m => m.phone).filter(Boolean))];
 
     // 2. Contatos por nome/telefone OU entre os telefones encontrados
     let orCond = `name.ilike.${like},phone.ilike.${like}`;
     // Número digitado com máscara — "(15) 98165-1975", "15 98165 1975", "+55 15…" —
     // tem de achar o contato: compara só os dígitos
     const soDig = raw.replace(/\D/g, '');
+    const formas = new Set(); // todas as formas do mesmo número (usadas no banco E na peneira)
     if (soDig.length >= 4 && soDig.length >= raw.replace(/\s/g, '').length * 0.5) {
       // O MESMO número é guardado de jeitos diferentes: com e sem o 55, com e sem o nono
       // dígito. Buscar "46999116591" não achava o lead guardado como "554699116591".
       // Agora procuramos por todas as formas — e pelos 8 últimos dígitos, que nunca mudam.
-      const formas = new Set();
       const base = new Set([soDig, soDig.replace(/^55/, '')]);
       for (const p0 of base) {
         if (!p0) continue;
@@ -3558,7 +3571,19 @@ app.get("/search", async (req, res) => {
     if (account_id) cq = cq.eq("account_id", account_id);
     const { data, error } = await cq;
     if (error) return res.status(500).json({ error: error.message });
-    res.json(data || []);
+    // peneira final: fica quem bate mesmo (nome sem acento, telefone em qualquer forma,
+    // ou alguma mensagem achada). As formas do número são as MESMAS usadas no banco —
+    // senão a peneira desfazia o trabalho (o Edson guardado sem o nono dígito sumia).
+    const achouPorMensagem = new Set(phones);
+    const bateFone = (fone) => {
+      const f = String(fone || '').replace(/\D/g, '');
+      if (!f) return false;
+      if (term && String(fone || '').includes(term)) return true;
+      for (const v of formas) if (v && v.length >= 4 && f.includes(v)) return true;
+      return false;
+    };
+    const lista = (data || []).filter(c => achouPorMensagem.has(c.phone) || _bateSemAcento(c.name, term) || bateFone(c.phone));
+    res.json(lista);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
