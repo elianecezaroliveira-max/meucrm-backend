@@ -189,6 +189,42 @@ process.on('uncaughtException', (e) => console.error('Erro não tratado:', (e &&
 // Exige estar logado (ou usar o token de integração) — usada nas rotas sensíveis
 // Decodifica sem quebrar: "%zz" derrubava a rota (e o processo)
 function _decSeguro(v) { try { return decodeURIComponent(String(v == null ? '' : v)); } catch (_) { return String(v == null ? '' : v); } }
+// 🔑 CHAVE DE MÍDIA: foto/vídeo/áudio em <img>/<video> não mandam o login, então quem
+// soubesse o endereço de um arquivo via o arquivo de QUALQUER conta. Agora o endereço leva
+// uma chave assinada pelo servidor que diz de qual conta é quem pede. Ela troca a cada 15
+// dias (o endereço fica igual nesse tempo: a foto não baixa de novo) e vale por até 45.
+// Se algo der errado, MIDIA_ABERTA=1 no Railway volta ao comportamento antigo.
+const _MIDIA_SEG = require('crypto').createHmac('sha256', String(process.env.MIDIA_SEGREDO || SUPABASE_KEY || APP_SECRET || VERIFY_TOKEN || 'vetra')).update('midia-v1').digest();
+const _MIDIA_JANELA = 15 * 24 * 3600000;
+function _midiaChave(owner, janela) {
+  if (!owner) return null;
+  const j = janela != null ? janela : Math.floor(Date.now() / _MIDIA_JANELA);
+  const o = Buffer.from(String(owner).toLowerCase()).toString('base64url');
+  const sig = require('crypto').createHmac('sha256', _MIDIA_SEG).update(o + '.' + j).digest('base64url').slice(0, 32);
+  return o + '.' + j + '.' + sig;
+}
+function _donoDaChave(k) {
+  try {
+    const [o, j] = String(k || '').split('.');
+    const agora = Math.floor(Date.now() / _MIDIA_JANELA), jn = Number(j);
+    if (!o || !Number.isInteger(jn) || jn > agora || jn < agora - 2) return null;
+    const certa = Buffer.from(_midiaChave(Buffer.from(o, 'base64url').toString(), jn)), veio = Buffer.from(String(k));
+    if (certa.length !== veio.length || !require('crypto').timingSafeEqual(certa, veio)) return null;
+    return Buffer.from(o, 'base64url').toString().toLowerCase();
+  } catch (_) { return null; }
+}
+// Tipo do arquivo pedido pelo endereço: nunca como página (html/svg rodariam código no servidor)
+const _tipoSeguro = t => (t && !/html|xml|svg|javascript|ecmascript/i.test(String(t))) ? String(t) : 'application/octet-stream';
+// De quem é este media_id da Meta? (guarda na memória: a mesma foto é pedida muitas vezes)
+const _midiaDonos = new Map();
+async function _donosDaMidia(mediaId) {
+  if (_midiaDonos.has(mediaId)) return _midiaDonos.get(mediaId);
+  let donos = [];
+  try { const { data } = await supabase.from('messages').select('owner').eq('media_id', mediaId).limit(5); donos = (data || []).map(r => r.owner ? String(r.owner).toLowerCase() : null); } catch (_) { return []; }
+  if (_midiaDonos.size > 20000) _midiaDonos.clear();
+  _midiaDonos.set(mediaId, donos);
+  return donos;
+}
 function _exigeLogin(req, res) {
   if (req.owner) return true;
   res.status(401).json({ error: 'Faça login no CRM' });
@@ -229,7 +265,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 312;
+const SERVER_VER = 313;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2927,7 +2963,7 @@ app.get('/exportar/arquivos.html', async (req, res) => {
       if (!m.media_id) continue;
       const inf = nomes[m.phone] || {};
       const u = base + '/media-proxy/' + encodeURIComponent(m.media_id)
-        + '?account_id=' + encodeURIComponent(inf.acc || '') + '&download=1';
+        + '?account_id=' + encodeURIComponent(inf.acc || '') + '&download=1&k=' + encodeURIComponent(_midiaChave(req.owner) || '');
       res.write('<tr><td>' + esc(_dataBr(m.timestamp)) + '</td><td>' + esc(inf.nome || m.phone)
         + '</td><td>' + esc(m.type || '') + '</td><td><a href="' + esc(u) + '">baixar</a></td></tr>');
       n++;
@@ -2958,6 +2994,11 @@ app.get('/exportar/resumo', async (req, res) => {
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
   const { mediaId } = req.params;
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Quem pede: pelo login (fetch) ou pela chave de mídia do endereço (<img>/<video>)
+  const quem = String(req.owner || _donoDaChave(req.query.k) || '').toLowerCase() || null;
+  const _publico = String(mediaId).startsWith('bot/'); // foto do bot: a Meta busca sem login
+  if (!quem && !_publico && process.env.MIDIA_ABERTA !== '1') return res.status(401).json({ error: 'Faça login no CRM' });
 
   // Busca token da conta
   let token = process.env.WHATSAPP_TOKEN;
@@ -2965,8 +3006,14 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   if (supabase && account_id) {
     const { data: account } = await supabase
       .from("accounts").select("token, owner, evolution_instance").eq("id", account_id).maybeSingle();
-    _contaDaMidia = account || null;
-    if (account?.token) token = account.token;
+    // Conta de OUTRA pessoa informada no endereço? Não usa o token dela
+    _contaDaMidia = (account && !(quem && account.owner && String(account.owner).toLowerCase() !== quem)) ? account : null;
+    if (_contaDaMidia?.token) token = _contaDaMidia.token;
+  }
+  // Arquivo da Meta (ou a cópia de 6 meses): só serve se for de uma conversa de quem pede
+  if (quem && supabase && !/^(qr|notas|bot)\//.test(String(mediaId))) {
+    const donos = await _donosDaMidia(String(mediaId));
+    if (donos.length && !donos.some(d => !d || d === quem)) return res.status(403).json({ error: 'Arquivo de outra conta' });
   }
   // 🔒 Arquivo do WhatsApp por QR: o caminho é "qr/<número>/arquivo" e só é
   // servido se pertencer ao MESMO número informado (antes bastava saber o
@@ -2981,7 +3028,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     } catch (_) {}
     // Só recusa quando dá para PROVAR que é de outra conta (imagem em <img> não
     // manda login, então nunca bloqueamos por falta de informação)
-    const quemPede = req.owner || (_contaDaMidia && _contaDaMidia.owner) || null;
+    const quemPede = quem || (_contaDaMidia && _contaDaMidia.owner) || null;
     if (donoDoArquivo && quemPede && String(donoDoArquivo).toLowerCase() !== String(quemPede).toLowerCase())
       return res.status(403).json({ error: 'Arquivo de outra conta' });
   }
@@ -2992,8 +3039,8 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   // A checagem agora é DIRETA (baixa a cópia): a busca por lista falhava às
   // vezes e o arquivo guardado era ignorado — parecia "sumido" antes da hora.
   // 🔒 Anexo de NOTA INTERNA: só o dono da nota vê
-  if (String(mediaId).startsWith('notas/') && req.owner) {
-    const marca = Buffer.from(String(req.owner)).toString('hex').slice(0, 24);
+  if (String(mediaId).startsWith('notas/') && quem) {
+    const marca = Buffer.from(String(quem)).toString('hex').slice(0, 24);
     if (String(mediaId).split('/')[1] !== marca) return res.status(403).json({ error: 'Nota de outra conta' });
   }
   let _servirDe = (mediaId.startsWith('qr/') || mediaId.startsWith('notas/') || mediaId.startsWith('bot/')) ? mediaId : null;
@@ -3016,7 +3063,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
       if (error || !blob) return res.status(404).json({ error: 'Mídia não encontrada' });
       const buf = Buffer.from(await blob.arrayBuffer());
       const total = buf.length;
-      const ctype = req.query.mime || blob.type || 'application/octet-stream';
+      const ctype = _tipoSeguro(req.query.mime || blob.type);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Content-Type', ctype);
@@ -3106,7 +3153,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
     res.status(up.status); // 200 ou 206 (parcial)
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Accept-Ranges", up.headers["accept-ranges"] || "bytes");
-    res.setHeader("Content-Type", req.query.mime || up.headers["content-type"] || "application/octet-stream");
+    res.setHeader("Content-Type", _tipoSeguro(req.query.mime || up.headers["content-type"]));
     if (up.headers["content-length"]) res.setHeader("Content-Length", up.headers["content-length"]);
     if (up.headers["content-range"])  res.setHeader("Content-Range", up.headers["content-range"]);
 
@@ -8794,7 +8841,8 @@ app.get('/meu-acesso', async (req, res) => {
   res.json({
     email: req.usuario || req.owner, dono: req.owner, papel: _papelDe(req),
     fornecedor: _ehDono(req), plano: _planoInfo(req.owner),
-    liberado: _temLiberacao(req), portaria: l.ligado
+    liberado: _temLiberacao(req), portaria: l.ligado,
+    midia_k: _midiaChave(req.owner) // chave que o app põe nos endereços de foto/vídeo/arquivo
   });
 });
 
