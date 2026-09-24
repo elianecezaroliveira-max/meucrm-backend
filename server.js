@@ -108,6 +108,7 @@ app.use(async (req, res, next) => {
         if (k.startsWith('api_token::') && _settings[k] === t) {
           const ow = k.slice('api_token::'.length);
           req.owner = ow === ' ' ? null : ow;
+          req._viaApiToken = true; // integração (n8n etc.): age pela conta, mas nunca como fornecedora
           break;
         }
       }
@@ -228,7 +229,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 311;
+const SERVER_VER = 312;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -260,8 +261,8 @@ app.get('/versao', async (req, res) => {
   } catch (_) {}
   res.json({ contas: _contasCompartilhadas(), server: SERVER_VER, no_ar_desde: _NO_AR_DESDE,
     node: process.version, ambiente: process.env.RAILWAY_ENVIRONMENT_NAME || null,
-    presencas: presCount, exemplos: presKeys.slice(0, 3),
-    copias_6meses: copias, cofre_ultimo_ok: _cofreUltimoOk, cofre_ultimo_erro: _cofreUltimoErro,
+    presencas: presCount, // (os exemplos traziam números de contatos para qualquer um — saiu)
+    copias_6meses: copias, cofre_ultimo_ok: _ehDono(req) ? _cofreUltimoOk : undefined, cofre_ultimo_erro: _ehDono(req) ? _cofreUltimoErro : undefined,
     // 📦 Espaço do Storage (última medição da faxina) — o plano grátis do Supabase dá 1 GB
     storage_mb: (_espacoCache ? _espacoCache.mb : null),
     storage_teto_mb: COFRE_TETO_MB,
@@ -1284,6 +1285,7 @@ async function clearNoticeDisc(owner, key) {
   } catch (_) {}
 }
 app.get('/notices', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.json({ value: [] });
   const { data } = await supabase.from('settings').select('value').eq('key', 'notices::' + (req.owner || ' ')).maybeSingle();
   let v = [];
@@ -1320,6 +1322,7 @@ app.put('/notices/item/:id', async (req, res) => {
   res.json({ success: true });
 });
 app.put('/notices/read', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const K = 'notices::' + (req.owner || ' ');
   const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
@@ -1630,7 +1633,7 @@ app.post("/accounts", async (req, res) => {
   const { data, error } = await supabase
     .from("accounts")
     .upsert({ name: _nomePreservado || name, phone_number_id, phone_display, waba_id, token, owner: req.owner || null }, { onConflict: 'phone_number_id' })
-    .select().single();
+    .select('id, name, phone_number_id, phone_display, waba_id, owner, type').single(); // sem o token: ele nunca vai para a tela
   if (error) return res.status(500).json({ error: error.message });
   const _avisos = [];
   if (!waba_id) _avisos.push('WABA não localizada — os modelos podem não aparecer');
@@ -1906,7 +1909,8 @@ app.post("/send", async (req, res) => {
   }
 
   // 2. Fallback: usa variáveis de ambiente (PHONE_NUMBER_ID + WHATSAPP_TOKEN)
-  if (!evolutionInstance && (!phoneNumberId || !token)) {
+  // Só a conta PRINCIPAL cai no número do .env — outra conta enviaria pelo seu número
+  if (!evolutionInstance && (!phoneNumberId || !token) && String(req.owner || '').toLowerCase() === OWNER_LEGADO) {
     phoneNumberId = process.env.PHONE_NUMBER_ID;
     token = process.env.WHATSAPP_TOKEN;
     if (phoneNumberId && token) {
@@ -1950,7 +1954,7 @@ app.post("/send", async (req, res) => {
     } catch (e1) {
       // A Meta recusou a mensagem citada (antiga demais, apagada)? Manda sem ela —
       // a mensagem NUNCA deixa de sair por causa da citação.
-      if (_cit) {
+      if (_cit && e1.response && e1.response.status >= 400 && e1.response.status < 500) {
         console.error('Citação recusada pela Meta, enviando sem ela:', e1.response?.data?.error?.message || e1.message);
         delete _corpo.context;
         response = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`, _corpo, _hdr);
@@ -2345,7 +2349,7 @@ app.post("/send-media", async (req, res) => {
     }
   }
 
-  if (!phoneNumberId || !token) {
+  if ((!phoneNumberId || !token) && String(req.owner || '').toLowerCase() === OWNER_LEGADO) { // .env só para a conta principal
     phoneNumberId = process.env.PHONE_NUMBER_ID;
     token = process.env.WHATSAPP_TOKEN;
   }
@@ -2407,7 +2411,7 @@ app.post("/send-media", async (req, res) => {
     try {
       mediaResp = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`, _corpoM, _hdrM);
     } catch (e1) {
-      if (_citM) {
+      if (_citM && e1.response && e1.response.status >= 400 && e1.response.status < 500) {
         console.error('Citação recusada pela Meta (mídia), enviando sem ela:', e1.response?.data?.error?.message || e1.message);
         delete _corpoM.context;
         mediaResp = await axios.post(`https://graph.facebook.com/v23.0/${phoneNumberId}/messages`, _corpoM, _hdrM);
@@ -2805,6 +2809,7 @@ async function getMediaUrl(mediaId, token, cacheKey, force) {
 // ⏱️ DURAÇÃO do áudio (para a barrinha andar certo já na 1ª reprodução)
 const _durCache = {};
 app.get('/audio-dur/:mediaId', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   const mediaId = String(req.params.mediaId || '');
   if (!mediaId) return res.json({ seconds: 0 });
   if (_durCache[mediaId] !== undefined) return res.json({ seconds: _durCache[mediaId] });
@@ -3411,7 +3416,7 @@ app.post('/contacts/unify-duplicates', async (req, res) => {
           const { count } = await supabase.from('messages').update({ phone: fica.phone }, { count: 'exact' }).eq('phone', dup.phone).eq('owner', OW);
           msgsMovidas += (count || 0);
           await supabase.from('tasks').update({ phone: fica.phone }).eq('phone', dup.phone).eq('owner', OW);
-          try { await supabase.from('bot_runs').update({ contact_phone: fica.phone }).eq('contact_phone', dup.phone); } catch (_) {}
+          try { await supabase.from('bot_runs').update({ contact_phone: fica.phone }).eq('contact_phone', dup.phone).eq('owner', OW); } catch (_) {}
           // 2) completa o que faltava no que fica (nome, etiquetas, notas, e-mail, etapa)
           const patch = {};
           if ((!fica.name || /^\+?\d+$/.test(fica.name)) && dup.name && !/^\+?\d+$/.test(dup.name)) patch.name = dup.name;
@@ -4925,6 +4930,7 @@ app.delete('/tmpl-lixeira/:id', async (req, res) => {
 
 // ── Enviar template ──
 app.post("/send-template", async (req, res) => {
+  if (!_exigeLogin(req, res)) return; // sem login parava o bot deste lead em TODAS as contas
   if (_planoBarra(req, res)) return;
   let { to, account_id, template_name, language_code, components, body_text } = req.body;
   if (!to || !account_id || !template_name)
@@ -5123,7 +5129,7 @@ app.get('/pipeline/stages/orphans', async (req, res) => {
   for (const b of (bots || [])) add(b.trigger_stage_id, 'bot "' + b.name + '"');
   for (const r of _dripRegras(OW)) { add(r.de, 'gotejamento "' + (r.nome || '') + '" (origem)'); add(r.para, 'gotejamento "' + (r.nome || '') + '" (destino)'); }
   try { const sa = JSON.parse(_settings['stage_actions::' + OW] || '{}'); for (const k in sa) add(k, 'automação da etapa'); for (const k in sa) for (const a of (sa[k] || [])) if (a && a.type === 'move_stage') add(a.stage_id, 'automação "mover para"'); } catch (_) {}
-  try { const { data: nodes } = await supabase.from('bot_nodes').select('config, type').eq('type', 'move_stage'); for (const n of (nodes || [])) { const c = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); add(c.stage_id, 'passo "Mudar status" de um bot'); } } catch (_) {}
+  try { const { data: nodes } = await supabase.from('bot_nodes').select('config, type').eq('type', 'move_stage').eq('owner', OW); for (const n of (nodes || [])) { const c = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); add(c.stage_id, 'passo "Mudar status" de um bot'); } } catch (_) {}
   res.json(Object.keys(refs).map(id => ({ id, pistas: [...refs[id]] })));
 });
 app.post('/pipeline/stages/recover', async (req, res) => {
@@ -5396,7 +5402,7 @@ app.post('/message-revoke', async (req, res) => {
     const sock = _waSocks[inst];
     const jid = await waResolveJid(sock, phone);
     await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: true, id: wamid } });
-    await supabase.from('messages').update({ content: 'Mensagem apagada', type: 'text' }).eq('wamid', wamid).eq('phone', phone);
+    await supabase.from('messages').update({ content: 'Mensagem apagada', type: 'text' }).eq('wamid', wamid).eq('phone', phone).eq('owner', req.owner || ' ');
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -5918,7 +5924,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
   let acct, usedAcctId;
   if (nodeAccountId) {
     // Nó com número CONFIGURADO: obedece exatamente — sem troca automática
-    acct = await botGetAcctStrict(nodeAccountId);
+    acct = await botGetAcctStrict(nodeAccountId, owner);
     usedAcctId = nodeAccountId;
     if (!acct) {
       await _recordBotFail(phone, text, 'O número configurado neste passo do bot não existe mais. Edite o nó "Enviar mensagem" e escolha outro número.', usedAcctId, owner, 'text');
@@ -5990,15 +5996,18 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
 
 // ESTRITO: devolve EXATAMENTE a conta pedida (ou null) — sem nenhum fallback.
 // Usado quando o nó do bot tem um número configurado: ou envia por ele, ou falha.
-async function botGetAcctStrict(accountId) {
+async function botGetAcctStrict(accountId, owner) {
   if (!supabase || !accountId) return null;
-  const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance').eq('id', accountId).maybeSingle();
+  const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance,owner').eq('id', accountId).maybeSingle();
+  // Número de OUTRA conta? Não serve (senão um bot enviaria pelo WhatsApp de outra pessoa)
+  if (data && owner && data.owner && String(data.owner).toLowerCase() !== String(owner).toLowerCase()) return null;
   return data || null;
 }
 
 async function botGetAcct(accountId, owner) {
   if (supabase && accountId) {
-    const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance').eq('id', accountId).maybeSingle();
+    let { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance,owner').eq('id', accountId).maybeSingle();
+    if (data && owner && data.owner && String(data.owner).toLowerCase() !== String(owner).toLowerCase()) data = null; // conta de outra pessoa: ignora
     // Conta QR Code escolhida → respeita a escolha (o bot envia pelo próprio QR,
     // sem desviar para a conta da API oficial)
     if (data && data.evolution_instance) return data;
@@ -6019,6 +6028,7 @@ async function botGetAcct(accountId, owner) {
       }
     } catch (e) { console.error('botGetAcct fallback:', e.message); }
   }
+  if (owner && String(owner).toLowerCase() !== OWNER_LEGADO) return {}; // o número do .env é só da conta principal
   return { phone_number_id: process.env.PHONE_NUMBER_ID, token: process.env.WHATSAPP_TOKEN, waba_id: process.env.WABA_ID };
 }
 
@@ -6054,7 +6064,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   if (cfg.account_id) {
     // Nó com número CONFIGURADO: obedece exatamente — ou envia por ele, ou FALHA.
     // Nunca troca de número sozinho.
-    acct = await botGetAcctStrict(cfg.account_id);
+    acct = await botGetAcctStrict(cfg.account_id, owner);
     usedAcctId = cfg.account_id;
     if (!acct) {
       await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'O número configurado neste passo do bot não existe mais. Edite o nó "Enviar mensagem" e escolha outro número.', usedAcctId, owner, 'template');
@@ -6522,7 +6532,7 @@ async function processNode(run, depth=0) {
           // Atômico: só retoma se AINDA estiver pausada (evita corrida com o ciclo de 30s)
           const { data: took } = await supabase.from('bot_runs')
             .update({ status:'running', pause_until:null, updated_at:new Date().toISOString() })
-            .eq('id', runId).eq('status', 'paused').select('id');
+            .eq('id', runId).eq('status', 'paused').not('pause_until', 'is', null).select('id'); // o ciclo de 30s já pegou? (ele zera o pause_until) então não repete
           if (!took || !took.length) return;
           const nxt = _nxtPre || await getNextNodeId(nodeId, null); // já descoberto durante a espera
           if (nxt) {
@@ -6675,7 +6685,7 @@ async function handleBotReply(phone, text, owner) {
     const upd = { current_node_id:matched.to_node_id, status:'running', pause_until:null, updated_at:new Date().toISOString() };
     // Atômico (mesmo cuidado da retomada de pausa): duas mensagens do lead quase juntas — ou o
     // mesmo webhook reentregue pela Meta — liam a espera as duas e o passo seguinte saía DUAS VEZES
-    const { data: _pegou } = await supabase.from('bot_runs').update(upd).eq('id',run.id).eq('status','waiting_reply').select('id');
+    const { data: _pegou } = await supabase.from('bot_runs').update(upd).eq('id',run.id).eq('status','waiting_reply').not('pause_until','is',null).select('id'); // o prazo já venceu e o ciclo pegou? não segue dos dois jeitos
     if (!_pegou || !_pegou.length) return true; // outra resposta do lead já levou o bot adiante
     await processNode({...run,...upd});
   } else { await stopRun(run.id,'completed'); }
@@ -6974,6 +6984,7 @@ setInterval(async () => {
       continue;
     }
     if (_cronoMarcado[run.id]) { clearTimeout(_cronoMarcado[run.id]); delete _cronoMarcado[run.id]; }
+    if (_cronoProprio.has(String(run.id))) continue; // a espera curta tem despertador próprio: ele cuida
     await _retomaUma(run);
   }
   } catch (e) { console.error('retomada de bots:', e.message); }
@@ -8437,6 +8448,10 @@ app.post('/bots/:id/start', async (req,res) => {
   // confirma que o bot é do dono
   const { data: own } = await supabase.from('bots').select('id').eq('id',req.params.id).eq('owner', req.owner || ' ').maybeSingle();
   if (!own) return res.status(404).json({error:'Bot não encontrado'});
+  if (account_id) { // o número escolhido tem de ser desta conta
+    const { data: ac } = await supabase.from('accounts').select('owner').eq('id', account_id).maybeSingle();
+    if (ac && ac.owner && String(ac.owner).toLowerCase() !== String(req.owner || '').toLowerCase()) return res.status(403).json({error:'Este número pertence a outra conta.'});
+  }
   const run = await startBot(req.params.id, phone, account_id, req.owner, true, true); // manual no chat: herda o número da conversa; responde na hora
   if (!run) return res.status(500).json({error:'Erro ao iniciar bot (verifique se o fluxo tem nó Início)'});
   res.json({success:true, run_id:run.id});
@@ -8560,11 +8575,15 @@ app.put('/quick-replies', async (req, res) => {
 });
 
 app.get('/integration/token', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'ver o token de integração')) return; // atendente não leva a chave da conta
   if (!supabase) return res.json({ token: null });
   const { data } = await supabase.from('settings').select('value').eq('key', 'api_token::' + (req.owner || ' ')).maybeSingle();
   res.json({ token: data?.value || null });
 });
 app.post('/integration/token', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!_exigeAdmin(req, res, 'gerar o token de integração')) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const token = 'vetra_' + require('crypto').randomBytes(24).toString('hex');
   const key = 'api_token::' + (req.owner || ' ');
@@ -8760,7 +8779,8 @@ function _exigeAdmin(req, res, oque) {
 // Quem FORNECE o VETRA (você). Vale o e-mail titular do sistema ou o
 // ADMIN_TOKEN das variáveis do Railway (socorro quando o login está fora do ar).
 function _ehDono(req) {
-  const q = String((req && req.usuario) || (req && req.owner) || '').toLowerCase();
+  // Pelo token de integração não vale: quem o pegasse viraria fornecedora do sistema
+  const q = (req && req._viaApiToken) ? '' : String((req && req.usuario) || (req && req.owner) || '').toLowerCase();
   if (q && q === OWNER_LEGADO) return true;
   const adm = String((req && req.query && req.query.admin) || (req && req.headers && req.headers['x-admin-token']) || '').trim();
   const esp = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
@@ -9961,7 +9981,8 @@ function _badgeAvisa(owner, phone) {
 
 // Teste de conexão N8N — envia evento de teste para o webhook configurado
 app.post('/n8n/test', async (req, res) => {
-  const n8nUrl = _settings['n8n_webhook_url'];
+  if (!_exigeLogin(req, res)) return;
+  const n8nUrl = _cfg('n8n_webhook_url', req.owner); // o N8N DESTA conta (antes: sempre o da conta principal)
   if (!n8nUrl) return res.status(400).json({ error: 'URL do N8N não configurada' });
   try {
     await axios.post(n8nUrl, {
@@ -10057,7 +10078,7 @@ async function waCleanupInstance(inst) {
 
 // Diagnóstico do motor embutido (para depurar sem acesso aos logs)
 app.get('/wa/debug', async (req, res) => {
-  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só para quem fornece o VETRA' }); // lista as conexões de todas as contas
   const instances = {};
   for (const k of new Set([...Object.keys(_waSocks), ...Object.keys(_waState)])) {
     instances[k] = { state: _waState[k] || null, phone: _waPhone[k] || null, err: _waErr[k] || null, temQr: !!qrCache[k] };
@@ -10713,7 +10734,7 @@ app.get('/evolution/qr/:instance', async (req, res) => {
 
 // GET /evolution/debug — mostra info bruta da Evolution API
 app.get('/evolution/debug', async (req, res) => {
-  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só para quem fornece o VETRA' });
   try {
     const { data } = await axios.get(`${EVOLUTION_URL}/instance/fetchInstances`, { headers: evoHdr(), timeout: 10000 });
     res.json({ instances: data, url: EVOLUTION_URL });
@@ -10785,6 +10806,9 @@ app.post('/evolution/save-account', async (req, res) => {
   const { data: exist } = await supabase.from('accounts').select('name, owner').eq('phone_number_id', instance).maybeSingle();
   if (exist && exist.owner && String(exist.owner).toLowerCase() !== String(req.owner).toLowerCase())
     return res.status(403).json({ error: 'Este número pertence a outra conta.' });
+  // QR aberto por OUTRA conta (nome da conexão descoberto)? Não pode ser tomado
+  if (_waDono[instance] && String(_waDono[instance]).toLowerCase() !== String(req.owner).toLowerCase())
+    return res.status(403).json({ error: 'Esta conexão é de outra conta.' });
   const name = exist?.name || (phone ? `WhatsApp ${phone}` : `WhatsApp QR (${instance})`);
   const { data, error } = await supabase.from('accounts')
     .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '', owner: req.owner || null }, { onConflict: 'phone_number_id' })
@@ -10960,7 +10984,7 @@ app.post('/evolution-webhook', async (req, res) => {
             const { data: realC } = await supabase.from('contacts').select('id').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
             if (realC) await supabase.from('contacts').delete().eq('id', lidC.id);  // já existe com o número certo — remove o duplicado @lid
             else await supabase.from('contacts').update({ phone }).eq('id', lidC.id); // corrige o número do contato
-            await supabase.from('messages').update({ phone }).eq('phone', data.lidJid); // histórico acompanha
+            { let _q = supabase.from('messages').update({ phone }).eq('phone', data.lidJid); if (ownerEmail) _q = _q.eq('owner', ownerEmail); await _q; } // histórico acompanha (só desta conta)
             console.log(`Contato @lid migrado para o número real: ${data.lidJid} → ${phone}`);
           }
         } catch (e) { console.error('Migração @lid:', e.message); }
