@@ -184,7 +184,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 306;
+const SERVER_VER = 308;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1511,6 +1511,7 @@ app.get('/accounts/:id/dependencias', async (req, res) => {
 // ficava "capada": sem número na tela, sem modelos e sem receber mensagens
 app.post("/accounts", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' }); // adicionar número exige login
   const { name, phone_number_id } = req.body;
   let token = String(req.body.token || '').trim();
   // REAPROVEITAR O TOKEN DE OUTRA CONTA: a Meta mostra o token de usuário do
@@ -1573,7 +1574,12 @@ app.post("/accounts", async (req, res) => {
   // Para trocar o nome, use o ✏️ na lista de Contas.
   let _nomePreservado = null;
   try {
-    const { data: _ex } = await supabase.from('accounts').select('name').eq('phone_number_id', phone_number_id).maybeSingle();
+    const { data: _ex } = await supabase.from('accounts').select('name, owner').eq('phone_number_id', phone_number_id).maybeSingle();
+    // 🔒 o mesmo número já está em OUTRA conta: a gravava por cima (trocando o dono) —
+    // era como entregar o número para quem soubesse o Phone Number ID
+    if (_ex && _ex.owner && String(_ex.owner).toLowerCase() !== String(req.owner).toLowerCase()) {
+      return res.status(403).json({ error: 'Este número já está cadastrado em outra conta.' });
+    }
     _nomePreservado = _ex?.name || null;
   } catch (_) {}
   const { data, error } = await supabase
@@ -3552,6 +3558,7 @@ function _foneComDDI(raw) {
   return d;                                              // outros países (com DDI próprio) ficam como vieram
 }
 app.post("/contacts", async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' }); // sem login gravava contato com dono nulo
   const { name, phone, account_id } = req.body;
   if (!name || !phone) return res.status(400).json({ error: "Nome e celular são obrigatórios" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
@@ -3570,6 +3577,7 @@ app.post("/contacts", async (req, res) => {
 
 // ── Importar lista de contatos ──
 app.post("/contacts/import", async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' }); // idem para a importação em lote
   const { contacts, account_id, stage_id } = req.body;
   if (!contacts || !Array.isArray(contacts)) return res.status(400).json({ error: "Lista inválida" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
@@ -6545,6 +6553,18 @@ async function _paraBotSeLeadRespondeu(phone, owner) {
   } catch (e) { console.error('parar bot ao responder:', e.message); }
 }
 
+// Ela respondeu à mão enquanto a resposta automática esperava os 25s? Então a automática NÃO sai.
+// É a mesma regra de ouro dos bots: quem fala com o lead é ela. (O bot_run parava na hora, mas
+// o FAQ e o "contato errado" já tinham o cronômetro armado e falavam por cima da resposta dela.)
+async function _elaRespondeuDepois(phone, owner, desde) {
+  if (!supabase) return false;
+  try {
+    const { data } = await supabase.from('messages').select('id')
+      .in('phone', phoneVariants(phone)).eq('owner', owner || ' ').eq('direction', 'outbound')
+      .gt('timestamp', desde).limit(1);
+    return !!(data && data.length);
+  } catch (_) { return false; }
+}
 async function handleBotReply(phone, text, owner) {
   if (!supabase) return false;
   await _paraBotSeLeadRespondeu(phone, owner);
@@ -6585,7 +6605,10 @@ async function handleBotReply(phone, text, owner) {
   if (!matched) { await stopRun(run.id, 'stopped'); return true; }
   if (matched?.to_node_id) {
     const upd = { current_node_id:matched.to_node_id, status:'running', pause_until:null, updated_at:new Date().toISOString() };
-    await supabase.from('bot_runs').update(upd).eq('id',run.id);
+    // Atômico (mesmo cuidado da retomada de pausa): duas mensagens do lead quase juntas — ou o
+    // mesmo webhook reentregue pela Meta — liam a espera as duas e o passo seguinte saía DUAS VEZES
+    const { data: _pegou } = await supabase.from('bot_runs').update(upd).eq('id',run.id).eq('status','waiting_reply').select('id');
+    if (!_pegou || !_pegou.length) return true; // outra resposta do lead já levou o bot adiante
     await processNode({...run,...upd});
   } else { await stopRun(run.id,'completed'); }
   return true;
@@ -7022,6 +7045,7 @@ async function matchFaq(text, owner) {
 // Executa a auto-resposta: valida interruptor, casa a pergunta, respeita "1x por cliente" e envia
 async function handleFaqAutoReply(phone, text, owner, accountId) {
   if (!supabase) return false;
+  const _armadoEm = new Date().toISOString(); // marca a chegada da mensagem do lead
   if ((_cfg('faq_enabled', owner) || 'off') !== 'on') return false; // interruptor DA CONTA
 
   // Filtro por conta de WhatsApp: se 'faq_accounts' foi configurado (lista JSON de IDs),
@@ -7069,6 +7093,11 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
   const delayMs = Math.max(0, (Number.isFinite(delaySec) ? delaySec : 25) * 1000);
   setTimeout(async () => {
     try {
+      if (await _elaRespondeuDepois(phone, owner, _armadoEm)) { // ela mesma já respondeu: a automática cala
+        await supabase.from('faq_replies').delete().eq('owner', owner || null).eq('phone', phone).eq('faq_id', m.faq.id);
+        console.log('FAQ #' + m.faq.id + ' cancelado: ela respondeu antes (' + phone + ')');
+        return;
+      }
       const wamid = await sendBotMsg(phone, acct, m.faq.answer, owner, acct || await _acctPadraoDoLead(phone, owner));
       if (!wamid) {
         // envio falhou: remove a reserva para permitir nova tentativa numa próxima mensagem
@@ -7607,14 +7636,16 @@ async function _iaLimpaTestes(owner) {
     const cr = require('crypto');
     const chaves = new Set();
     for (const m of msgs) for (const f of fones) chaves.add(cr.createHash('sha1').update(f + '|' + m.id).digest('hex').slice(0, 12));
-    const mem = await _iaMemoria(owner, true);
-    const ficam = mem.exemplos.filter(e => !(e && e.chave && chaves.has(e.chave)));
-    const tirados = mem.exemplos.length - ficam.length;
-    if (tirados > 0) {
-      await _iaMemoriaGrava(owner, 'exemplos', ficam.map(o => JSON.stringify(o)).join('\n'));
-      console.log('IA: ' + tirados + ' exemplo(s) da conversa de TESTE tirados da memória');
-    }
-    return { tirados, total: ficam.length };
+    return await _iaMemNaFila(async () => { // mesma fila do aprendizado: senão uma gravação apaga a outra
+      const mem = await _iaMemoria(owner, true);
+      const ficam = mem.exemplos.filter(e => !(e && e.chave && chaves.has(e.chave)));
+      const tirados = mem.exemplos.length - ficam.length;
+      if (tirados > 0) {
+        await _iaMemoriaGrava(owner, 'exemplos', ficam.map(o => JSON.stringify(o)).join('\n'));
+        console.log('IA: ' + tirados + ' exemplo(s) da conversa de TESTE tirados da memória');
+      }
+      return { tirados, total: ficam.length };
+    });
   } catch (e) { console.error('IA limpar testes:', e.message); return { tirados: 0, erro: e.message }; }
 }
 // Roda sozinho um tempo depois de subir (e dá para chamar na mão pela rota abaixo)
@@ -7633,11 +7664,14 @@ app.post('/ia/esquecer', async (req, res) => {
     const cr = require('crypto');
     const chaves = new Set();
     for (const m of (msgs || [])) for (const f of fones) chaves.add(cr.createHash('sha1').update(f + '|' + m.id).digest('hex').slice(0, 12));
-    const mem = await _iaMemoria(req.owner, true);
-    const ficam = mem.exemplos.filter(e => !(e && e.chave && chaves.has(e.chave)));
-    const tirados = mem.exemplos.length - ficam.length;
-    if (tirados > 0) await _iaMemoriaGrava(req.owner, 'exemplos', ficam.map(o => JSON.stringify(o)).join('\n'));
-    res.json({ ok: true, tirados, total: ficam.length });
+    const r = await _iaMemNaFila(async () => { // mesma fila do aprendizado automático
+      const mem = await _iaMemoria(req.owner, true);
+      const ficam = mem.exemplos.filter(e => !(e && e.chave && chaves.has(e.chave)));
+      const tirados = mem.exemplos.length - ficam.length;
+      if (tirados > 0) await _iaMemoriaGrava(req.owner, 'exemplos', ficam.map(o => JSON.stringify(o)).join('\n'));
+      return { tirados, total: ficam.length };
+    });
+    res.json({ ok: true, tirados: r.tirados, total: r.total });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // GET /ia/status — ligada? chave? quanta memória há
@@ -7667,6 +7701,13 @@ app.put('/ia/memoria', async (req, res) => {
       if (b[parte] === undefined) continue;
       let v = String(b[parte] || '');
       if (v.length > 2_000_000) return res.status(413).json({ error: parte + ' grande demais' });
+      // 🔒 arquivo vazio NÃO apaga a memória que existe (mesma trava do fluxo do bot):
+      // importar o arquivo errado zerava o estilo/manual/exemplos sem perguntar
+      if (!v.trim() && !b.confirmar) {
+        const atual = await _iaMemoria(req.owner, true);
+        const tinha = parte === 'exemplos' ? (atual.brutoExemplos || '') : (atual[parte] || '');
+        if (tinha.trim()) return res.status(409).json({ error: 'O arquivo de ' + parte + ' chegou vazio e já existe memória gravada. Nada foi apagado.' });
+      }
       if (parte === 'exemplos') { const ok = _iaLinhasJsonl(v); v = ok.map(o => JSON.stringify(o)).join('\n'); feito.exemplos = ok.length; }
       else feito[parte] = v.length;
       await _iaMemoriaGrava(req.owner, parte, v);
@@ -7860,6 +7901,7 @@ async function addTagToContact(phone, owner, tag) {
 
 // Retorna true se assumiu a resposta (para o FAQ não responder também)
 async function handleWrongPerson(phone, text, owner, accountId) {
+  const _armadoEm = new Date().toISOString(); // idem: vale a chegada da mensagem do lead
   if (!supabase) return false;
   if ((_cfg('wrongperson_enabled', owner) || 'off') !== 'on') return false;
 
@@ -7894,6 +7936,11 @@ async function handleWrongPerson(phone, text, owner, accountId) {
 
   setTimeout(async () => {
     try {
+      if (await _elaRespondeuDepois(phone, owner, _armadoEm)) { // ela mesma já respondeu: a automática cala
+        await supabase.from('faq_replies').delete().eq('owner', owner || null).eq('phone', phone).eq('faq_id', WRONGPERSON_FAQ_ID);
+        console.log('Contato errado cancelado: ela respondeu antes (' + phone + ')');
+        return;
+      }
       const wamid = await sendBotMsg(phone, acct, answer, owner, acct || await _acctPadraoDoLead(phone, owner));
       if (!wamid) {
         await supabase.from('faq_replies').delete()
@@ -9592,8 +9639,13 @@ app.get('/publico/empresa', async (req, res) => {
 
 app.get('/settings/:key', async (req, res) => {
   if (!supabase) return res.json({ value: null });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' }); // sem login ninguém lê ajuste nenhum
   const k = req.params.key;
   if (_SETTINGS_PROIBIDAS.test(k)) return res.status(403).json({ error: 'chave protegida' });
+  // 🔒 "::" é o separador da conta (ex.: lead_trash::dona@email). Pedir a chave JÁ com "::"
+  // era ler o ajuste de OUTRA conta (lixeira de leads, respostas rápidas, webhook do n8n).
+  // A chave da própria conta continua vindo pelo nome simples, como o app sempre pediu.
+  if (k.includes('::')) return res.status(403).json({ error: 'chave de outra conta' });
   if (CHAVES_POR_CONTA.has(k)) { const v = _cfg(k, req.owner); return res.json({ value: (v === undefined ? null : v) }); }
   const { data } = await supabase.from('settings').select('value').eq('key', k).maybeSingle();
   res.json({ value: data?.value || null });
@@ -9603,6 +9655,7 @@ app.put('/settings/:key', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
   if (_SETTINGS_PROIBIDAS.test(req.params.key)) return res.status(403).json({ error: 'chave protegida' });
+  if (req.params.key.includes('::')) return res.status(403).json({ error: 'chave de outra conta' }); // gravar em "chave::outra-conta" mexia no ajuste alheio
   const { value } = req.body;
   const k = CHAVES_POR_CONTA.has(req.params.key)
     ? req.params.key + '::' + (req.owner || ' ')   // grava SEMPRE na chave da conta
@@ -9834,6 +9887,7 @@ const _waRetryCounter = (() => { const m = new Map(); return {
 const _waPresence = {}; // 'instancia|jid' -> { state, lastSeen, at } (online/visto por último)
 const _waPolls = {};    // wamid da enquete -> { options, encKey, creatorJid } (para decifrar votos)
 const _waQrRetries = {}, _waCreatedAt = {}, _waRegistered = {}; // controle de instâncias que nunca parearam
+const _waDono = {}; // instância → dono que pediu o QR (o QR é a chave do WhatsApp: ninguém mais pode ver)
 const _waReconnDelay = {}; // espera progressiva entre reconexões (economia no Railway)
 let _waVerCache = { v: null, ts: 0 }; // cache da versão do Baileys (evita consulta na internet a cada reconexão)
 let _waVersion = null;
@@ -10374,8 +10428,22 @@ async function sendViaEvolution(instanceName, to, text, quoted) {
 }
 
 // POST /evolution/connect — limpa instâncias antigas, cria nova e retorna QR
+// O QR conecta o WhatsApp dela de verdade — só quem pediu pode ver o dele.
+async function _waDonoDa(inst) {
+  if (_waDono[inst]) return _waDono[inst];
+  try { const { data } = await supabase.from('accounts').select('owner').eq('evolution_instance', inst).maybeSingle(); if (data && data.owner) { _waDono[inst] = data.owner; return data.owner; } } catch (_) {}
+  return null;
+}
+const _waPodeVer = async (req, res) => {
+  if (!req.owner) { res.status(401).json({ error: 'Faça login no CRM' }); return false; }
+  const dono = await _waDonoDa(req.params.instance);
+  if (dono && String(dono).toLowerCase() !== String(req.owner).toLowerCase()) { res.status(403).json({ error: 'Esta conexão é de outra conta' }); return false; }
+  return true;
+};
 app.post('/evolution/connect', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
   const instanceName = `meucrm_${Date.now()}`;
+  _waDono[instanceName] = req.owner;
   if (WA_EMBEDDED) {
     try {
       // Limpa instâncias antigas que nunca parearam (QRs abandonados) com mais de
@@ -10462,6 +10530,7 @@ app.post('/evolution/connect', async (req, res) => {
 
 // GET /evolution/qr/:instance — QR code (Evolution API v2)
 app.get('/evolution/qr/:instance', async (req, res) => {
+  if (!await _waPodeVer(req, res)) return;
   // 0. Se o webhook já entregou o QR, serve do cache (mais rápido e confiável)
   if (qrCache[req.params.instance]) {
     return res.json({ qr: qrCache[req.params.instance], code: null, pairingCode: null, raw: { cached: true } });
@@ -10503,6 +10572,7 @@ app.get('/evolution/debug', async (req, res) => {
 
 // GET /evolution/status/:instance — verifica estado (Evolution API v2)
 app.get('/evolution/status/:instance', async (req, res) => {
+  if (!await _waPodeVer(req, res)) return;
   if (WA_EMBEDDED) {
     const _st = _waState[req.params.instance] || 'close';
     // "pairing" = QR já lido, conexão terminando de subir (o front mostra o aviso)
@@ -10839,4 +10909,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply };
