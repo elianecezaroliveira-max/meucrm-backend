@@ -265,7 +265,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 313;
+const SERVER_VER = 314;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -981,6 +981,7 @@ app.post("/webhook", async (req, res) => {
 
 // ── Embedded Signup: recebe código do Facebook e salva conta automaticamente ──
 app.post("/auth/whatsapp", async (req, res) => {
+  if (!_exigeLogin(req, res)) return; // sem login o número entrava "sem dona"
   const { code, redirect_uri } = req.body;
   if (!code) return res.status(400).json({ error: "Código não informado" });
   if (!APP_ID || !APP_SECRET) return res.status(500).json({ error: "APP_ID e APP_SECRET não configurados" });
@@ -1059,8 +1060,10 @@ app.post("/auth/whatsapp", async (req, res) => {
         // o nome dela por cima quando você reconecta/atualiza o token)
         let _nomeAtual = null;
         try {
-          const { data: _ex } = await supabase.from('accounts').select('name').eq('phone_number_id', phone.id).maybeSingle();
+          const { data: _ex } = await supabase.from('accounts').select('name, owner').eq('phone_number_id', phone.id).maybeSingle();
           _nomeAtual = _ex?.name || null;
+          // Número já cadastrado em OUTRA conta do VETRA: não passa para esta (igual ao cadastro manual)
+          if (_ex && _ex.owner && String(_ex.owner).toLowerCase() !== String(req.owner).toLowerCase()) { console.warn('Embedded Signup: número de outra conta, ignorado:', phone.id); continue; }
         } catch (_) {}
         const accountData = {
           name: _nomeAtual || phone.verified_name || wabaName,
@@ -1075,7 +1078,7 @@ app.post("/auth/whatsapp", async (req, res) => {
           const { data, error } = await supabase
             .from("accounts")
             .upsert(accountData, { onConflict: "phone_number_id" })
-            .select()
+            .select('id, name, phone_number_id, phone_display, waba_id') // sem o token: ele nunca vai para a tela
             .single();
           if (!error) {
             savedAccounts.push(data);
@@ -1084,7 +1087,7 @@ app.post("/auth/whatsapp", async (req, res) => {
             console.error("Erro ao salvar conta:", error.message);
           }
         } else {
-          savedAccounts.push(accountData);
+          savedAccounts.push({ ...accountData, token: undefined });
         }
       }
     }
@@ -1215,6 +1218,8 @@ app.get('/historico', async (req, res) => {
   // Versões do FLUXO dos bots (guardadas antes de cada salvamento)
   try {
     const { data: snaps } = await supabase.from('settings').select('key, value').like('key', 'bot_snap::' + req.owner + '::%');
+    const _snPref = 'bot_snap::' + req.owner + '::';
+    for (let i = (snaps || []).length - 1; i >= 0; i--) if (!snaps[i].key.startsWith(_snPref)) snaps.splice(i, 1); // só as desta conta
     const nomes = {};
     if ((snaps || []).length) {
       const ids = (snaps || []).map(x => x.key.split('::').pop());
@@ -2892,7 +2897,11 @@ app.get('/audio-dur/:mediaId', async (req, res) => {
 });
 
 // ── 📦 MEUS DADOS: conversas e arquivos do cliente ──
-function _csvCampo(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"'; }
+function _csvCampo(v) {
+  let t = String(v == null ? '' : v);
+  if (/^[=@\t\r]|^[+\-](?![\d\s(])/.test(t)) t = "'" + t; // "=HYPERLINK(...)" vindo do lead não vira fórmula no Excel
+  return '"' + t.replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"';
+}
 function _dataBr(iso) {
   try { const d = new Date(new Date(iso).getTime() - 3 * 3600000);
     return String(d.getUTCDate()).padStart(2, '0') + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + d.getUTCFullYear()
@@ -3568,6 +3577,7 @@ app.get("/tasks", async (req, res) => {
 });
 
 app.post("/tasks", async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phone, account_id, title, due_at, notes } = req.body;
   // Nome NÃO é obrigatório: sem texto, a tarefa nasce como "Tarefa"
@@ -5040,6 +5050,7 @@ app.get("/pipeline/stages", async (req, res) => {
 
 // Criar estágio — TODA etapa nasce com um ID EXTERNO próprio (pronto para o n8n)
 app.post("/pipeline/stages", async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { name, position } = req.body;
   if (!name) return res.status(400).json({ error: "Nome obrigatório" });
@@ -5626,7 +5637,15 @@ app.post('/wa-profile', async (req, res) => {
 
 // 🔗 Prévia de link (título/descrição/imagem do site) — com cache em memória
 const _linkPrevCache = new Map();
+// O nome do site aponta para um endereço INTERNO? (ex.: 169.254.169.254.nip.io) — não busca
+async function _hostInterno(host) {
+  try {
+    const ips = await require('dns').promises.lookup(host, { all: true });
+    return !ips.length || ips.some(({ address: a }) => /^(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|::1$|::$|f[cd]|fe80|::ffff:(127|10|169\.254|192\.168)\.)/i.test(a));
+  } catch (_) { return true; }
+}
 app.get('/link-preview', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
   try {
     const url = String(req.query.url || '');
     if (!/^https?:\/\//i.test(url)) return res.json({});
@@ -5637,6 +5656,7 @@ app.get('/link-preview', async (req, res) => {
     } catch (_) { return res.json({}); }
     const hit = _linkPrevCache.get(url);
     if (hit && Date.now() - hit.ts < 6 * 3600000) return res.json(hit.data);
+    if (await _hostInterno(new URL(url).hostname.replace(/^\[|\]$/g, ''))) return res.json({});
     const r = await axios.get(url, { timeout: 6000, maxContentLength: 512 * 1024, maxRedirects: 0, validateStatus: c => c >= 200 && c < 300, // sem seguir redirecionamento: um link podia desviar para um endereço interno do servidor
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VETRA-CRM/1.0)' }, responseType: 'text',
       validateStatus: st => st >= 200 && st < 400 });
@@ -8512,8 +8532,19 @@ app.post('/bot-runs/:id/stop', async (req,res) => {
 
 // Disparo EM MASSA para uma LISTA de leads selecionados (telefones enviados pelo front).
 // Responde na hora com a contagem e processa em segundo plano (com throttle e dedupe).
+// Disparo em massa JÁ em andamento para este bot (segundo clique/aba não dispara de novo)
+const _massaRodando = new Set();
+// Recebeu ESTE bot há menos de 10 min (mesmo já concluído)? Pula — era o reenvio do 2º clique
+async function _recebeuHaPouco(botId, phone) {
+  try {
+    const { data } = await supabase.from('bot_runs').select('id').eq('bot_id', botId).eq('contact_phone', phone)
+      .gte('created_at', new Date(Date.now() - 10 * 60000).toISOString()).limit(1);
+    return !!(data && data.length);
+  } catch (_) { return false; }
+}
 app.post('/bots/:id/start-bulk', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  if (!_exigeLogin(req, res)) return;
   const owner = req.owner || ' ';
   const botId = req.params.id;
   const { data: own } = await supabase.from('bots').select('id, account_id').eq('id',botId).eq('owner', owner).maybeSingle();
@@ -8524,8 +8555,11 @@ app.post('/bots/:id/start-bulk', async (req,res) => {
   // Segurança: só dispara para contatos do próprio dono
   const { data: contacts } = await supabase.from('contacts').select('phone, account_id').eq('owner', owner).in('phone', phones);
   const valid = contacts || [];
+  const _chM = owner + '|' + botId;
+  if (valid.length && _massaRodando.has(_chM)) return res.status(409).json({ error: 'Este bot já está disparando para a lista. Aguarde terminar.' });
   res.json({ success:true, total: valid.length }); // responde já; processa em background
   if (!valid.length) return;
+  _massaRodando.add(_chM);
 
   (async () => {
     let started=0, skipped=0;
@@ -8535,19 +8569,21 @@ app.post('/bots/:id/start-bulk', async (req,res) => {
           .eq('contact_phone',c.phone).eq('bot_id',botId)
           .in('status',['running','waiting_reply','paused']).maybeSingle();
         if (active) { skipped++; continue; }
+        if (await _recebeuHaPouco(botId, c.phone)) { skipped++; continue; }
         const run = await startBot(botId, c.phone, c.account_id || own.account_id || null, req.owner);
         if (run) started++; else skipped++;
       } catch(e){ skipped++; console.error('start-bulk:', c.phone, e.message); }
       await new Promise(r=>setTimeout(r, 200)); // ~5/seg
     }
     console.log(`Disparo em massa (selecionados) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${valid.length}`);
-  })().catch(e=>console.error('Disparo em massa falhou:', e.message));
+  })().catch(e=>console.error('Disparo em massa falhou:', e.message)).finally(() => _massaRodando.delete(_chM));
 });
 
 // Disparo EM MASSA de um bot para todos os leads com TAREFA EM ABERTO (não concluída).
 // Responde imediatamente com a contagem e processa em segundo plano (com throttle).
 app.post('/bots/:id/start-open-tasks', async (req,res) => {
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
+  if (!_exigeLogin(req, res)) return;
   const owner = req.owner || ' ';
   const botId = req.params.id;
   // confirma que o bot é do dono
@@ -8556,8 +8592,11 @@ app.post('/bots/:id/start-open-tasks', async (req,res) => {
   // Leads com tarefa em aberto (done=false) e com telefone
   const { data: tasks } = await supabase.from('tasks').select('phone').eq('owner', owner).eq('done', false).not('phone','is',null);
   const phones = [...new Set((tasks||[]).map(t=>t.phone).filter(Boolean))];
+  const _chT = owner + '|' + botId;
+  if (phones.length && _massaRodando.has(_chT)) return res.status(409).json({ error: 'Este bot já está disparando para a lista. Aguarde terminar.' });
   res.json({ success:true, total: phones.length }); // responde já; processa em background
   if (!phones.length) return;
+  _massaRodando.add(_chT);
 
   (async () => {
     // account_id de cada contato (o bot dispara pelo número do lead)
@@ -8571,13 +8610,14 @@ app.post('/bots/:id/start-open-tasks', async (req,res) => {
           .eq('contact_phone',phone).eq('bot_id',botId)
           .in('status',['running','waiting_reply','paused']).maybeSingle();
         if (active) { skipped++; continue; }
+        if (await _recebeuHaPouco(botId, phone)) { skipped++; continue; }
         const run = await startBot(botId, phone, acctByPhone[phone] || own.account_id || null, req.owner);
         if (run) started++; else skipped++;
       } catch(e){ skipped++; console.error('start-open-tasks:', phone, e.message); }
       await new Promise(r=>setTimeout(r, 200)); // ~5/seg — respeita limites do WhatsApp
     }
     console.log(`Disparo em massa (tarefas abertas) bot ${botId}: ${started} iniciados, ${skipped} pulados de ${phones.length}`);
-  })().catch(e=>console.error('Disparo em massa falhou:', e.message));
+  })().catch(e=>console.error('Disparo em massa falhou:', e.message)).finally(() => _massaRodando.delete(_chT));
 });
 app.get('/bot-runs/contact/:phone', async (req,res) => {
   if (!supabase) return res.json([]);
@@ -9074,8 +9114,11 @@ async function _backupAutoDe(owner) {
     const dig = _impressao(JSON.stringify(_semHora));
     // Nada mudou desde a última cópia? Não gasta espaço com uma cópia igual.
     try {
-      const { data: ult } = await supabase.from('settings').select('key, value')
-        .like('key', 'bkp::' + owner + '::%').order('key', { ascending: false }).limit(1);
+      // (o "_" do e-mail é curinga no LIKE: pega as chaves e confere o começo EXATO)
+      const { data: _ks } = await supabase.from('settings').select('key').like('key', 'bkp::' + owner + '::%');
+      const _ultK = (_ks || []).map(r => r.key).filter(k => k.startsWith('bkp::' + owner + '::')).sort().pop();
+      const { data: _ultRow } = _ultK ? await supabase.from('settings').select('key, value').eq('key', _ultK).maybeSingle() : { data: null };
+      const ult = _ultRow ? [_ultRow] : [];
       const anterior = (ult && ult[0]) ? _unzipTxt(ult[0].value) : '';
       if (anterior) {
         try {
@@ -9089,7 +9132,7 @@ async function _backupAutoDe(owner) {
     // de propósito NÃO guarda na memória: cópia é grande e só é lida quando você pede
     // apaga o que passou de 30 dias
     const { data: velhos } = await supabase.from('settings').select('key').like('key', 'bkp::' + owner + '::%');
-    const dias = (velhos || []).map(r => r.key).sort();
+    const dias = (velhos || []).map(r => r.key).filter(k => k.startsWith('bkp::' + owner + '::')).sort(); // nunca apaga cópia de outra conta
     if (dias.length > _BKP_DIAS) {
       for (const k of dias.slice(0, dias.length - _BKP_DIAS)) {
         await supabase.from('settings').delete().eq('key', k);
@@ -9122,7 +9165,7 @@ app.get('/backup/auto', async (req, res) => {
   try {
     // só as datas: baixar o conteúdo de 30 cópias só para montar a lista seria desperdício
     const { data } = await supabase.from('settings').select('key, updated_at').like('key', 'bkp::' + req.owner + '::%');
-    const itens = (data || []).map(r => ({
+    const itens = (data || []).filter(r => r.key.startsWith('bkp::' + req.owner + '::')).map(r => ({
       dia: r.key.split('::').pop(),
       quando: r.updated_at || null
     })).sort((a, b) => b.dia.localeCompare(a.dia));
@@ -9478,7 +9521,7 @@ app.get('/admin/pagamento', async (req, res) => {
 app.put('/admin/pagamento', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode mexer nisto.' });
   const c = _pagCfg();
-  if (req.body?.gerar_token) c.token = 'pag_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  if (req.body?.gerar_token) c.token = 'pag_' + require('crypto').randomBytes(18).toString('hex');
   if (req.body?.ciclo_dias !== undefined) c.ciclo_dias = Math.min(400, Math.max(1, parseInt(req.body.ciclo_dias, 10) || 30));
   await _pagSalva(c);
   res.json({ ok: true, token: c.token || null, ciclo_dias: c.ciclo_dias || 30 });
@@ -9510,6 +9553,17 @@ app.post('/pagamento/webhook', async (req, res) => {
   if (!pago) {
     await _pagLog({ quando: new Date().toISOString(), email, resultado: 'aviso recebido, mas não é de pagamento aprovado', origem: 'webhook' });
     return res.json({ ok: false, motivo: 'não aprovado' });
+  }
+  // O serviço de pagamento reenvia avisos (e manda "confirmado" E "recebido" do mesmo
+  // pagamento): o mesmo id de pagamento só renova UMA vez
+  const _pid = String((corpo.payment && corpo.payment.id) || (corpo.data && corpo.data.id) || corpo.payment_id || corpo.transaction_id || '').slice(0, 80);
+  if (_pid) {
+    const cf = _pagCfg(); const vistos = Array.isArray(cf.vistos) ? cf.vistos : [];
+    if (vistos.includes(_pid)) {
+      await _pagLog({ quando: new Date().toISOString(), email, resultado: 'aviso repetido do mesmo pagamento — ignorado', origem: 'webhook' });
+      return res.json({ ok: true, repetido: true });
+    }
+    cf.vistos = [_pid].concat(vistos).slice(0, 300); await _pagSalva(cf);
   }
   try {
     const ate = await _renovaPlano(email, dias, 'pagamento automático');
