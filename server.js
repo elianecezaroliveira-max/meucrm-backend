@@ -213,6 +213,8 @@ function _donoDaChave(k) {
     return Buffer.from(o, 'base64url').toString().toLowerCase();
   } catch (_) { return null; }
 }
+// Pasta dos anexos de nota desta conta (única por e-mail)
+const _marcaNota = ow => Buffer.from(String(ow).toLowerCase()).toString('hex').slice(0, 24) + '-' + require('crypto').createHash('sha256').update(String(ow).toLowerCase()).digest('hex').slice(0, 12);
 // Tipo do arquivo pedido pelo endereço: nunca como página (html/svg rodariam código no servidor)
 const _tipoSeguro = t => (t && !/html|xml|svg|javascript|ecmascript/i.test(String(t))) ? String(t) : 'application/octet-stream';
 // De quem é este media_id da Meta? (guarda na memória: a mesma foto é pedida muitas vezes)
@@ -265,7 +267,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 314;
+const SERVER_VER = 315;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -643,7 +645,7 @@ app.post("/webhook", async (req, res) => {
           if (supabase) {
             let { data: accsW } = wabaId ? await supabase.from('accounts').select('name, owner').eq('waba_id', wabaId) : { data: null };
             accsW = (accsW || []).filter(Boolean);
-            if (!accsW.length) { const { data: a1 } = await supabase.from('accounts').select('name, owner').not('owner', 'is', null).limit(1).maybeSingle(); if (a1) accsW = [a1]; }
+            if (!accsW.length) { const { data: a1 } = await supabase.from('accounts').select('name, owner').eq('owner', OWNER_LEGADO).limit(1).maybeSingle(); if (a1) accsW = [a1]; } // WABA desconhecida: avisa VOCÊ (antes ia para um cliente qualquer)
             if (accsW.length) { ownerN = accsW[0].owner; nomeN = accsW.map(a => a.name).filter(Boolean).join(', '); }
           }
           const tName = value?.message_template_name || value?.name || '?';
@@ -682,7 +684,7 @@ app.post("/webhook", async (req, res) => {
             // O evento é do PORTFÓLIO (WABA), que pode ter vários números — cita todos
             let { data: accsW } = wabaId ? await supabase.from('accounts').select('name, owner').eq('waba_id', wabaId) : { data: null };
             accsW = (accsW || []).filter(Boolean);
-            if (!accsW.length) { const { data: a1 } = await supabase.from('accounts').select('name, owner').not('owner', 'is', null).limit(1).maybeSingle(); if (a1) accsW = [a1]; }
+            if (!accsW.length) { const { data: a1 } = await supabase.from('accounts').select('name, owner').eq('owner', OWNER_LEGADO).limit(1).maybeSingle(); if (a1) accsW = [a1]; } // WABA desconhecida: avisa VOCÊ (antes ia para um cliente qualquer)
             if (accsW.length) { ownerN = accsW[0].owner; nomeN = accsW.map(a => a.name).filter(Boolean).join(', '); }
           }
           const sufixo = nomeN ? (nomeN.includes(',') ? ` (números: ${nomeN})` : ` (conta "${nomeN}")`) : '';
@@ -2720,8 +2722,7 @@ setTimeout(() => { _soMaestro(_faxinaCompleta)(); setInterval(_soMaestro(_faxina
 // o login para de funcionar — o token de administração do Railway:
 //   ?admin=<ADMIN_TOKEN ou VERIFY_TOKEN das variáveis do Railway>
 function _storageAuthOk(req, destrutivo) {
-  if (req.owner && !destrutivo) return true; // ver números: qualquer conta logada
-  if (req.owner && destrutivo && req.owner === OWNER_LEGADO) return true; // apagar: só a dona
+  if (_ehDono(req)) return true; // mostra as pastas de TODAS as contas: só quem fornece o VETRA
   const adm = String(req.query.admin || '').trim();
   const espAdm = process.env.ADMIN_TOKEN || VERIFY_TOKEN;
   if (adm && espAdm && adm === espAdm) return true;
@@ -2731,7 +2732,7 @@ function _storageAuthOk(req, destrutivo) {
   // Token de integração: só LEITURA dos números (apagar exige a dona ou o token
   // de administração — antes qualquer cliente podia apagar arquivos de outro)
   if (destrutivo) return false;
-  for (const k in _settings) if (k.startsWith('api_token::') && _settings[k] === tok) return true;
+  if (_settings['api_token::' + OWNER_LEGADO] && _settings['api_token::' + OWNER_LEGADO] === tok) return true; // só o token da conta principal
   return false;
 }
 const _storageAuthErro = { error: 'Sem permissão. Entre no CRM, ou use ?token=SEU_TOKEN (Configurações → Integração), ou ?admin=VERIFY_TOKEN (variável do Railway).' };
@@ -3049,8 +3050,12 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
   // vezes e o arquivo guardado era ignorado — parecia "sumido" antes da hora.
   // 🔒 Anexo de NOTA INTERNA: só o dono da nota vê
   if (String(mediaId).startsWith('notas/') && quem) {
-    const marca = Buffer.from(String(quem)).toString('hex').slice(0, 24);
-    if (String(mediaId).split('/')[1] !== marca) return res.status(403).json({ error: 'Nota de outra conta' });
+    const pastaN = String(mediaId).split('/')[1], velha = Buffer.from(String(quem)).toString('hex').slice(0, 24);
+    if (pastaN !== _marcaNota(quem) && pastaN !== velha) return res.status(403).json({ error: 'Nota de outra conta' });
+    if (pastaN === velha) { // pasta antiga (pode ser de e-mail parecido): confere de quem é a nota
+      const donos = await _donosDaMidia(String(mediaId));
+      if (donos.length && !donos.some(d => !d || d === quem)) return res.status(403).json({ error: 'Nota de outra conta' });
+    }
   }
   let _servirDe = (mediaId.startsWith('qr/') || mediaId.startsWith('notas/') || mediaId.startsWith('bot/')) ? mediaId : null;
   let _blobCopia = null;
@@ -3379,8 +3384,8 @@ async function _exportarLeadsCsv(req, res) {
     let rows = data || [];
     if (tag) rows = rows.filter(r => (r.tags || []).includes(tag));
     const [{ data: stages }, { data: accs }] = await Promise.all([
-      supabase.from('pipeline_stages').select('id, name'),
-      supabase.from('accounts').select('id, name, phone_display')
+      supabase.from('pipeline_stages').select('id, name').eq('owner', OW),
+      supabase.from('accounts').select('id, name, phone_display').eq('owner', OW)
     ]);
     const stN = {}; for (const s of (stages || [])) stN[s.id] = s.name;
     const acN = {}; for (const a of (accs || [])) acN[a.id] = a.name || a.phone_display || a.id;
@@ -4601,7 +4606,8 @@ app.post("/notes", async (req, res) => {
       if (buf.length > 16 * 1024 * 1024) return res.status(400).json({ error: 'Arquivo muito grande (máx. 16 MB)' });
       mediaMime = String(mime || 'application/octet-stream').split(';')[0].toLowerCase();
       const ext = (String(filename || '').match(/\.([a-z0-9]{1,6})$/i) || [])[1] || (mediaMime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '');
-      const pasta = 'notas/' + Buffer.from(String(req.owner || 'x')).toString('hex').slice(0, 24);
+      // (a marca antiga eram só as 12 primeiras letras do e-mail: "contato.loja1@" e "contato.loja2@" caíam na mesma pasta)
+      const pasta = 'notas/' + _marcaNota(req.owner || 'x');
       mediaId = `${pasta}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
       const { error: upErr } = await supabase.storage.from('wa-media').upload(mediaId, buf, { contentType: mediaMime, upsert: false });
       if (upErr) { console.error('Anexo da nota:', upErr.message); return res.status(500).json({ error: 'Não consegui guardar o arquivo da nota: ' + upErr.message }); }
@@ -5964,6 +5970,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
   // 🔎 O WhatsApp baixa a foto pelo link. Se o link não abrir, o envio "vai" mas
   // chega sem imagem — então conferimos ANTES e avisamos com clareza.
   try {
+    if (!/^https?:\/\//i.test(String(imgUrl)) || await _hostInterno(new URL(imgUrl).hostname.replace(/^\[|\]$/g, ''))) throw new Error('endereço não permitido'); // nada de rede interna
     const chk = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 8000, maxContentLength: 20 * 1024 * 1024, validateStatus: c => c === 200 });
     const tam = (chk.data && chk.data.byteLength) || 0;
     if (!tam) throw new Error('arquivo vazio');
@@ -8452,6 +8459,12 @@ app.put('/bots/:id/flow', async (req,res) => {
     // lead que chegasse nesse instante encerrava a execução — o bot "parava".
     const novosNos = (nodes || []).map(n=>({ id:n.id, bot_id:botId, type:n.type, label:n.label||'', config:n.config||{}, pos_x:Math.round(n.pos_x||0), pos_y:Math.round(n.pos_y||0), owner:req.owner||null }));
     const novasLig = (edges || []).map(e=>({ id:e.id, bot_id:botId, from_node_id:e.from_node_id, to_node_id:e.to_node_id, label:e.label||'', owner:req.owner||null }));
+    // id de passo/ligação que pertence a OUTRO bot? A gravação por cima (upsert) roubaria
+    // aquele passo do outro bot (e de outra conta) — recusa antes de mexer em nada
+    { const _iN = novosNos.map(n => n.id).filter(Boolean), _iE = novasLig.map(e => e.id).filter(Boolean);
+      const { data: _aN } = _iN.length ? await supabase.from('bot_nodes').select('id').in('id', _iN).neq('bot_id', botId) : { data: [] };
+      const { data: _aE } = _iE.length ? await supabase.from('bot_edges').select('id').in('id', _iE).neq('bot_id', botId) : { data: [] };
+      if ((_aN && _aN.length) || (_aE && _aE.length)) return res.status(409).json({ error: 'Alguns passos deste fluxo pertencem a outro bot. Recarregue a página e tente de novo.' }); }
     if (novosNos.length) { const { error:ne } = await supabase.from('bot_nodes').upsert(novosNos, { onConflict: 'id' }); if (ne) throw ne; }
     if (novasLig.length) { const { error:ee } = await supabase.from('bot_edges').upsert(novasLig, { onConflict: 'id' }); if (ee) throw ee; }
     const idsNos = new Set(novosNos.map(n => String(n.id))), idsLig = new Set(novasLig.map(e => String(e.id)));
