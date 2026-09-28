@@ -498,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 314;
+const SERVER_VER = 316;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5980,9 +5980,13 @@ app.get('/presence', async (req, res) => {
 // 🔇 Silenciar/reativar notificações da conversa
 app.put('/contacts/:phone/mute', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const fone = _decSeguro(req.params.phone);
   const { error } = await supabase.from('contacts').update({ muted: !!req.body.muted })
-    .eq('phone', _decSeguro(req.params.phone)).eq('owner', req.owner || ' ');
+    .eq('phone', fone).eq('owner', req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
+  // 🔇 Igual ao WhatsApp: silenciou, a notificação daquela conversa SAI da bandeja dos
+  // celulares e ela deixa de contar no número do ícone (o aviso "badge" faz os dois).
+  if (req.body.muted) _badgeAvisa(req.owner, fone);
   res.json({ success: true });
 });
 
@@ -7842,6 +7846,96 @@ function _iaAnonima(txt, nomeLead) {
   t = t.replace(/https?:\/\/\S+/g, '{link}');
   return t;
 }
+// 💡 Valor e data reais NÃO entram na memória: a IA copiava "R$ 1.457,05" de um cliente
+// antigo para outro. Vira [VALOR]/[DATA] — e é assim que ela aprende a deixar o marcador
+// para a dona preencher.
+function _iaMascara(t) {
+  return String(t || '')
+    .replace(/R\$\s?\*?\d[\d.]*(?:,\d{1,2})?\*?/g, '[VALOR]')
+    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, '[DATA]');
+}
+// Fala do lead que é só figurinha/mídia sem texto: não ensina nada (31 exemplos assim poluíam a memória)
+const _iaFalaVazia = (linhas) => ![].concat(linhas || []).some(x => { const t = String(x || '').replace(/^Lead: /, '').trim(); return t && !/^\(?\[?(figurinha|sticker|áudio|audio|imagem|image|vídeo|video|documento|document)\b/i.test(t) && !_iaEhMarcador(t); });
+// ── Novidades (informações novas com data) e resumo da parte antiga da conversa ──
+const _iaNovK = (owner) => _iaMemK(owner, 'novidades');
+async function _iaNovidades(owner) {
+  try { const { data } = await supabase.from('settings').select('value').eq('key', _iaNovK(owner)).maybeSingle(); return _iaLinhasJsonl(data && data.value); } catch (_) { return []; }
+}
+async function _iaNovidadesGrava(owner, lista) {
+  const corte = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+  const viva = lista.filter(n => n && n.texto && (n.em || '') >= corte).slice(-40); // 60 dias, no máximo 40
+  await supabase.from('settings').upsert({ key: _iaNovK(owner), value: viva.map(o => JSON.stringify(o)).join('\n'), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  return viva;
+}
+async function _iaNovidadeJunta(owner, textos, em) {
+  const lista = await _iaNovidades(owner);
+  const norm = t => _faqNorm(String(t || '')).slice(0, 80);
+  const ja = new Set(lista.map(n => norm(n.texto)));
+  let n = 0;
+  for (const t of textos) { const x = String(t || '').trim().slice(0, 240); if (!x || ja.has(norm(x))) continue; ja.add(norm(x)); lista.push({ em: em || new Date().toISOString().slice(0, 10), texto: x }); n++; }
+  if (n) await _iaNovidadesGrava(owner, lista);
+  return n;
+}
+// 🧠 Extrai das respostas DELA o que é informação nova e datada (banco fora do ar, prazo que
+// mudou, sistema instável, regra nova). Uma chamada por varredura, só quando houve resposta nova.
+let _iaNovUltima = 0;
+async function _iaExtraiNovidades(owner, textos) {
+  if (!textos.length || !process.env.GROQ_API_KEY) return 0;
+  if (Date.now() - _iaNovUltima < 10 * 60000) { _iaNovFila.push(...textos); return 0; } // junta e manda a cada 10 min
+  const lote = _iaNovFila.splice(0).concat(textos).slice(-40);
+  _iaNovUltima = Date.now();
+  const sys = 'Você lê mensagens que uma correspondente bancária (consignado SIAPE) enviou hoje aos clientes e extrai SÓ informações operacionais NOVAS e passageiras, que valem para todos os clientes nos próximos dias: banco fora do ar ou de volta, saldos/portabilidades suspensos ou liberados, prazo que mudou, sistema instável, regra nova, feriado, promoção. Ignore o que é rotina da operação, cortesia ou específico de um cliente (valor dele, parcela dele). Responda SOMENTE JSON: {"novidades":["frase curta e datável", ...]} — ou {"novidades":[]}.';
+  const usr = 'Hoje é ' + _iaHoje() + '.\n\nMENSAGENS QUE ELA ENVIOU:\n' + lote.map(t => '- ' + String(t).slice(0, 300)).join('\n');
+  try {
+    const { texto } = await _iaChamaGroq(sys, usr, owner);
+    const m = /\{[\s\S]*\}/.exec(texto || ''); const j = m ? JSON.parse(m[0]) : null;
+    const lista = (j && Array.isArray(j.novidades) ? j.novidades : []).map(x => String(x || '').trim()).filter(x => x.length > 8).slice(0, 6);
+    const n = await _iaNovidadeJunta(owner, lista);
+    if (n) console.log('IA anotou ' + n + ' novidade(s) do dia');
+    return n;
+  } catch (e) { console.error('IA novidades:', e.message); return 0; }
+}
+const _iaNovFila = [];
+// 📜 Resumo da parte ANTIGA da conversa: a IA passa a ver a conversa inteira sem estourar o
+// limite de tokens — as últimas 40 mensagens vão por inteiro e o que veio antes vai resumido
+// (com datas, valores, o que já foi feito e pendências). O resumo fica guardado por conversa
+// e só é refeito quando a parte antiga cresce.
+const _iaResumoCache = new Map(); // owner|fone → { ate, texto }
+const _iaResumoK = (owner, phone) => 'ia_resumo::' + (owner || ' ') + '::' + require('crypto').createHash('sha1').update(String(phone)).digest('hex').slice(0, 16);
+async function _iaResumoAntigo(owner, phone, antigas) {
+  if (!antigas.length) return '';
+  const ate = String(antigas[antigas.length - 1].id);
+  const ck = (owner || ' ') + '|' + phone;
+  let c = _iaResumoCache.get(ck);
+  if (!c) { try { const { data } = await supabase.from('settings').select('value').eq('key', _iaResumoK(owner, phone)).maybeSingle(); c = data && data.value ? JSON.parse(data.value) : null; } catch (_) { c = null; } }
+  if (c && c.ate === ate && c.texto) { _iaResumoCache.set(ck, c); return c.texto; }
+  if (!process.env.GROQ_API_KEY) return '';
+  const sys = 'Você resume a parte antiga de uma conversa de WhatsApp entre uma correspondente bancária ("Eu") e um cliente ("Lead"), para que outra IA continue o atendimento sabendo TUDO o que já aconteceu. Escreva em português, no máximo 14 linhas, cada linha começando pela data [dd/mm]: fase da operação, valores/parcelas/bancos/contratos citados (copie os números exatos), documentos e dados que o lead já mandou, o que ela já enviou/prometeu, prazos dados e pendências. Sem opinião, sem cortesia. Responda só o resumo.';
+  const usr = _iaConversaComDatas(antigas, 0).slice(0, 24000);
+  try {
+    const { texto } = await _iaChamaGroq(sys, usr, owner);
+    const resumo = String(texto || '').trim().slice(0, 2400);
+    if (!resumo) return '';
+    c = { ate, texto: resumo, em: new Date().toISOString() };
+    _iaResumoCache.set(ck, c);
+    if (_iaResumoCache.size > 500) _iaResumoCache.delete(_iaResumoCache.keys().next().value);
+    try { await supabase.from('settings').upsert({ key: _iaResumoK(owner, phone), value: JSON.stringify(c), updated_at: new Date().toISOString() }, { onConflict: 'key' }); } catch (_) {}
+    return resumo;
+  } catch (e) { console.error('IA resumo:', e.message); return ''; }
+}
+// Correções dela: o que a IA sugeriu errado → o que ela mandou (as mais parecidas com a fala atual)
+function _iaCorrecoesParecidas(exemplos, textoLead, n) {
+  const ed = exemplos.filter(e => e.origem === 'editada' && [].concat(e.sugerido || []).length && JSON.stringify(e.sugerido) !== JSON.stringify(e.resposta));
+  return _iaExemplosParecidos(ed, textoLead, n);
+}
+// Placar: de tudo que a IA sugeriu, quanto ela aproveitou (aceitou ou editou) — por período
+function _iaPlacar(exemplos, dias) {
+  const desde = new Date(Date.now() - dias * 86400000).toISOString().slice(0, 10);
+  const no = exemplos.filter(e => (e.em || '') >= desde);
+  const sug = no.filter(e => [].concat(e.sugerido || []).length);
+  const aceitas = sug.filter(e => e.origem === 'aceita').length, editadas = sug.filter(e => e.origem === 'editada').length;
+  return { dias, aprendidos: no.length, sugeridas: sug.length, aceitas, editadas, ignoradas: sug.length - aceitas - editadas, aproveitamento_pct: sug.length ? Math.round((aceitas + editadas) / sug.length * 100) : null };
+}
 async function _iaChamaGroq(sys, usr, owner) {
   const pref = _cfg('ia_sug_model', owner);
   const modelos = (pref ? [pref] : []).concat(IA_SUG_MODELOS.filter(m => m !== pref));
@@ -7965,14 +8059,20 @@ async function _iaSugere(owner, phone, forcar) {
   //  a consulta inteira em quem ainda não rodou o SQL da transcrição — e vinha "sem conversa")
   const { data: brutas, error: erroMsgs } = await supabase.from('messages').select('*')
     .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
-    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(80);
+    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(400);
   if (erroMsgs) return { mensagens: [], motivo: 'banco: ' + erroMsgs.message };
-  const msgs = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 50).reverse();
+  // 📜 conversa INTEIRA: as 40 últimas vão por inteiro; o que veio antes vai resumido (com datas)
+  const todas = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 300).reverse();
+  const RECENTES = 40;
+  const msgs = todas.slice(Math.max(0, todas.length - RECENTES));
+  const antigas = todas.slice(0, Math.max(0, todas.length - RECENTES));
   if (!msgs.length) return { mensagens: [], motivo: 'sem conversa' };
   const ult = msgs[msgs.length - 1];
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
   const c = _iaSugCache[chave];
   if (c && !forcar && Date.now() - c.t < 10 * 60000) return c.r;
+  const resumoAntigo = antigas.length ? await _iaResumoAntigo(owner, phone, antigas) : '';
+  const novidades = await _iaNovidades(owner);
   let lead = null;
   try { const { data } = await supabase.from('contacts').select('name, stage_id, tags, notes').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); lead = (data || [])[0] || null; } catch (_) {}
   let etapa = '';
@@ -7984,16 +8084,26 @@ async function _iaSugere(owner, phone, forcar) {
   const textoLead = doLead.map(m => m.type === 'audio' && m.transcript ? m.transcript : (m.content || '')).join(' ');
   // 6 exemplos (eram 8) e conversa mais curta: o plano grátis da Groq limita tokens por minuto
   const exemplos = _iaExemplosParecidos(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6);
+  const correcoes = _iaCorrecoesParecidas(mem.exemplos, textoLead || '', 3);
   const nome = String((lead && lead.name) || '').trim();
   const primeiro = nome.split(/\s+/)[0] || '';
   // ⚡ respostas rápidas e 🤖 bots dela: a IA sugere USAR o que já existe em vez de reescrever o bloco padrão
   const { rapidas, bots } = await _iaCatalogo(owner);
-  const _SO_TEXTO = true; // sugestão = SÓ mensagem personalizada (sem resposta rápida e sem bot)
-  const catTxt = (!_SO_TEXTO && rapidas.length ? '### RESPOSTAS RÁPIDAS DELA (prontas — use só quando for exatamente o que ela mandaria)\n' + rapidas.map(r => '/' + r.atalho + ' — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '')).join('\n') + '\n\n' : '')
-    + (!_SO_TEXTO && bots.length ? '### BOTS DELA (fluxos automáticos que ela dispara na conversa)\n' + bots.map(b => b.nome).join('\n') + '\n\n' : '');
+  // 🎯 texto pronto (rápida/bot) só entra na sugestão como ITEM, e só no momento que ela cadastrou
+  const quando = await _iaQuando(owner);
+  const fixos = await _iaTextosAutomaticos(owner);
+  const rapidasCom = rapidas.filter(r => String(quando.rapidas[r.atalho] || '').trim());
+  const botsCom = bots.filter(b => String(quando.bots[b.id] || '').trim());
+  const _SO_TEXTO = !(rapidasCom.length || botsCom.length); // sem momento cadastrado: só mensagem personalizada
+  const catTxt = (!_SO_TEXTO ? '### RESPOSTAS PRONTAS E BOTS DELA — cada um SÓ no momento cadastrado por ela\n'
+      + rapidasCom.map(r => 'Rápida {"rapida":"/' + r.atalho + '"} — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '') + ' → SÓ QUANDO: ' + String(quando.rapidas[r.atalho]).trim()).join('\n')
+      + (rapidasCom.length && botsCom.length ? '\n' : '')
+      + botsCom.map(b => 'Bot {"bot":"' + b.nome + '"} → SÓ QUANDO: ' + String(quando.bots[b.id]).trim()).join('\n')
+      + '\nRegra: se a conversa está EXATAMENTE nesse momento, devolva o item ({"rapida":"/x"} ou {"bot":"Nome"}) no lugar de escrever o texto dele. Fora desse momento, não use nem o item nem o texto dele — escreva a resposta personalizada.\n\n' : '');
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
+    + (novidades.length ? '### NOVIDADES RECENTES (o que mudou nos últimos dias, com data — quando bater de frente com o manual, vale a novidade)\n' + novidades.slice(-15).map(n => '[' + String(n.em || '').split('-').reverse().slice(0, 2).join('/') + '] ' + n.texto).join('\n') + '\n\n' : '')
     + '### REGRAS DE SAÍDA\n'
     + '- Responda SOMENTE com JSON no formato {"mensagens":["...","..."]}: de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
     + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
@@ -8019,13 +8129,29 @@ async function _iaSugere(owner, phone, forcar) {
     + (_pri ? 'Primeira mensagem desta conversa: ' + _iaDataHora(_pri.timestamp) + ' (há ' + _iaDiasCorridos(_pri.timestamp) + ' dia(s), ' + _iaDiasUteis(_pri.timestamp) + ' útil(eis))\n' : '')
     + (_ultMinha ? 'Última mensagem DELA: ' + _iaDataHora(_ultMinha.timestamp) + ' (há ' + _iaDiasCorridos(_ultMinha.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultMinha.timestamp) + ' útil(eis))\n' : '')
     + (_ultLead ? 'Última mensagem do LEAD: ' + _iaDataHora(_ultLead.timestamp) + ' (há ' + _iaDiasCorridos(_ultLead.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultLead.timestamp) + ' útil(eis))\n' : '');
+  const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300)).join('\n---\n');
   const usr = catTxt + (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
+    + (corrTxt ? '### CORREÇÕES DELA (aprenda com o erro: não repita o que ela trocou)\n' + corrTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
     + tempoTxt
-    + '\n\n### CONVERSA INTEIRA, do começo (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada; as mais antigas vêm encurtadas)\n' + _iaConversaComDatas(msgs, 24)
+    + (resumoAntigo ? '\n\n### RESUMO DA PARTE ANTIGA DA CONVERSA (' + antigas.length + ' mensagens, de ' + _iaDataHora(antigas[0].timestamp) + ' a ' + _iaDataHora(antigas[antigas.length - 1].timestamp) + ')\n' + resumoAntigo : '')
+    + '\n\n### ' + (resumoAntigo ? 'ÚLTIMAS ' + msgs.length + ' MENSAGENS, por inteiro' : 'CONVERSA INTEIRA, do começo') + ' (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs, msgs.length)
     + '\n\nAntes de escrever: olhe as DATAS acima, veja em que ponto da operação este cliente está e o que já foi feito. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
-  const itens = _iaExtraiItens(texto, rapidas, bots, _SO_TEXTO).map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
+  // 🎯 filtro dos itens: rápida/bot só com momento cadastrado; texto que é de rápida/bot vira o
+  // item (se tem momento) ou cai fora (era isso que fazia a IA sugerir "Qualquer dúvida me aciona…" na hora errada)
+  const brutosIt = _iaExtraiItens(texto, rapidas, bots, false);
+  const itensOk = [];
+  for (const it of brutosIt) {
+    if (it.tipo === 'rapida') { if (quando.rapidas[it.atalho] && !itensOk.some(x => x.tipo === 'rapida' && x.atalho === it.atalho)) itensOk.push(it); continue; }
+    if (it.tipo === 'bot') { if (quando.bots[it.id] && !itensOk.some(x => x.tipo === 'bot' && x.id === it.id)) itensOk.push(it); continue; }
+    const dono = _iaDonoDoTexto(it.texto, fixos);
+    if (!dono) { itensOk.push(it); continue; }
+    if (dono.rapida && quando.rapidas[dono.rapida]) { const r = rapidas.find(x => x.atalho === dono.rapida); if (r && !itensOk.some(x => x.tipo === 'rapida' && x.atalho === r.atalho)) itensOk.push({ tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
+    if (dono.bot && quando.bots[dono.bot]) { const b = bots.find(x => x.id === dono.bot); if (b && !itensOk.some(x => x.tipo === 'bot' && x.id === b.id)) itensOk.push({ tipo: 'bot', id: b.id, nome: b.nome }); continue; }
+    // texto pronto sem momento: não entra
+  }
+  const itens = itensOk.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
   const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
     transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)) }; // o app mostra o que o lead disse no áudio
@@ -8090,8 +8216,74 @@ app.get('/ia/status', async (req, res) => {
   if (String(req.owner || '').toLowerCase() !== _CONTA_IA) return res.json({ ligada: false, liberada: false, chave: false, memoria: { estilo: false, fluxo: false, exemplos: 0, aprendidos: 0 } });
   try {
     const m = await _iaMemoria(req.owner);
+    const nov = await _iaNovidades(req.owner);
     res.json({ ligada: await _iaSugLigada(req.owner), chave: !!process.env.GROQ_API_KEY, model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
-      memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length } });
+      memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length, novidades: nov.length },
+      placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// 🎯 Momentos: quando cada rápida/bot pode ser sugerido pela IA
+app.get('/ia/quando', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  const q = await _iaQuando(req.owner); const cat = await _iaCatalogo(req.owner);
+  res.json({ quando: q, rapidas: cat.rapidas.map(r => ({ atalho: r.atalho, previa: r.previa })), bots: cat.bots });
+});
+app.put('/ia/quando', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  const b = req.body || {}; const lim = o => { const out = {}; for (const k in (o || {})) { const v = String(o[k] || '').trim().slice(0, 300); if (v) out[String(k).slice(0, 80)] = v; } return out; };
+  const q = { rapidas: lim(b.rapidas), bots: lim(b.bots) };
+  await supabase.from('settings').upsert({ key: _iaQuandoK(req.owner), value: JSON.stringify(q), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  res.json({ ok: true, quando: q });
+});
+// 📌 Novidades: informações novas com data (a IA anota sozinha das respostas dela; ela também pode escrever/apagar)
+app.get('/ia/novidades', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  res.json({ novidades: await _iaNovidades(req.owner) });
+});
+app.post('/ia/novidades', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  const t = String((req.body && req.body.texto) || '').trim().slice(0, 240);
+  if (!t) return res.status(400).json({ error: 'texto vazio' });
+  const n = await _iaNovidadeJunta(req.owner, [t]);
+  res.json({ ok: true, guardado: n > 0, novidades: await _iaNovidades(req.owner) });
+});
+app.delete('/ia/novidades/:i', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  const lista = await _iaNovidades(req.owner); const i = parseInt(req.params.i, 10);
+  if (!(i >= 0 && i < lista.length)) return res.status(404).json({ error: 'não achei' });
+  lista.splice(i, 1); await _iaNovidadesGrava(req.owner, lista);
+  res.json({ ok: true, novidades: lista });
+});
+// 🧹 Limpa a memória: tira exemplos em que o lead só mandou figurinha/mídia, mascara valores e
+// datas reais ([VALOR]/[DATA]) e remove repetidos. Devolve o que fez.
+app.post('/ia/memoria/limpar', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  try {
+    const r = await _iaMemNaFila(async () => {
+      const mem = await _iaMemoria(req.owner, true);
+      let figurinha = 0, mascarados = 0, repetidos = 0, prontos = 0; const vistos = new Set(); const out = [];
+      const fx = await _iaTextosAutomaticos(req.owner);
+      for (const e of mem.exemplos) {
+        if (_iaFalaVazia(e.lead)) { figurinha++; continue; }
+        const resp = [].concat(e.resposta || []).filter(t => /^\[(rapida|bot):/.test(String(t)) || !_iaEhAutomatica(t, fx));
+        if (resp.length !== [].concat(e.resposta || []).length) { prontos++; if (!resp.length) continue; e.resposta = resp; }
+        const antes = JSON.stringify([e.resposta, e.sugerido, e.contexto]);
+        e.resposta = [].concat(e.resposta || []).map(_iaMascara); e.sugerido = [].concat(e.sugerido || []).map(_iaMascara); e.contexto = [].concat(e.contexto || []).map(_iaMascara); e.lead = [].concat(e.lead || []).map(_iaMascara);
+        if (JSON.stringify([e.resposta, e.sugerido, e.contexto]) !== antes) mascarados++;
+        const k = JSON.stringify([e.lead, e.resposta]);
+        if (vistos.has(k)) { repetidos++; continue; }
+        vistos.add(k); out.push(e);
+      }
+      await _iaMemoriaGrava(req.owner, 'exemplos', out.map(o => JSON.stringify(o)).join('\n'));
+      return { ok: true, antes: mem.exemplos.length, depois: out.length, figurinha, mascarados, repetidos, prontos };
+    });
+    res.json(r);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // GET /ia/memoria — os três textos (para exportar / levar para outra IA)
@@ -8161,8 +8353,11 @@ const _iaMemNaFila = (fn) => { const p = _iaMemFila.then(fn, fn); _iaMemFila = p
 // b: { phone, enviado:[…], sugerido?, lead?, contexto?, chave?, usou?, auto? }
 async function _iaGuardaExemplo(owner, b) {
   const phone = String(b.phone || '').replace(/\D/g, '');
-  const enviadas = [].concat(b.enviado || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 8);
+  let enviadas = [].concat(b.enviado || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 8);
   if (!phone || !enviadas.length) return { erro: 'phone/enviado' };
+  // texto pronto (rápida/bot) não ensina: a IA passava a sugerir "Qualquer dúvida me aciona…" fora de hora
+  try { const fx = await _iaTextosAutomaticos(owner); enviadas = enviadas.filter(t => /^\[(rapida|bot):/.test(t) || !_iaEhAutomatica(t, fx)); } catch (_) {}
+  if (!enviadas.length) return { ok: true, guardado: false, motivo: 'só texto pronto (rápida/bot) — não ensina' };
   if (_iaEhTeste(phone, owner)) return { ok: true, guardado: false, motivo: 'conversa de teste' }; // nada de teste entra na memória
   const sugerido = [].concat(b.sugerido || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
   let nome = '';
@@ -8179,7 +8374,8 @@ async function _iaGuardaExemplo(owner, b) {
     leadLinhas = doLead.map(m => _iaLinha(m).replace(/^Lead: /, ''));
     ctxLinhas = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha);
   }
-  const an = t => _iaAnonima(t, nome).slice(0, 1500);
+  if (_iaFalaVazia(leadLinhas)) return { ok: true, guardado: false, motivo: 'o lead só mandou figurinha/mídia — não ensina nada' };
+  const an = t => _iaMascara(_iaAnonima(t, nome)).slice(0, 1500);
   // a chave identifica a fala do lead só para SUBSTITUIR o exemplo; guardada como resumo (sem o telefone)
   const chave = require('crypto').createHash('sha1').update(String(b.chave || (phone + '|' + leadLinhas.join('|')))).digest('hex').slice(0, 12);
   const ex = {
@@ -8214,14 +8410,29 @@ const _iaAutoCache = {};
 async function _iaTextosAutomaticos(owner) {
   const c = _iaAutoCache[owner || ' '];
   if (c && Date.now() - c.t < 5 * 60000) return c.fixos;
-  const fixos = [];
-  const junta = (t) => { const fixo = String(t || '').split(/\{\{|\{/)[0].replace(/\s+/g, ' ').trim().toLowerCase(); if (fixo.length >= 12) fixos.push(fixo.slice(0, 60)); };
-  try { const { data } = await supabase.from('bot_nodes').select('config').eq('owner', owner || ' ');
-    for (const n of (data || [])) { let cfg = {}; try { cfg = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); } catch (_) {} junta(cfg.text); }
+  const fixos = []; const donos = [];
+  const junta = (t, dono) => { const fixo = String(t || '').split(/\{\{|\{/)[0].replace(/\s+/g, ' ').trim().toLowerCase(); if (fixo.length >= 12) { fixos.push(fixo.slice(0, 60)); donos.push({ fixo: fixo.slice(0, 60), dono }); } };
+  try { const { data } = await supabase.from('bot_nodes').select('config, bot_id').eq('owner', owner || ' ');
+    for (const n of (data || [])) { let cfg = {}; try { cfg = typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); } catch (_) {} junta(cfg.text, { bot: String(n.bot_id || '') }); }
   } catch (_) {}
-  try { const cat = await _iaCatalogo(owner); for (const r of (cat.rapidas || [])) junta(r.texto); } catch (_) {}
+  try { const cat = await _iaCatalogo(owner); for (const r of (cat.rapidas || [])) junta(r.texto, { rapida: r.atalho }); } catch (_) {}
+  fixos.donos = donos;
   _iaAutoCache[owner || ' '] = { t: Date.now(), fixos };
   return fixos;
+}
+// De quem é este texto pronto (rápida "/x" ou bot id)? null se não for texto pronto
+function _iaDonoDoTexto(txt, fixos) {
+  const t = String(txt || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!t) return null;
+  const d = ((fixos && fixos.donos) || []).find(x => x.fixo === t || (x.fixo.length >= 20 && t.startsWith(x.fixo.slice(0, 40))));
+  return d ? d.dono : null;
+}
+// 🎯 MOMENTOS: para cada rápida/bot, quando a IA pode sugerir (texto dela). Sem momento
+// cadastrado, o texto pronto NUNCA aparece na sugestão (ela dispara pelo "/" e "#").
+const _iaQuandoK = (owner) => 'ia_quando::' + (owner || ' ');
+async function _iaQuando(owner) {
+  try { const { data } = await supabase.from('settings').select('value').eq('key', _iaQuandoK(owner)).maybeSingle(); const o = data && data.value ? JSON.parse(data.value) : {}; return { rapidas: (o && o.rapidas) || {}, bots: (o && o.bots) || {} }; }
+  catch (_) { return { rapidas: {}, bots: {} }; }
 }
 const _iaEhAutomatica = (txt, fixos) => {
   const t = String(txt || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -8244,7 +8455,7 @@ async function _iaVarreRespostas() {
   const porFone = new Map();
   for (const m of (brutas || [])) { if (!m || m.type === 'note') continue; if (!porFone.has(m.phone)) porFone.set(m.phone, []); porFone.get(m.phone).push(m); }
   const fixos = await _iaTextosAutomaticos(owner);
-  let novos = 0;
+  let novos = 0; const paraNovidades = [];
   for (const [fone, lista] of porFone) { // lista: da mais nova para a mais antiga
     let k = 0;
     while (k < lista.length && lista[k].direction === 'inbound') k++; // o lead pode ter falado DEPOIS: a resposta dela continua valendo
@@ -8272,10 +8483,13 @@ async function _iaVarreRespostas() {
         : { phone: fone, enviado: enviadas, auto: true });
       if (r && r.guardado) novos++;
     } catch (e) { console.error('IA aprender sozinha:', e.message); }
+    paraNovidades.push(...enviadas);
   }
   _iaVarridoAte = agora - 2 * 60000;
   if (novos) console.log('IA aprendeu sozinha com ' + novos + ' resposta(s) dela');
-  return { novos };
+  let novidades = 0;
+  try { novidades = await _iaExtraiNovidades(owner, paraNovidades); } catch (_) {}
+  return { novos, novidades };
 }
 setTimeout(() => { _soMaestro(_iaVarreRespostas)().catch(() => {}); setInterval(() => { _soMaestro(_iaVarreRespostas)().catch(() => {}); }, 3 * 60000); }, 90000);
 
@@ -8996,7 +9210,7 @@ let _settings = {};
 // configuração e fotos de fluxo de bot). Elas são grandes, ninguém lê da memória
 // (todas as rotas buscam direto no banco) e, sem esta exclusão, elas empurrariam
 // as configurações de verdade para fora do limite de linhas da consulta.
-const _SETTINGS_PESADAS = /^(bkp::|hist::|bot_snap::|msg_trash::|ia_mem::)/;
+const _SETTINGS_PESADAS = /^(bkp::|hist::|bot_snap::|msg_trash::|ia_mem::|ia_resumo::)/;
 async function loadSettings() {
   if (!supabase) return;
   try {
@@ -10041,7 +10255,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(maestro_bg|gasto_banco::.*|owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(maestro_bg|gasto_banco::.*|owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|ia_resumo::.*|ia_quando::.*|.*token.*|.*secret.*)$/i;
 // ── PÁGINA PÚBLICA (Termos e Privacidade) ──────────────────────────
 // privacy.html e terms.html ficam FORA do login: a Meta, o cliente e qualquer
 // pessoa precisam conseguir abrir. Estas páginas mostram a razão social, o CNPJ
@@ -10262,8 +10476,15 @@ async function sendPushToOwner(owner, payload, opt) {
     payload.owner = owner; // o aparelho confere se o aviso é mesmo dele
     // As duas consultas (contador do ícone + aparelhos) vão JUNTAS, e o envio para
     // cada aparelho também: antes era um atrás do outro e cada passo somava atraso.
+    // 🔇 conversa silenciada não conta no ícone (igual WhatsApp); se a coluna "muted"
+    // ainda não existir no banco, lê sem ela (e conta todas)
+    const _naoLidas = async () => {
+      const r = await supabase.from('contacts').select('phone, unread_count, muted').gt('unread_count', 0).eq('owner', owner).then(r => r, () => ({ data: null, error: true }));
+      if (r && !r.error && r.data) return { data: r.data.filter(c => !c.muted) };
+      return supabase.from('contacts').select('phone, unread_count').gt('unread_count', 0).eq('owner', owner).then(r => r, () => ({ data: null }));
+    };
     const [rowsR, subsR] = await Promise.all([
-      supabase.from('contacts').select('phone, unread_count').gt('unread_count', 0).eq('owner', owner).then(r => r, () => ({ data: null })),
+      _naoLidas(),
       supabase.from('push_subscriptions').select('endpoint, subscription').eq('owner', owner),
     ]);
     // Número no ícone = CONVERSAS não lidas (igual ao que o app mostra), não mensagens.
@@ -11415,4 +11636,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
