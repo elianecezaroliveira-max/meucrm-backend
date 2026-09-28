@@ -19,7 +19,7 @@ let supabase = null;
 // ═════ 💸 CACHE DE LEITURA (o Supabase cobra por dado que SAI do banco) ═════
 // Cada aparelho aberto pedia a lista de conversas INTEIRA a cada 3 s e a conversa
 // aberta também — milhares de linhas por pedido, o dia todo, para cada pessoa. Foi
-// isso que estourou a cota de egress do Supabase e derrubou o VETRA.
+// isso que estourou a cota de egress do Supabase e derrubou o FILAZ.
 // Agora o servidor guarda a última resposta na memória e sabe O QUE mudou:
 //   • toda escrita em contacts/messages passa por aqui e anota o TELEFONE mexido;
 //   • a lista de conversas, quando muda, relê SÓ as linhas desses telefones (não a
@@ -137,7 +137,7 @@ function _fonesSujosDesde(desde) {
 }
 
 // ═════ 💸 MEDIDOR DE SAÍDA DO BANCO (para NUNCA MAIS estourar a cota do Supabase) ═════
-// O plano grátis do Supabase dá 5 GB de saída por ciclo. Em setembro/2026 o VETRA gastou
+// O plano grátis do Supabase dá 5 GB de saída por ciclo. Em setembro/2026 o FILAZ gastou
 // 9 GB e o Supabase cortou TUDO (leads, conversas, login) até o fim do ciclo. Agora o
 // servidor SOMA cada byte que sai do banco (linhas lidas + arquivos baixados), por rota e
 // por dia, guarda o total no banco a cada 2 min (sobrevive a deploy e vale para os dois
@@ -387,14 +387,14 @@ app.use(async (req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 🚪 PORTARIA — só usa o VETRA quem VOCÊ liberou
+// 🚪 PORTARIA — só usa o FILAZ quem VOCÊ liberou
 // ═══════════════════════════════════════════════════════════════════
 // Sem isso, qualquer pessoa que criasse um login ganhava uma conta e usava de
 // graça. Agora existe uma lista de e-mails liberados (settings: acesso_liberado).
 //
 // Três travas de segurança para NUNCA deixar você (ou um cliente seu) na rua:
 //   1. A portaria só age quando você LIGA a chave (ligado: true).
-//   2. Ao ligar, o servidor solta automaticamente todo mundo que já usa o VETRA.
+//   2. Ao ligar, o servidor solta automaticamente todo mundo que já usa o FILAZ.
 //   3. O seu e-mail e o ADMIN_TOKEN do Railway passam sempre, aconteça o que
 //      acontecer — é a chave reserva da porta.
 const _ACESSO_K = 'acesso_liberado';
@@ -445,7 +445,7 @@ app.use((req, res, next) => {
     if (_temLiberacao(req)) return next();
     _anotaTentativa(String(req.usuario || req.owner || '').toLowerCase());
     return res.status(403).json({
-      error: 'Este e-mail ainda não foi liberado para usar o VETRA. Fale com quem te forneceu o sistema.',
+      error: 'Este e-mail ainda não foi liberado para usar o FILAZ. Fale com quem te forneceu o sistema.',
       sem_liberacao: true
     });
   } catch (_) { return next(); }   // se a portaria falhar, ela ABRE (nunca tranca por engano)
@@ -463,9 +463,9 @@ function _exigeLogin(req, res) {
   res.status(401).json({ error: 'Faça login no CRM' });
   return false;
 }
-app.get("/", (req, res) => res.send("VETRA Backend funcionando!"));
+app.get("/", (req, res) => res.send("FILAZ Backend funcionando!"));
 // ═══════════════════════════════════════════════════════════════════
-// 🔑 ENTREGA DO LOGIN (iPhone com o VETRA na tela inicial)
+// 🔑 ENTREGA DO LOGIN (iPhone com o FILAZ na tela inicial)
 // ═══════════════════════════════════════════════════════════════════
 // No iPhone, o app da tela inicial abre o login do Google numa janela do Safari que
 // tem um "cofre" SEPARADO: o login acontecia lá, mas o app continuava sem sessão e
@@ -498,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 316;
+const SERVER_VER = 317;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1538,7 +1538,7 @@ async function addNotice(owner, text, dedupeKey, opts) {
     });
     list = list.slice(0, 80);
     await supabase.from('settings').upsert({ key: K, value: JSON.stringify(list), updated_at: new Date().toISOString() });
-    sendPushToOwner(owner || null, { title: 'VETRA — Aviso', body: text, tag: 'notice' }).catch(() => {});
+    sendPushToOwner(owner || null, { title: 'FILAZ — Aviso', body: text, tag: 'notice' }).catch(() => {});
   } catch (e) { console.error('addNotice:', e.message); }
 }
 // Conta voltou → neutraliza o marcador de "desconectada" (permite avisar numa próxima queda)
@@ -1770,7 +1770,7 @@ app.get('/accounts/uso', async (req, res) => {
 
 // O que depende deste número (para avisar antes de excluir)
 // 🔎 Onde este modelo está sendo usado? Antes de esconder ou apagar um modelo,
-// o VETRA avisa se algum bot depende dele — senão o passo do bot fica apontando
+// o FILAZ avisa se algum bot depende dele — senão o passo do bot fica apontando
 // para um modelo que não existe mais e ninguém descobre até o cliente reclamar.
 app.get('/templates/uso', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
@@ -1831,7 +1831,7 @@ app.post("/accounts", async (req, res) => {
   let token = String(req.body.token || '').trim();
   // REAPROVEITAR O TOKEN DE OUTRA CONTA: a Meta mostra o token de usuário do
   // sistema uma única vez. Quem já colou um aqui não precisa gerar outro a cada
-  // número novo — o VETRA usa o que já está guardado (o token não vai para a
+  // número novo — o FILAZ usa o que já está guardado (o token não vai para a
   // tela em momento nenhum; a troca é só aqui dentro).
   const _tokenDe = String(req.body.usar_token_de || '').trim();
   if (!token && _tokenDe) {
@@ -1928,7 +1928,7 @@ app.get('/accounts/:id/meta-diag', async (req, res) => {
     const nome = String(d.name_status || '').toUpperCase();
     const passos = [];
     if (cod && cod !== 'VERIFIED') passos.push('1) VERIFICAR O NÚMERO: no Gerenciador da Meta (WhatsApp > Números), clique no número e conclua a verificação por SMS ou ligação.');
-    if (st === 'PENDING' || st === 'UNVERIFIED') passos.push('2) REGISTRAR na Cloud API: use o botão "Ativar na Meta" aqui no VETRA (registra o número com um PIN de 6 dígitos).');
+    if (st === 'PENDING' || st === 'UNVERIFIED') passos.push('2) REGISTRAR na Cloud API: use o botão "Ativar na Meta" aqui no FILAZ (registra o número com um PIN de 6 dígitos).');
     if (nome && !['APPROVED', 'AVAILABLE_WITHOUT_REVIEW'].includes(nome)) passos.push('3) NOME DE EXIBIÇÃO em análise/rejeitado (' + nome + '): a Meta leva até 48h. O número pode ficar "Pendente" até aprovar.');
     res.json({ tipo: 'api', numero: d.display_phone_number || null, nome_exibicao: d.verified_name || null,
       status: st || null, verificacao: cod || null, nome_status: nome || null, qualidade: d.quality_rating || null, passos });
@@ -2050,7 +2050,7 @@ async function _isSelfSend(to, account_id) {
   } catch (_) { return false; }
 }
 
-// 💬 RESPONDER DE VERDADE: o VETRA guarda a citação pelo id INTERNO da mensagem,
+// 💬 RESPONDER DE VERDADE: o FILAZ guarda a citação pelo id INTERNO da mensagem,
 // mas o WhatsApp precisa do id DELE (wamid) para desenhar a citação no celular do
 // cliente. Aqui trocamos um pelo outro. Se a mensagem citada for antiga demais e
 // não tiver wamid, o envio segue normal — só sem a citação (nunca falha por isso).
@@ -2349,7 +2349,7 @@ function convertAudioToOpus(buf) {
 function _fmtDur(s) { s = Math.max(0, Math.round(s || 0)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
 // ═══════════════════════════════════════════════════════════════════
 // 📩 MENSAGENS DO QR CODE EM CAIXAS ESPECIAIS (modelo aprovado com botões, lista,
-//    "ver uma vez", temporária, editada). Sem isto elas chegavam no VETRA como
+//    "ver uma vez", temporária, editada). Sem isto elas chegavam no FILAZ como
 //    "[Mensagem recebida]", sem o texto — foi o caso do código de verificação.
 // ═══════════════════════════════════════════════════════════════════
 function _qrDentro(m) {
@@ -3081,7 +3081,7 @@ app.get('/audio-dur/:mediaId', async (req, res) => {
   if (!_ffmpeg || !supabase) return res.json({ seconds: 0 });
   try {
     let buf = null;
-    // 1º: a cópia no cofre do VETRA (não gasta cota da Meta e é mais rápido)
+    // 1º: a cópia no cofre do FILAZ (não gasta cota da Meta e é mais rápido)
     const caminhos = /^(qr|notas|bot)\//.test(mediaId) ? [mediaId] : ['api/' + mediaId];
     for (const c of caminhos) {
       try {
@@ -3182,11 +3182,11 @@ app.get('/exportar/arquivos.html', async (req, res) => {
   const base = (req.headers['x-forwarded-proto'] || 'https') + '://' + req.headers.host;
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="arquivos_' + new Date().toISOString().slice(0, 10) + '.html"');
-  res.write('<!doctype html><meta charset="utf-8"><title>Arquivos do VETRA</title>'
+  res.write('<!doctype html><meta charset="utf-8"><title>Arquivos do FILAZ</title>'
     + '<style>body{font-family:system-ui,Arial;margin:24px;color:#131c20}h1{font-size:19px}'
     + 'table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid #e9edef;padding:7px 8px;text-align:left}'
     + 'a{color:#00806a}</style><h1>Arquivos recebidos e enviados</h1>'
-    + '<p style="font-size:13px;color:#667781">Clique para baixar. Os links funcionam com você conectado ao VETRA.</p>'
+    + '<p style="font-size:13px;color:#667781">Clique para baixar. Os links funcionam com você conectado ao FILAZ.</p>'
     + '<table><tr><th>Data</th><th>Lead</th><th>Tipo</th><th>Arquivo</th></tr>');
   let n = 0;
   for await (const bloco of _todasMensagens(req.owner, null)) {
@@ -4019,7 +4019,7 @@ app.post("/import/lead", async (req, res) => {
 // ⏳ GOTEJAMENTO (substitui o 2º fluxo do n8n): move leads de uma etapa para
 // outra UM POR VEZ, com intervalo aleatório entre eles (ex.: 3,5 a 5 min), para
 // que os bots da etapa de destino disparem espaçados. Regras por conta em
-// Quanto tempo a fila precisa ficar VAZIA para o VETRA considerar que o ciclo
+// Quanto tempo a fila precisa ficar VAZIA para o FILAZ considerar que o ciclo
 // terminou de verdade (e só então avisar, uma única vez).
 const _DRIP_CARENCIA_MS = 10 * 60 * 1000; // 10 minutos
 // settings drip_rules::owner = [{ id, nome, de, para, min_seg, max_seg, ativo,
@@ -4830,7 +4830,7 @@ app.post("/notes", async (req, res) => {
   if (!phone) return res.status(400).json({ error: "Telefone é obrigatório" });
   if (!txt && !arquivo) return res.status(400).json({ error: "Escreva algo ou anexe um arquivo" });
   // 📎 Anexo da nota: fica no NOSSO cofre, numa pasta separada. Nunca passa
-  // pelo WhatsApp — é só para você e sua equipe verem dentro do VETRA.
+  // pelo WhatsApp — é só para você e sua equipe verem dentro do FILAZ.
   let mediaId = null, mediaMime = null;
   if (arquivo) {
     try {
@@ -5131,7 +5131,7 @@ app.get("/templates", async (req, res) => {
   }
 });
 
-// Modelos escondidos no CRM (a Meta às vezes recusa apagar; então o VETRA só
+// Modelos escondidos no CRM (a Meta às vezes recusa apagar; então o FILAZ só
 // esconde). Guardar na conta faz o "excluir" valer em todos os aparelhos.
 app.get('/tmpl-ocultos', async (req, res) => {
   if (!supabase) return res.json([]);
@@ -5204,7 +5204,7 @@ app.delete("/templates/:template_id", async (req, res) => {
 });
 
 // ── LIXEIRA DOS MODELOS ──
-// Antes de apagar na Meta, o VETRA guarda o modelo inteiro aqui. Assim dá para
+// Antes de apagar na Meta, o FILAZ guarda o modelo inteiro aqui. Assim dá para
 // recriar depois, sem depender da Meta ter mantido alguma cópia (ela não mantém).
 app.get('/tmpl-lixeira', async (req, res) => {
   if (!supabase) return res.json([]);
@@ -5773,7 +5773,7 @@ async function _subscribeRecentPresence(owner) {
 // primeira cópia carimba a mensagem NA MEMÓRIA, sem esperar o banco; a
 // segunda vê o carimbo e vai embora. (Vale por 30 min; o banco segue como
 // segunda barreira para cópias mais tardias.)
-// Ids das mensagens enviadas PELO SERVIDOR (VETRA ou bot) no canal QR. O eco
+// Ids das mensagens enviadas PELO SERVIDOR (FILAZ ou bot) no canal QR. O eco
 // delas volta pelo mesmo caminho das mensagens digitadas no celular — e era
 // tratado como "você respondeu pelo celular": zerava as não lidas. Um bot
 // respondendo NÃO é você lendo a conversa (igual WhatsApp: a conversa continua
@@ -5925,7 +5925,7 @@ app.get('/link-preview', async (req, res) => {
     const hit = _linkPrevCache.get(url);
     if (hit && Date.now() - hit.ts < 6 * 3600000) return res.json(hit.data);
     const r = await axios.get(url, { timeout: 6000, maxContentLength: 512 * 1024, maxRedirects: 0, validateStatus: c => c >= 200 && c < 300, // sem seguir redirecionamento: um link podia desviar para um endereço interno do servidor
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VETRA-CRM/1.0)' }, responseType: 'text',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FILAZ-CRM/1.0)' }, responseType: 'text',
       validateStatus: st => st >= 200 && st < 400 });
     const html = String(r.data || '').slice(0, 300000);
     const pick = (re) => { const m = html.match(re); return m ? m[1].trim() : null; };
@@ -7535,7 +7535,7 @@ async function handleFaqAutoReply(phone, text, owner, accountId) {
 }
 
 // ── CRUD de FAQ (perguntas/respostas da IA) ──
-// 🔒 A aba "IA" (respostas automáticas + sugestões) é SÓ da conta principal (a dona do VETRA
+// 🔒 A aba "IA" (respostas automáticas + sugestões) é SÓ da conta principal (a dona do FILAZ
 // e a equipe dela). Outras contas: a tela não aparece e estas rotas recusam.
 const _CONTA_IA = 'elianecezaroliveira@gmail.com';
 function _soContaIA(req, res) {
@@ -8753,7 +8753,7 @@ app.get('/uso-conta', async (req, res) => {
 // ── BACKUP: baixa tudo o que é configuração (não leva conversas nem leads) ──
 const _BK_CHAVES = ['quick_replies', 'tag_catalog', 'tag_cores', 'stage_actions', 'drip_rules', 'sheets_sync'];
 app.get('/backup', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do FILAZ.' });
   if (_bancoPoupa(req, res, 'o backup manual')) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
@@ -8780,7 +8780,7 @@ app.get('/backup', async (req, res) => {
 // gotejamento e planilha). Bots e etapas ficam no arquivo, mas não são
 // sobrescritos aqui — mexer neles às cegas quebraria o que está rodando.
 app.post('/backup/restaurar', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do FILAZ.' });
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
   if (!_exigeAdmin(req, res, 'restaurar um backup')) return;
@@ -9193,7 +9193,7 @@ setInterval(async () => {
       if (!count) continue;
       await sendPushToOwner(ownerVal, {
         title: 'Tarefas em aberto',
-        body: `Você tem ${count} tarefa${count > 1 ? 's' : ''} em aberto no VETRA`,
+        body: `Você tem ${count} tarefa${count > 1 ? 's' : ''} em aberto no FILAZ`,
         tag: 'task-reminder'
       });
     }
@@ -9319,7 +9319,7 @@ function _exigeAdmin(req, res, oque) {
   res.status(403).json({ error: 'Seu acesso é de atendente — ' + (oque || 'esta ação') + ' é só para administradores. Peça a quem administra a conta.', sem_permissao: true });
   return false;
 }
-// Quem FORNECE o VETRA (você). Vale o e-mail titular do sistema ou o
+// Quem FORNECE o FILAZ (você). Vale o e-mail titular do sistema ou o
 // ADMIN_TOKEN das variáveis do Railway (socorro quando o login está fora do ar).
 function _ehDono(req) {
   const q = String((req && req.usuario) || (req && req.owner) || '').toLowerCase();
@@ -9360,7 +9360,7 @@ app.put('/equipe/:email/papel', async (req, res) => {
 // 💳 PLANO / COBRANÇA — validade, limites e suspensão
 // ═══════════════════════════════════════════════════════════════════
 // O plano de cada cliente fica em settings, chave billing::<dono>. Só QUEM VENDE
-// o VETRA mexe (e-mail titular do sistema ou ADMIN_TOKEN do Railway).
+// o FILAZ mexe (e-mail titular do sistema ou ADMIN_TOKEN do Railway).
 // Regra de ouro: plano vencido NUNCA apaga nem esconde dados. Ele só impede
 // ENVIAR mensagem nova. Ler, exportar e fazer backup continuam liberados.
 const _TOLERANCIA_DIAS = 5; // depois de vencer, ainda envia por 5 dias
@@ -9382,7 +9382,7 @@ function _planoInfo(owner) {
     if (dias < -_TOLERANCIA_DIAS) { bloqueado = true; motivo = 'O plano venceu em ' + _brDia(val) + '.'; }
   }
   return {
-    plano: p.plano || 'VETRA', validade: val, validade_br: _brDia(val), dias_restantes: dias,
+    plano: p.plano || 'FILAZ', validade: val, validade_br: _brDia(val), dias_restantes: dias,
     vencido, bloqueado, motivo, tolerancia_dias: _TOLERANCIA_DIAS,
     limite_numeros: p.limite_numeros || null, limite_msgs_mes: p.limite_msgs_mes || null,
     contato: p.contato || null, obs: p.obs || null, sem_plano: !val && !p.plano,
@@ -9396,7 +9396,7 @@ function _planoBarra(req, res) {
   try { i = _planoInfo(req.owner); } catch (_) { return false; }
   if (!i.bloqueado) return false;
   res.status(402).json({
-    error: (i.motivo || 'Plano suspenso.') + ' Fale com quem te forneceu o VETRA para reativar. Nada foi perdido: suas conversas, leads e configurações continuam aqui.',
+    error: (i.motivo || 'Plano suspenso.') + ' Fale com quem te forneceu o FILAZ para reativar. Nada foi perdido: suas conversas, leads e configurações continuam aqui.',
     plano_bloqueado: true
   });
   return true;
@@ -9405,14 +9405,14 @@ function _planoBarra(req, res) {
 app.put('/billing', async (req, res) => {
   if (!_ehDono(req)) {
     if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
-    return res.status(403).json({ error: 'Só quem fornece o VETRA pode mexer no plano.' });
+    return res.status(403).json({ error: 'Só quem fornece o FILAZ pode mexer no plano.' });
   }
   const alvo = String(req.body && req.body.dono || req.owner || '').toLowerCase();
   if (!alvo || alvo.indexOf('@') < 0) return res.status(400).json({ error: 'Informe o e-mail do cliente em "dono".' });
   const b = req.body || {};
   const atual = _planoBruto(alvo) || {};
   const novo = {
-    plano: b.plano !== undefined ? String(b.plano || '').slice(0, 60) : (atual.plano || 'VETRA'),
+    plano: b.plano !== undefined ? String(b.plano || '').slice(0, 60) : (atual.plano || 'FILAZ'),
     validade: b.validade !== undefined ? (/^\d{4}-\d{2}-\d{2}$/.test(String(b.validade || '')) ? b.validade : null) : (atual.validade || null),
     suspenso: b.suspenso !== undefined ? !!b.suspenso : !!atual.suspenso,
     limite_numeros: b.limite_numeros !== undefined ? (parseInt(b.limite_numeros, 10) || null) : (atual.limite_numeros || null),
@@ -9611,7 +9611,7 @@ async function _backupAutoTodos() {
 setTimeout(() => { _soMaestro(_backupAutoTodos)(); setInterval(_soMaestro(_backupAutoTodos), 24 * 3600 * 1000); }, 10 * 60000);
 
 app.get('/backup/auto', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do FILAZ.' });
   if (!_exigeLogin(req, res)) return;
   try {
     // só as datas: baixar o conteúdo de 30 cópias só para montar a lista seria desperdício
@@ -9624,7 +9624,7 @@ app.get('/backup/auto', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/backup/auto/:dia', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do FILAZ.' });
   if (!_exigeLogin(req, res)) return;
   const dia = String(req.params.dia || '').slice(0, 10);
   const { data: _d0 } = await supabase.from('settings').select('value').eq('key', 'bkp::' + req.owner + '::' + dia).maybeSingle();
@@ -9633,7 +9633,7 @@ app.get('/backup/auto/:dia', async (req, res) => {
   try { res.json(JSON.parse(data.value)); } catch (_) { res.status(500).json({ error: 'Cópia ilegível.' }); }
 });
 app.post('/backup/auto/agora', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do FILAZ.' });
   if (!_exigeLogin(req, res)) return;
   if (!_exigeAdmin(req, res, 'gerar uma cópia agora')) return;
   const r = await _backupAutoDe(req.owner);
@@ -9642,7 +9642,7 @@ app.post('/backup/auto/agora', async (req, res) => {
   res.json({ ok: true, dia: r.dia });
 });
 app.post('/backup/auto/restaurar', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do FILAZ.' });
   if (!_exigeLogin(req, res)) return;
   if (!_exigeAdmin(req, res, 'restaurar um backup')) return;
   const dia = String(req.body?.dia || '').slice(0, 10);
@@ -9677,7 +9677,7 @@ app.post('/backup/auto/restaurar', async (req, res) => {
 //   ✅ enviadas por número da API oficial (texto, foto, áudio, arquivo) = SERVIÇO
 //   ✅ enviadas por modelo aprovado (template) = MODELO — já é cobrado hoje
 //   ❌ recebidas do cliente (a Meta nunca cobra)
-//   ❌ notas internas (nunca saem do VETRA)
+//   ❌ notas internas (nunca saem do FILAZ)
 //   ❌ que falharam (a Meta cobra só o que é ENTREGUE)
 //   ❌ números por QR Code (não passam pela Meta, não têm cobrança)
 const _CUSTOS_PADRAO = { preco_servico: 0.035, preco_modelo: 0.035, franquia: 1000, por: 'waba' };
@@ -9965,12 +9965,12 @@ async function _renovaPlano(email, dias, origem) {
   return nova;
 }
 app.get('/admin/pagamento', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA vê isto.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê isto.' });
   const c = _pagCfg();
   res.json({ token: c.token || null, ciclo_dias: c.ciclo_dias || 30, log: c.log || [] });
 });
 app.put('/admin/pagamento', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode mexer nisto.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode mexer nisto.' });
   const c = _pagCfg();
   if (req.body?.gerar_token) c.token = 'pag_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   if (req.body?.ciclo_dias !== undefined) c.ciclo_dias = Math.min(400, Math.max(1, parseInt(req.body.ciclo_dias, 10) || 30));
@@ -9978,7 +9978,7 @@ app.put('/admin/pagamento', async (req, res) => {
   res.json({ ok: true, token: c.token || null, ciclo_dias: c.ciclo_dias || 30 });
 });
 app.post('/admin/pagamento/registrar', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode registrar pagamento.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode registrar pagamento.' });
   const email = String(req.body?.email || '').trim().toLowerCase();
   const dias = Math.min(400, Math.max(1, parseInt(req.body?.dias, 10) || (_pagCfg().ciclo_dias || 30)));
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'E-mail inválido.' });
@@ -10039,7 +10039,7 @@ app.post('/solicitar-acesso', async (req, res) => {
   res.json({ ok: true });
 });
 app.delete('/admin/acesso/pedido/:email', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode descartar pedidos.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode descartar pedidos.' });
   const email = _decSeguro(req.params.email).trim().toLowerCase();
   const l = _acessoLista();
   if (l.pedidos) delete l.pedidos[email];
@@ -10059,9 +10059,9 @@ function _todosOsDonos() {
   return donos;
 }
 app.get('/admin/acesso', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA vê esta lista.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê esta lista.' });
   const l = _acessoLista();
-  // Quem já usa o VETRA mas ainda NÃO está na lista — é o que seria trancado
+  // Quem já usa o FILAZ mas ainda NÃO está na lista — é o que seria trancado
   const fora = [];
   try {
     const contas = new Set();
@@ -10077,7 +10077,7 @@ app.get('/admin/acesso', async (req, res) => {
   res.json({ ligado: l.ligado, emails: l.emails, tentativas: l.tentativas, pedidos: l.pedidos || {}, ja_usam_sem_liberacao: fora.sort(), planos, eu: OWNER_LEGADO });
 });
 app.post('/admin/acesso', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode liberar acesso.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode liberar acesso.' });
   const email = String(req.body && req.body.email || '').trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'E-mail inválido.' });
   const l = _acessoLista();
@@ -10094,7 +10094,7 @@ app.post('/admin/acesso', async (req, res) => {
   if (b.plano || b.validade) {
     const atual = _planoBruto(email) || {};
     const novo = {
-      plano: b.plano ? String(b.plano).slice(0, 60) : (atual.plano || 'VETRA'),
+      plano: b.plano ? String(b.plano).slice(0, 60) : (atual.plano || 'FILAZ'),
       validade: /^\d{4}-\d{2}-\d{2}$/.test(String(b.validade || '')) ? b.validade : (atual.validade || null),
       suspenso: false,
       limite_numeros: atual.limite_numeros || null, limite_msgs_mes: atual.limite_msgs_mes || null,
@@ -10108,7 +10108,7 @@ app.post('/admin/acesso', async (req, res) => {
   res.json({ ok: true, email, plano: _planoInfo(email) });
 });
 app.delete('/admin/acesso/:email', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode bloquear acesso.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode bloquear acesso.' });
   const email = _decSeguro(req.params.email).trim().toLowerCase();
   if (email === OWNER_LEGADO) return res.status(400).json({ error: 'Você não pode bloquear o seu próprio acesso.' });
   const l = _acessoLista();
@@ -10117,9 +10117,9 @@ app.delete('/admin/acesso/:email', async (req, res) => {
   console.log('Acesso BLOQUEADO para ' + email);
   res.json({ ok: true });
 });
-// Liga/desliga a portaria. Ao LIGAR, solta automaticamente quem já usa o VETRA.
+// Liga/desliga a portaria. Ao LIGAR, solta automaticamente quem já usa o FILAZ.
 app.put('/admin/acesso/trava', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA pode mexer na portaria.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode mexer na portaria.' });
   const l = _acessoLista();
   const ligar = !!(req.body && req.body.ligado);
   let soltos = [];
@@ -10142,7 +10142,7 @@ app.put('/admin/acesso/trava', async (req, res) => {
 });
 
 app.get('/admin/clientes', async (req, res) => {
-  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o VETRA vê este painel.' });
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê este painel.' });
   if (!supabase) return res.json({ clientes: [] });
   try {
     const donos = new Set();
@@ -10224,7 +10224,7 @@ app.post('/equipe', async (req, res) => {
   // Não engole uma conta que já tem dados próprios
   try {
     const { count } = await supabase.from('contacts').select('phone', { count: 'exact', head: true }).eq('owner', email);
-    if (count && count > 0) return res.status(409).json({ error: 'Este e-mail já tem uma conta com dados próprios no VETRA. Ele precisa entrar com a conta dele.' });
+    if (count && count > 0) return res.status(409).json({ error: 'Este e-mail já tem uma conta com dados próprios no FILAZ. Ele precisa entrar com a conta dele.' });
   } catch (_) {}
   mapa[email] = String(req.owner).toLowerCase();
   await _equipeSalva(mapa);
@@ -10452,7 +10452,7 @@ app.post('/push/test', async (req, res) => {
     for (const s of subs || []) {
       try {
         await webpush.sendNotification(s.subscription,
-          JSON.stringify({ title: 'VETRA', body: 'Notificações funcionando!', tag: 'push-test' }), { TTL: 300, urgency: 'high' });
+          JSON.stringify({ title: 'FILAZ', body: 'Notificações funcionando!', tag: 'push-test' }), { TTL: 300, urgency: 'high' });
         results.push({ ok: true });
       } catch (e) {
         results.push({ ok: false, status: e.statusCode || null, msg: String(e.body || e.message || '').substring(0, 150) });
@@ -11509,7 +11509,7 @@ app.post('/evolution-webhook', async (req, res) => {
         return;
       }
 
-      // Eco de uma mensagem que o PRÓPRIO servidor mandou (VETRA ou bot)? Dá
+      // Eco de uma mensagem que o PRÓPRIO servidor mandou (FILAZ ou bot)? Dá
       // tempo de o CRM gravar a dele (o eco costuma voltar antes) — a checagem
       // "já existe" abaixo então a reconhece e nada duplica.
       const ecoDoServidor = fromMe && _ehEcoDoServidor(wamid);
@@ -11543,7 +11543,7 @@ app.post('/evolution-webhook', async (req, res) => {
       if (supabase) {
         // Dedup: evita duplicar mensagens já salvas (ex.: o eco das enviadas pelo próprio CRM).
         // IMPORTANTE: filtra também pelo telefone da conversa — quando DOIS números
-        // conectados no VETRA conversam entre si, a mensagem chega com o MESMO wamid
+        // conectados no FILAZ conversam entre si, a mensagem chega com o MESMO wamid
         // nos dois lados; sem o filtro, o lado que recebia era descartado como "eco"
         // e a mensagem nunca aparecia para quem recebeu.
         if (wamid) {
@@ -11576,7 +11576,7 @@ app.post('/evolution-webhook', async (req, res) => {
         if (accountId && (fromMe || !existC || existC.account_id == null)) contactData.account_id = accountId;
         // Você respondeu pelo CELULAR/WhatsApp Web → a conversa deixa de ser "não lida"
         // no CRM (mensagens enviadas pelo próprio CRM não passam por aqui — dedupe acima)
-        // (eco do servidor — bot ou VETRA — NÃO conta: quem zera as não lidas é você)
+        // (eco do servidor — bot ou FILAZ — NÃO conta: quem zera as não lidas é você)
         if (fromMe && !ecoDoServidor) { contactData.unread_count = 0; contactData.first_unread_at = null; }
         const { error: cErr } = await supabase.from('contacts').upsert(contactData, { onConflict: 'owner,phone' });
         if (cErr) console.error('Evolution: erro ao salvar contato:', cErr.message);
