@@ -6,7 +6,7 @@ const cors = require("cors");
 const app = express();
 app.set('trust proxy', true); // Railway fica atrás de proxy: req.ip = IP real
 app.use(express.json({ limit: '30mb', verify: (req, _res, buf) => { req.rawBody = buf; } })); // rawBody = assinatura do webhook da Meta
-app.use(cors());
+app.use(cors({ exposedHeaders: ['X-Vetra-Poll', 'X-Vetra-Banco'] })); // o app lê o ritmo pedido pelo medidor do banco
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -16,8 +16,272 @@ const APP_SECRET = process.env.APP_SECRET;
 const PORT = process.env.PORT || 3000;
 
 let supabase = null;
+// ═════ 💸 CACHE DE LEITURA (o Supabase cobra por dado que SAI do banco) ═════
+// Cada aparelho aberto pedia a lista de conversas INTEIRA a cada 3 s e a conversa
+// aberta também — milhares de linhas por pedido, o dia todo, para cada pessoa. Foi
+// isso que estourou a cota de egress do Supabase e derrubou o VETRA.
+// Agora o servidor guarda a última resposta na memória e sabe O QUE mudou:
+//   • toda escrita em contacts/messages passa por aqui e anota o TELEFONE mexido;
+//   • a lista de conversas, quando muda, relê SÓ as linhas desses telefones (não a
+//     tabela inteira) e encaixa na lista guardada;
+//   • a conversa aberta só é relida quando chegou algo NELA (versão por conversa);
+//   • vários aparelhos pedindo a mesma coisa = UMA leitura.
+// Escrita sem telefone conhecido (ex.: recibo por wamid) invalida tudo, por segurança.
+const _tabVer = { contacts: 0, messages: 0 };
+const _sujoLog = { contacts: [] };          // [{ ver, fones:[…] | null }] (null = tudo)
+const _verConv = new Map();                 // telefone → versão da conversa
+function _marcaSujo(tabela, fones) {
+  _tabVer[tabela]++;
+  if (tabela === 'contacts') {
+    _sujoLog.contacts.push({ ver: _tabVer.contacts, fones: fones ? fones.map(String) : null });
+    if (_sujoLog.contacts.length > 400) _sujoLog.contacts.splice(0, _sujoLog.contacts.length - 400);
+  } else {
+    if (!fones) { _verConv.clear(); _verGeralMsgs++; return; }
+    for (const f of fones) for (const v of (typeof phoneVariants === 'function' ? phoneVariants(f) : [String(f)])) _verConv.set(v, (_verConv.get(v) || 0) + 1);
+  }
+}
+let _verGeralMsgs = 0; // escrita em messages SEM telefone conhecido: todas as conversas releem
+const _fonePorWamid = new Map(); // wamid → telefone (os recibos de entrega/leitura chegam só com o wamid)
+function _lembraWamid(wamid, fone) {
+  if (!wamid || !fone) return;
+  _fonePorWamid.set(String(wamid), String(fone));
+  if (_fonePorWamid.size > 8000) { const k = _fonePorWamid.keys().next().value; _fonePorWamid.delete(k); }
+}
+const _versaoConversa = (fone) => _verGeralMsgs + '|' + ((typeof phoneVariants === 'function' ? phoneVariants(fone) : [String(fone)]).map(v => _verConv.get(v) || 0).join(','));
+function _embrulhaParaCache(cli) {
+  const fromOrig = cli.from.bind(cli);
+  cli.from = (tabela) => {
+    const b = fromOrig(tabela);
+    // 💸 toda consulta (qualquer tabela) passa pelo medidor de saída
+    for (const m of ['select', 'insert', 'upsert', 'update', 'delete']) {
+      if (typeof b[m] !== 'function') continue;
+      const o = b[m].bind(b);
+      b[m] = (...a) => _medeSaida(o(...a), null);
+    }
+    if (tabela !== 'contacts' && tabela !== 'messages') return b;
+    const campoFone = tabela === 'contacts' ? 'phone' : 'phone';
+    for (const m of ['insert', 'upsert']) {
+      if (typeof b[m] !== 'function') continue;
+      const orig = b[m].bind(b);
+      b[m] = (linhas, ...a) => {
+        const arr = Array.isArray(linhas) ? linhas : [linhas];
+        const fones = arr.map(r => r && r[campoFone]).filter(Boolean);
+        if (tabela === 'messages') arr.forEach(r => { if (r) _lembraWamid(r.wamid, r.phone); });
+        _marcaSujo(tabela, fones.length === arr.length && fones.length ? fones : null);
+        return orig(linhas, ...a);
+      };
+    }
+    for (const m of ['update', 'delete']) {
+      if (typeof b[m] !== 'function') continue;
+      const orig = b[m].bind(b);
+      b[m] = (...a) => {
+        const fb = orig(...a);
+        const fones = []; let marcado = false, semFone = false;
+        try {
+          const eqO = fb.eq.bind(fb), inO = fb.in.bind(fb), thenO = fb.then.bind(fb);
+          fb.eq = (c, v) => {
+            if (c === campoFone) fones.push(v);
+            else if (c === 'wamid' && tabela === 'messages') { const f = _fonePorWamid.get(String(v)); if (f) fones.push(f); else semFone = true; }
+            return eqO(c, v);
+          };
+          fb.in = (c, v) => { if (c === campoFone) (v || []).forEach(x => fones.push(x)); return inO(c, v); };
+          fb.then = (ok, err) => { if (!marcado) { marcado = true; _marcaSujo(tabela, (fones.length && !semFone) ? fones : null); } return thenO(ok, err); };
+        } catch (_) { _marcaSujo(tabela, null); }
+        return fb;
+      };
+    }
+    return b;
+  };
+  // 💸 arquivo baixado do Storage também é saída (foto, áudio, documento)
+  try {
+    if (cli.storage && typeof cli.storage.from === 'function') {
+      const sFrom = cli.storage.from.bind(cli.storage);
+      cli.storage.from = (balde) => {
+        const api = sFrom(balde);
+        if (api && typeof api.download === 'function' && !api._medido) {
+          const dl = api.download.bind(api);
+          api.download = async (...a) => { const r = await dl(...a); try { _gastoAnota(_gastoTamanho(r && r.data), null); } catch (_) {} return r; };
+          api._medido = true;
+        }
+        return api;
+      };
+    }
+  } catch (_) {}
+  return cli;
+}
+// Por quanto tempo uma resposta guardada vale mesmo sem nenhuma escrita vista por ESTE
+// processo (10 min). Com mais de um servidor no ar, encurte (CACHE_TTL_MS=20000): o outro
+// processo escreve sem este ficar sabendo.
+const _CACHE_TTL_MS = Math.max(1000, parseInt(process.env.CACHE_TTL_MS || '600000', 10) || 600000);
+const _cacheLeitura = new Map(); // chave → { ver, t, corpo, pendente }
+async function _comCache(chave, versaoAtual, ttlMs, gera) {
+  const c = _cacheLeitura.get(chave);
+  if (c && c.pendente) return c.pendente;                                        // pedido igual no ar: espera ele
+  if (c && c.ver === versaoAtual && Date.now() - c.t < ttlMs) return c.corpo;   // nada mudou: da memória
+  const pendente = Promise.resolve().then(() => gera(c && !c.pendente ? c : null)).then(corpo => {
+    _cacheLeitura.set(chave, { ver: versaoAtual, t: Date.now(), corpo });
+    if (_cacheLeitura.size > 3000) _cacheLeitura.clear();
+    return corpo;
+  }, (e) => { _cacheLeitura.delete(chave); throw e; });
+  _cacheLeitura.set(chave, { ver: versaoAtual, t: 0, corpo: null, pendente });
+  return pendente;
+}
+// Telefones que mudaram em contacts desde a versão `desde` (null = não dá para saber: relê tudo)
+function _fonesSujosDesde(desde) {
+  const log = _sujoLog.contacts;
+  if (!log.length) return [];
+  if (log[0].ver > desde + 1) return null; // o registro não alcança tão para trás
+  const out = new Set();
+  for (const e of log) { if (e.ver <= desde) continue; if (!e.fones) return null; e.fones.forEach(f => out.add(f)); }
+  return [...out];
+}
+
+// ═════ 💸 MEDIDOR DE SAÍDA DO BANCO (para NUNCA MAIS estourar a cota do Supabase) ═════
+// O plano grátis do Supabase dá 5 GB de saída por ciclo. Em setembro/2026 o VETRA gastou
+// 9 GB e o Supabase cortou TUDO (leads, conversas, login) até o fim do ciclo. Agora o
+// servidor SOMA cada byte que sai do banco (linhas lidas + arquivos baixados), por rota e
+// por dia, guarda o total no banco a cada 2 min (sobrevive a deploy e vale para os dois
+// servidores) e reage sozinho, sem esperar ninguém olhar:
+//   • ≥ 50 % da cota → aviso na central de avisos do fornecedor;
+//   • ≥ 65 % → modo ECONOMIA: o app passa a consultar a cada 10 s (em vez de 3 s);
+//   • ≥ 85 % → modo POUPANÇA: consulta a cada 30 s e as rotas pesadas que NÃO são
+//     atendimento (busca dentro das mensagens, exportações, backup manual, planilha,
+//     varredura da IA) param até o ciclo virar — chat, envio e recebimento continuam.
+// Regra para toda mudança futura (testes/gasto-do-banco.js): um dia de uso simulado tem
+// de caber em 5 GB ÷ 30 dias; a bancada fica VERMELHA se passar. Cota e dia da virada do
+// ciclo vêm do Railway: BANCO_GB_MES (padrão 5) e BANCO_DIA_CICLO (padrão 1).
+const { AsyncLocalStorage } = require('async_hooks');
+const _gastoCtx = new AsyncLocalStorage();
+const _BANCO_GB_MES = Math.max(0.1, parseFloat(process.env.BANCO_GB_MES || '5') || 5);
+const _BANCO_DIA_CICLO = Math.min(28, Math.max(1, parseInt(process.env.BANCO_DIA_CICLO || '1', 10) || 1));
+const _BANCO_ORCAMENTO = Math.round(_BANCO_GB_MES * 1024 * 1024 * 1024);
+function _cicloInicio(t) {
+  const d = new Date(t || Date.now());
+  let a = d.getUTCFullYear(), m = d.getUTCMonth();
+  if (d.getUTCDate() < _BANCO_DIA_CICLO) { m--; if (m < 0) { m = 11; a--; } }
+  return new Date(Date.UTC(a, m, _BANCO_DIA_CICLO));
+}
+function _cicloFim(t) { const i = _cicloInicio(t); return new Date(Date.UTC(i.getUTCFullYear(), i.getUTCMonth() + 1, _BANCO_DIA_CICLO)); }
+const _gasto = { ciclo: '', bytes: 0, dias: {}, rotas: {}, pend: { bytes: 0, dias: {}, rotas: {} }, avisos: {}, desde: null, forcado: null };
+function _gastoTamanho(x) {
+  if (x == null) return 0;
+  if (Buffer.isBuffer(x)) return x.length;
+  if (typeof x === 'string') return Buffer.byteLength(x);
+  if (typeof x.size === 'number') return x.size; // Blob do Storage
+  try { return Buffer.byteLength(JSON.stringify(x)); } catch (_) { return 0; }
+}
+function _gastoRotulo() { const c = _gastoCtx.getStore(); return (c && c.rota) || 'fundo:outros'; }
+// Rota sem o telefone/id dentro (para somar "/messages/:x" e não um rótulo por lead)
+function _gastoRotaDe(req) {
+  try { return req.method + ' /' + String(req.path || '').split('/').filter(Boolean).map(p => /^[0-9a-f-]{8,}$|^\d{6,}$|^wamid\.|%|^qr|\.(ogg|jpg|jpeg|png|mp4|pdf|webp)$/i.test(p) ? ':x' : p).join('/'); }
+  catch (_) { return 'rota'; }
+}
+function _gastoAnota(bytes, rotulo) {
+  if (!(bytes > 0)) return;
+  const ciclo = _cicloInicio().toISOString().slice(0, 10);
+  if (_gasto.ciclo !== ciclo) { _gasto.ciclo = ciclo; _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; _gasto.avisos = {}; }
+  const dia = new Date().toISOString().slice(0, 10), r = rotulo || _gastoRotulo();
+  _gasto.bytes += bytes; _gasto.dias[dia] = (_gasto.dias[dia] || 0) + bytes; _gasto.rotas[r] = (_gasto.rotas[r] || 0) + bytes;
+  const p = _gasto.pend; p.bytes += bytes; p.dias[dia] = (p.dias[dia] || 0) + bytes; p.rotas[r] = (p.rotas[r] || 0) + bytes;
+}
+// Mede o que uma consulta devolveu (o tamanho do JSON é o que o Supabase cobra como saída)
+function _medeSaida(fb, rotulo) {
+  try {
+    const thenO = fb.then.bind(fb);
+    fb.then = (ok, err) => thenO(r => { try { _gastoAnota(_gastoTamanho(r && r.data), rotulo); } catch (_) {} return ok ? ok(r) : r; }, err);
+  } catch (_) {}
+  return fb;
+}
+function _gastoNivel(bytes) {
+  if (_gasto.forcado) return _gasto.forcado; // (só a bancada força um nível)
+  const pct = (bytes == null ? _gasto.bytes : bytes) / _BANCO_ORCAMENTO;
+  return pct >= 0.85 ? 'poupanca' : pct >= 0.65 ? 'economia' : pct >= 0.5 ? 'atencao' : 'ok';
+}
+const _GASTO_POLL = { ok: 3, atencao: 3, economia: 10, poupanca: 30 };
+const _gastoPollSeg = () => _GASTO_POLL[_gastoNivel()] || 3;
+const _gastoPoupando = () => _gastoNivel() === 'poupanca';
+// Rota pesada que não é atendimento: em modo poupança responde 503 e explica
+function _bancoPoupa(req, res, oQue) {
+  if (!_gastoPoupando()) return false;
+  res.status(503).json({ error: 'Poupando o banco: ' + oQue + ' fica pausado até a cota do Supabase virar (dia ' + _cicloFim().toISOString().slice(8, 10) + '). O chat, o envio e o recebimento continuam normais.', poupanca: true });
+  return true;
+}
+function _gastoResumo() {
+  const ini = _cicloInicio(), fim = _cicloFim();
+  const diasCiclo = Math.round((fim - ini) / 86400000), diaDoCiclo = Math.max(1, Math.ceil((Date.now() - ini) / 86400000));
+  const projecao = Math.round(_gasto.bytes / diaDoCiclo * diasCiclo);
+  const rotas = Object.entries(_gasto.rotas).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([rota, bytes]) => ({ rota, bytes }));
+  return { ciclo_inicio: ini.toISOString().slice(0, 10), ciclo_fim: fim.toISOString().slice(0, 10), dia_do_ciclo: diaDoCiclo, dias_no_ciclo: diasCiclo,
+    orcamento: _BANCO_ORCAMENTO, gasto: _gasto.bytes, pct: Math.round(_gasto.bytes / _BANCO_ORCAMENTO * 1000) / 10, projecao,
+    nivel: _gastoNivel(), poll_seg: _gastoPollSeg(), hoje: _gasto.dias[new Date().toISOString().slice(0, 10)] || 0,
+    dias: _gasto.dias, rotas, medido_desde: _gasto.desde, servidor: _EU_GASTO };
+}
+const _EU_GASTO = 'p' + process.pid;
+const _GASTO_K = () => 'gasto_banco::' + _cicloInicio().toISOString().slice(0, 10);
+// Ao subir: continua de onde o ciclo estava (o processo reinicia a cada deploy)
+async function _gastoCarrega() {
+  if (!supabase) return;
+  try {
+    const { data } = await _gastoCtx.run({ rota: 'fundo:medidor' }, () => supabase.from('settings').select('value').eq('key', _GASTO_K()).maybeSingle());
+    let g = null; try { g = data && data.value ? JSON.parse(data.value) : null; } catch (_) {}
+    if (g && typeof g.bytes === 'number') {
+      const p = _gasto.pend;
+      _gasto.ciclo = _cicloInicio().toISOString().slice(0, 10);
+      _gasto.bytes = g.bytes + p.bytes; _gasto.dias = Object.assign({}, g.dias || {}); _gasto.rotas = Object.assign({}, g.rotas || {});
+      for (const d in p.dias) _gasto.dias[d] = (_gasto.dias[d] || 0) + p.dias[d];
+      for (const r in p.rotas) _gasto.rotas[r] = (_gasto.rotas[r] || 0) + p.rotas[r];
+      _gasto.avisos = g.avisos || {}; _gasto.desde = g.desde || null;
+    }
+    if (!_gasto.desde) _gasto.desde = new Date().toISOString();
+  } catch (_) {}
+}
+// A cada 2 min: lê o total do banco (que inclui o outro servidor), soma o que ESTE processo
+// gastou desde a última gravação e grava. Depois confere se precisa avisar.
+async function _gastoSalva() {
+  if (!supabase) return;
+  const p = _gasto.pend;
+  if (!p.bytes) return _gastoAvisa();
+  _gasto.pend = { bytes: 0, dias: {}, rotas: {} };
+  const K = _GASTO_K();
+  try {
+    await _gastoCtx.run({ rota: 'fundo:medidor' }, async () => {
+      const { data } = await supabase.from('settings').select('value').eq('key', K).maybeSingle();
+      let g = null; try { g = data && data.value ? JSON.parse(data.value) : null; } catch (_) {}
+      if (!g || typeof g.bytes !== 'number') g = { bytes: 0, dias: {}, rotas: {}, desde: _gasto.desde || new Date().toISOString() };
+      g.bytes += p.bytes;
+      for (const d in p.dias) g.dias[d] = (g.dias[d] || 0) + p.dias[d];
+      for (const r in p.rotas) g.rotas[r] = (g.rotas[r] || 0) + p.rotas[r];
+      g.avisos = Object.assign({}, g.avisos || {}, _gasto.avisos);
+      const { error } = await supabase.from('settings').upsert({ key: K, value: JSON.stringify(g), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+      if (error) throw error;
+      // o total do banco passa a ser o meu (mais o que chegou enquanto eu gravava)
+      const q = _gasto.pend;
+      _gasto.bytes = g.bytes + q.bytes; _gasto.dias = g.dias; _gasto.rotas = g.rotas; _gasto.avisos = g.avisos; _gasto.desde = g.desde;
+      for (const d in q.dias) _gasto.dias[d] = (_gasto.dias[d] || 0) + q.dias[d];
+      for (const r in q.rotas) _gasto.rotas[r] = (_gasto.rotas[r] || 0) + q.rotas[r];
+    });
+  } catch (e) { // não gravou: devolve o pendente para tentar de novo daqui a 2 min
+    const q = _gasto.pend; q.bytes += p.bytes;
+    for (const d in p.dias) q.dias[d] = (q.dias[d] || 0) + p.dias[d];
+    for (const r in p.rotas) q.rotas[r] = (q.rotas[r] || 0) + p.rotas[r];
+  }
+  _gastoAvisa();
+}
+function _gastoAvisa() {
+  try {
+    const R = _gastoResumo();
+    const marca = (k, texto, tipo) => { if (_gasto.avisos[k]) return; _gasto.avisos[k] = new Date().toISOString(); addNotice(OWNER_LEGADO, texto, 'gasto:' + k + ':' + _gasto.ciclo, { tipo: tipo || 'erro', alvo: 'contas' }).catch(() => {}); };
+    const gb = b => (b / 1073741824).toFixed(2) + ' GB';
+    if (R.nivel === 'poupanca') marca('85', 'Banco (Supabase): ' + gb(R.gasto) + ' de ' + gb(R.orcamento) + ' já saíram neste ciclo (' + R.pct + '%). MODO POUPANÇA ligado: busca em mensagens, exportações, backup manual, planilha e varredura da IA pausados até dia ' + R.ciclo_fim.slice(8, 10) + '. Veja Configurações ▸ Diagnóstico.');
+    else if (R.nivel === 'economia') marca('65', 'Banco (Supabase): ' + gb(R.gasto) + ' de ' + gb(R.orcamento) + ' já saíram neste ciclo (' + R.pct + '%). MODO ECONOMIA ligado: o app passou a atualizar a cada 10 s. Veja Configurações ▸ Diagnóstico.');
+    else if (R.nivel === 'atencao') marca('50', 'Banco (Supabase): metade da cota de saída já foi (' + gb(R.gasto) + ' de ' + gb(R.orcamento) + ') no dia ' + R.dia_do_ciclo + ' de ' + R.dias_no_ciclo + ' do ciclo. Veja quem está gastando em Configurações ▸ Diagnóstico.', 'info');
+    // ritmo: a partir do 3º dia, se a projeção passa da cota, avisa uma vez
+    if (R.dia_do_ciclo >= 3 && R.projecao > R.orcamento) marca('ritmo', 'Banco (Supabase): neste ritmo o ciclo fecha em ' + gb(R.projecao) + ' — acima da cota de ' + gb(R.orcamento) + '. O servidor vai frear sozinho (economia aos 65 %, poupança aos 85 %), mas vale olhar Configurações ▸ Diagnóstico.', 'info');
+  } catch (_) {}
+}
+setTimeout(() => { _gastoCarrega().catch(() => {}); setInterval(() => { _gastoSalva().catch(() => {}); }, 2 * 60000); }, 20000);
 if (SUPABASE_URL && SUPABASE_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+  supabase = _embrulhaParaCache(createClient(SUPABASE_URL, SUPABASE_KEY));
   console.log("Supabase conectado!");
 }
 
@@ -51,7 +315,7 @@ async function _euSouMaestro() {
     return _souMaestro;
   } catch (e) { console.error('maestro:', e.message); return _souMaestro; } // erro de banco: mantém o que era
 }
-const _soMaestro = (fn) => async (...a) => { try { if (!await _euSouMaestro()) return; } catch (_) {} return fn(...a); };
+const _soMaestro = (fn) => async (...a) => { try { if (!await _euSouMaestro()) return; } catch (_) {} return _gastoCtx.run({ rota: 'fundo:' + (fn.name || 'trabalho') }, () => fn(...a)); };
 // Já gravada? O carimbo de chegada vive na MEMÓRIA do processo — com dois servidores no ar
 // um não enxerga o carimbo do outro e a mesma mensagem entrava duas vezes. O wamid no banco
 // enxerga (e também pega a reentrega da Meta depois de um reinício).
@@ -96,6 +360,12 @@ async function resolveOwner(req) {
     return email;
   } catch (e) { return null; }
 }
+// 💸 cada pedido carrega o rótulo da rota (para o medidor somar por rota) e leva no
+// cabeçalho o ritmo que o app deve usar (3 s normal, 10 s economia, 30 s poupança)
+app.use((req, res, next) => {
+  try { res.setHeader('X-Vetra-Poll', String(_gastoPollSeg())); res.setHeader('X-Vetra-Banco', _gastoNivel()); } catch (_) {}
+  _gastoCtx.run({ rota: _gastoRotaDe(req) }, () => next());
+});
 app.use(async (req, res, next) => {
   try { req.owner = await resolveOwner(req); } catch (_) { req.owner = null; }
   req.usuario = req._usuario || null; // quem da EQUIPE está usando o CRM agora
@@ -228,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 312;
+const SERVER_VER = 314;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2876,6 +3146,7 @@ async function* _todasMensagens(owner, filtroFone) {
 // Conversas em planilha (abre no Excel)
 app.get('/exportar/conversas.csv', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
+  if (_bancoPoupa(req, res, 'a exportação')) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const nomes = {};
   try {
@@ -2900,6 +3171,7 @@ app.get('/exportar/conversas.csv', async (req, res) => {
 // Lista dos arquivos, com link para baixar cada um
 app.get('/exportar/arquivos.html', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
+  if (_bancoPoupa(req, res, 'a exportação')) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const nomes = {};
   try {
@@ -3241,6 +3513,7 @@ app.post('/transcribe', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/search/messages', async (req, res) => {
   if (!supabase) return res.json([]);
+  if (_bancoPoupa(req, res, 'a busca dentro das mensagens')) return;
   const raw = String(req.query.q || '').trim();
   if (raw.length < 2) return res.json([]);
   const term = raw.replace(/[,()%_]/g, ' ').trim();
@@ -4292,6 +4565,7 @@ app.get('/sheets/preview', async (req, res) => {
 app.post('/sheets/sync', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  if (_bancoPoupa(req, res, 'a planilha')) return;
   if (String(req.query.bg || '') === '1') {
     // Em segundo plano: responde já e o app acompanha o progresso em /sheets/sync/status
     if (_sheetsRodando.has(req.owner)) return res.json({ ok: true, iniciado: false, ja_rodando: true });
@@ -4585,6 +4859,7 @@ app.post("/notes", async (req, res) => {
 // Busca pelas DUAS variantes do número (com e sem o nono dígito): mensagens
 // enviadas por canais diferentes (QR × API) podem ter sido gravadas na outra
 // variante — o chat mostra TUDO num lugar só, como deve ser
+const _curaFeitaEm = new Map(); // conversa → última vez que a cura retroativa rodou
 app.get("/messages/:phone", async (req, res) => {
   if (!supabase) return res.json([]);
   // Só as mais recentes (?limite=300): conversa comprida vinha INTEIRA (milhares
@@ -4592,53 +4867,71 @@ app.get("/messages/:phone", async (req, res) => {
   // mensagens mais antigas" (o app pede sem limite). O cabeçalho X-Mais-Antigas
   // diz quantas ficaram de fora (-1 = há mais, sem contagem).
   const _lim = Math.max(0, parseInt(req.query.limite, 10) || 0);
-  let brutas, error;
-  if (_lim) {
-    // (ordem ESTÁVEL: horário e depois id — duas linhas no mesmo horário vinham
-    //  em ordem diferente a cada pedido e a bolha era recriada na tela)
-    const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
-      .order("timestamp", { ascending: false }).order("id", { ascending: false }).limit(_lim + 1);
-    error = r.error; brutas = (r.data || []).slice().reverse();
-    let mais = 0;
-    if (brutas.length > _lim) {
-      brutas = brutas.slice(brutas.length - _lim);
-      mais = -1;
-      try {
-        const c = await supabase.from("messages").select("id", { count: 'exact', head: true }).in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ');
-        if (c && typeof c.count === 'number' && c.count > _lim) mais = c.count - _lim;
-      } catch (_) {}
-    }
-    res.set('Access-Control-Expose-Headers', 'X-Mais-Antigas');
-    res.set('X-Mais-Antigas', String(mais));
-  } else {
-    const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
-      .order("timestamp", { ascending: true }).order("id", { ascending: true });
-    error = r.error; brutas = r.data;
-  }
-  if (error) return res.status(500).json({ error: error.message });
-  // CURA das duplicatas antigas: a mesma mensagem (mesmo id do WhatsApp, mesma
-  // direção) gravada duas vezes aparece UMA vez — e a sobra é apagada do banco
-  // em segundo plano, para a conversa ficar limpa de vez.
-  // Entre as cópias fica SEMPRE a de menor id (não "a primeira que veio"): dois
-  // pedidos ao mesmo tempo escolhem a mesma cópia — senão um apagava uma e o
-  // outro apagava a outra, e a mensagem sumia de vez.
-  const _grupos = new Map();
-  for (const m of (brutas || [])) {
-    const k = m.wamid ? (String(m.wamid) + '|' + String(m.direction || '')) : null;
-    if (!k) continue;
-    if (!_grupos.has(k)) _grupos.set(k, []);
-    _grupos.get(k).push(m);
-  }
-  const _sobras = [], _fora = new Set();
-  _grupos.forEach(g => { if (g.length < 2) return; g.sort((a, b) => String(a.id).localeCompare(String(b.id))); g.slice(1).forEach(m => { _sobras.push(m.id); _fora.add(m); }); });
-  const data = (brutas || []).filter(m => !_fora.has(m));
-  res.json(data);
+  // 💸 cache: a conversa aberta era relida do banco a cada 3 s por aparelho. Pedidos
+  // iguais ao mesmo tempo (dois aparelhos) esperam a MESMA leitura.
+  const _chaveC = 'messages|' + (req.owner || ' ') + '|' + req.params.phone + '|' + _lim;
+  let _euBusquei = false;
+  let corpo;
+  try {
+    corpo = await _comCache(_chaveC, _versaoConversa(req.params.phone), _CACHE_TTL_MS, async () => {
+      _euBusquei = true;
+      let brutas, error, mais = null;
+      if (_lim) {
+        // (ordem ESTÁVEL: horário e depois id — duas linhas no mesmo horário vinham
+        //  em ordem diferente a cada pedido e a bolha era recriada na tela)
+        const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
+          .order("timestamp", { ascending: false }).order("id", { ascending: false }).limit(_lim + 1);
+        error = r.error; brutas = (r.data || []).slice().reverse();
+        mais = 0;
+        if (brutas.length > _lim) {
+          brutas = brutas.slice(brutas.length - _lim);
+          mais = -1;
+          try {
+            const c = await supabase.from("messages").select("id", { count: 'exact', head: true }).in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ');
+            if (c && typeof c.count === 'number' && c.count > _lim) mais = c.count - _lim;
+          } catch (_) {}
+        }
+      } else {
+        const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
+          .order("timestamp", { ascending: true }).order("id", { ascending: true });
+        error = r.error; brutas = r.data;
+      }
+      if (error) throw new Error(error.message);
+      // CURA das duplicatas antigas: a mesma mensagem (mesmo id do WhatsApp, mesma
+      // direção) gravada duas vezes aparece UMA vez — e a sobra é apagada do banco
+      // em segundo plano, para a conversa ficar limpa de vez.
+      // Entre as cópias fica SEMPRE a de menor id (não "a primeira que veio"): dois
+      // pedidos ao mesmo tempo escolhem a mesma cópia — senão um apagava uma e o
+      // outro apagava a outra, e a mensagem sumia de vez.
+      const _grupos = new Map();
+      for (const m of (brutas || [])) {
+        const k = m.wamid ? (String(m.wamid) + '|' + String(m.direction || '')) : null;
+        if (!k) continue;
+        if (!_grupos.has(k)) _grupos.set(k, []);
+        _grupos.get(k).push(m);
+      }
+      const sobras = [], _fora = new Set();
+      _grupos.forEach(g => { if (g.length < 2) return; g.sort((a, b) => String(a.id).localeCompare(String(b.id))); g.slice(1).forEach(m => { sobras.push(m.id); _fora.add(m); }); });
+      return { data: (brutas || []).filter(m => !_fora.has(m)), mais, sobras };
+    });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+  if (corpo.mais != null) { res.set('Access-Control-Expose-Headers', 'X-Mais-Antigas'); res.set('X-Mais-Antigas', String(corpo.mais)); }
+  res.json(corpo.data);
+  if (!_euBusquei) return; // resposta da memória: nada de faxina nem cura de novo
+  const _sobras = corpo.sobras || [];
   if (_sobras.length) {
     (async () => { try {
       await supabase.from('messages').delete().in('id', _sobras).eq('owner', req.owner || ' ');
       console.log('🧹 ' + _sobras.length + ' bolha(s) duplicada(s) apagada(s) na conversa ' + req.params.phone);
     } catch (_) {} })();
   }
+  // A cura retroativa abaixo faz várias leituras e escritas: rodava a CADA pedido (a cada
+  // 3 s com a conversa aberta). Agora no máximo uma vez a cada 5 minutos por conversa.
+  const _kCura = (req.owner || ' ') + '|' + req.params.phone;
+  const _agoraC = Date.now();
+  if (_curaFeitaEm.get(_kCura) && _agoraC - _curaFeitaEm.get(_kCura) < 5 * 60000) return;
+  _curaFeitaEm.set(_kCura, _agoraC);
+  if (_curaFeitaEm.size > 5000) _curaFeitaEm.clear();
   // CURA RETROATIVA (só a partir de RECIBOS REAIS): "leu uma = leu as anteriores".
   // Antes ela partia do status da PRÉVIA do contato — se a prévia estivesse com um
   // "lida" herdado, pintava de azul mensagens que ninguém leu (caso do bot).
@@ -5171,19 +5464,41 @@ app.get("/contacts", async (req, res) => {
   // seleção sem ela (não quebra o carregamento dos leads/conversas)
   _subscribeRecentPresence(req.owner); // presença dos recentes (não bloqueia a resposta)
   const COLS_BASE = "phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite, avatar";
-  const build = (cols) => {
+  const build = (cols, soFones) => {
     let q = supabase.from("contacts").select(cols).eq("owner", req.owner || ' ').order("last_message_at", { ascending: false });
     if (account_id) q = q.eq("account_id", account_id);
     if (with_messages) q = q.not("last_message_preview", "is", null);
+    if (soFones) q = q.in("phone", soFones); // releitura incremental: só quem mudou
     return q;
   };
-  let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted");
-  if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned")); } // fallback sem muted
-  if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status")); } // fallback sem pinned
-  if (error) { ({ data, error } = await build(COLS_BASE + ", created_at")); } // fallback sem last_message_status
-  if (error) { ({ data, error } = await build(COLS_BASE)); } // fallback sem created_at
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  const chave = 'contacts|' + (req.owner || ' ') + '|' + (account_id || '') + '|' + (with_messages ? 1 : 0);
+  const buscaTudo = async (extra) => {
+    let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted", extra);
+    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned", extra)); } // fallback sem muted
+    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status", extra)); } // fallback sem pinned
+    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at", extra)); } // fallback sem last_message_status
+    if (error) { ({ data, error } = await build(COLS_BASE, extra)); } // fallback sem created_at
+    if (error) throw new Error(error.message);
+    return data || [];
+  };
+  let r;
+  try {
+    r = await _comCache(chave, _tabVer.contacts, _CACHE_TTL_MS, async (guardado) => {
+      // 💸 Já tem lista guardada e sabemos QUAIS telefones mudaram: relê só essas linhas
+      const sujos = guardado ? _fonesSujosDesde(guardado.ver) : null;
+      if (guardado && sujos && sujos.length <= 60) {
+        if (!sujos.length) return guardado.corpo;
+        const alvo = new Set(); sujos.forEach(f => phoneVariants(f).forEach(v => alvo.add(v)));
+        const novas = await buscaTudo([...alvo]);
+        const vieram = new Map(novas.map(c => [c.phone, c]));
+        const lista = guardado.corpo.filter(c => !alvo.has(c.phone)).concat(novas);
+        lista.sort((a, b) => String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')));
+        return lista;
+      }
+      return buscaTudo(null); // primeira vez, ou mudança sem telefone conhecido: relê tudo
+    });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json(r);
 });
 
 // Mover lead para estágio
@@ -7917,11 +8232,14 @@ let _iaVarridoAte = 0;
 async function _iaVarreRespostas() {
   const owner = _CONTA_IA;
   if (!supabase) return { novos: 0 };
+  if (_gastoPoupando()) return { novos: 0, poupanca: true }; // 💸 modo poupança: a varredura espera o ciclo virar
   if (!await _iaSugLigada(owner)) return { novos: 0 };
   const agora = Date.now();
   const desde = _iaVarridoAte || (agora - 30 * 60000);
+  // 💸 só o que chegou desde a última varredura (com folga de 5 min) — não as 300 últimas sempre
   const { data: brutas } = await supabase.from('messages').select('id, phone, direction, type, content, timestamp')
-    .eq('owner', owner || ' ').order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(300);
+    .eq('owner', owner || ' ').gte('timestamp', new Date(desde - 5 * 60000).toISOString())
+    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(300);
   const quando = (ts) => { const d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(ts)) ? ts : String(ts) + 'Z'); return isNaN(d) ? 0 : d.getTime(); };
   const porFone = new Map();
   for (const m of (brutas || [])) { if (!m || m.type === 'note') continue; if (!porFone.has(m.phone)) porFone.set(m.phone, []); porFone.get(m.phone).push(m); }
@@ -7940,14 +8258,18 @@ async function _iaVarreRespostas() {
       if ((m.type && m.type !== 'text') || !txt || _iaTemLink(txt) || _iaEhAutomatica(txt, fixos)) { ok = false; break; } // bot, rápida, modelo, áudio, foto ou link: não é texto dela para aprender
       enviadas.unshift(txt);
     }
-    if (!ok || !enviadas.length || i >= lista.length || lista[i].direction !== 'inbound') continue;
-    // o que o lead disse ANTES desta resposta (e não o que ele mandou depois dela) + 4 linhas de contexto
+    if (!ok || !enviadas.length) continue;
+    if (i < lista.length && lista[i].direction !== 'inbound') continue;
+    // o que o lead disse ANTES desta resposta (e não o que ele mandou depois dela) + 4 linhas de contexto.
+    // Se a fala do lead ficou fora da janela lida (ela respondeu horas depois), a gravação
+    // busca no banco a última fala dele (mesmo caminho do app antigo).
     let j = i; const doLead = [];
     for (; j < lista.length && lista[j].direction === 'inbound'; j++) doLead.unshift(lista[j]);
     const ctx = lista.slice(j, j + 4).slice().reverse().map(_iaLinha);
     try {
-      const r = await _iaGuardaExemplo(owner, { phone: fone, enviado: enviadas, chave: fone + '|' + lista[i].id, auto: true,
-        lead: doLead.map(m => _iaLinha(m).replace(/^Lead: /, '')), contexto: ctx });
+      const r = await _iaGuardaExemplo(owner, doLead.length
+        ? { phone: fone, enviado: enviadas, chave: fone + '|' + lista[i].id, auto: true, lead: doLead.map(m => _iaLinha(m).replace(/^Lead: /, '')), contexto: ctx }
+        : { phone: fone, enviado: enviadas, auto: true });
       if (r && r.guardado) novos++;
     } catch (e) { console.error('IA aprender sozinha:', e.message); }
   }
@@ -8218,6 +8540,7 @@ app.get('/uso-conta', async (req, res) => {
 const _BK_CHAVES = ['quick_replies', 'tag_catalog', 'tag_cores', 'stage_actions', 'drip_rules', 'sheets_sync'];
 app.get('/backup', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do VETRA.' });
+  if (_bancoPoupa(req, res, 'o backup manual')) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
   try {
@@ -9718,7 +10041,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(maestro_bg|owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(maestro_bg|gasto_banco::.*|owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|.*token.*|.*secret.*)$/i;
 // ── PÁGINA PÚBLICA (Termos e Privacidade) ──────────────────────────
 // privacy.html e terms.html ficam FORA do login: a Meta, o cliente e qualquer
 // pessoa precisam conseguir abrir. Estas páginas mostram a razão social, o CNPJ
@@ -9834,6 +10157,11 @@ app.get('/diagnostico/banco', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   try { res.json(await _confereBanco(String(req.query.forcar || '') === '1')); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+// 💸 Quanto já saiu do banco neste ciclo, quem gasta e em que modo o servidor está
+app.get('/diagnostico/gasto', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  try { res.json(_gastoResumo()); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Na subida: avisa no log o que falta (só o maestro, para não repetir com vários servidores)
 setTimeout(() => { _soMaestro(async () => {
@@ -11087,4 +11415,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
