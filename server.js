@@ -498,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 320;
+const SERVER_VER = 322;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3792,6 +3792,49 @@ app.get("/search", async (req, res) => {
   }
 });
 
+// ── TIPOS DE TAREFA (Reunião, Acompanhar… e os que você criar) ──
+// Guardados por conta em settings tarefa_tipos::dono = [{ id, nome, icone, cor }].
+// A tarefa guarda só o id do tipo (coluna tasks.tipo): renomear ou trocar a cor do
+// tipo muda todas as tarefas dele na hora.
+const _TAREFA_ICONES = ['users','user','call','phone','chat','mail','calendar','clock','doc','file','card','target','star','pin','bell','check','alert','map','video','camera','zap','crown','id','note','task','tag','send','chart','key','lock','eye','sheet','layers','folder'];
+const _TAREFA_TIPOS_PADRAO = [
+  { id: 'reuniao', nome: 'Reunião', icone: 'users', cor: '#5a4fd6' },
+  { id: 'acompanhar', nome: 'Acompanhar', icone: 'eye', cor: '#22c3e6' },
+];
+function _tarefaTipoLimpo(v) { const s = String(v == null ? '' : v).trim().slice(0, 40); return /^[a-z0-9_-]+$/i.test(s) ? s : null; }
+function _semColunaTipo(error) { return /tipo/i.test(String((error && error.message) || '')) && /column|coluna|schema cache/i.test(String((error && error.message) || '')); }
+function _tarefaTipos(owner) {
+  try { const v = JSON.parse(_cfg('tarefa_tipos', owner) || 'null'); if (Array.isArray(v)) return v; } catch (_) {}
+  return _TAREFA_TIPOS_PADRAO.map(t => Object.assign({}, t));
+}
+app.get('/tarefa-tipos', (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  res.json({ tipos: _tarefaTipos(req.owner), icones: _TAREFA_ICONES });
+});
+app.put('/tarefa-tipos', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const brutos = Array.isArray(req.body && req.body.tipos) ? req.body.tipos : null;
+  if (!brutos) return res.status(400).json({ error: 'Envie a lista de tipos' });
+  const vistos = new Set(), tipos = [];
+  for (const b of brutos.slice(0, 30)) {
+    const nome = String((b && b.nome) || '').replace(/\s+/g, ' ').trim().slice(0, 30);
+    if (!nome) continue;
+    let id = _tarefaTipoLimpo(b.id) || ('t' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+    if (vistos.has(id)) id = 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    vistos.add(id);
+    const icone = _TAREFA_ICONES.includes(b.icone) ? b.icone : 'task';
+    const cor = /^#[0-9a-f]{6}$/i.test(String(b.cor || '')) ? String(b.cor).toLowerCase() : '#667781';
+    tipos.push({ id, nome, icone, cor });
+  }
+  const k = 'tarefa_tipos::' + req.owner;
+  const value = JSON.stringify(tipos);
+  const { error } = await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) return res.status(500).json({ error: error.message });
+  _settings[k] = value;
+  res.json({ success: true, tipos });
+});
+
 // ── Tarefas / lembretes por lead ──
 app.get("/tasks", async (req, res) => {
   if (!supabase) return res.json([]);
@@ -3805,10 +3848,11 @@ app.get("/tasks", async (req, res) => {
   // anexa o nome do lead (para a aba global de tarefas)
   const phones = [...new Set(tasks.map(t => t.phone).filter(Boolean))];
   if (phones.length) {
-    const { data: cts } = await supabase.from("contacts").select("phone,name").in("phone", phones).eq("owner", req.owner || ' ');
-    const nameMap = {};
-    for (const c of cts || []) nameMap[c.phone] = c.name;
-    for (const t of tasks) t.contact_name = t.phone ? (nameMap[t.phone] || t.phone) : null;
+    const { data: cts } = await supabase.from("contacts").select("phone,name,stage_id").in("phone", phones).eq("owner", req.owner || ' ');
+    const nameMap = {}, etapaMap = {};
+    for (const c of cts || []) { nameMap[c.phone] = c.name; etapaMap[c.phone] = c.stage_id || null; }
+    // a ETAPA do lead vai junto: a tela Tarefas filtra por etapa do pipeline
+    for (const t of tasks) { t.contact_name = t.phone ? (nameMap[t.phone] || t.phone) : null; t.contact_stage_id = t.phone ? (etapaMap[t.phone] || null) : null; }
   }
   res.json(tasks);
 });
@@ -3818,11 +3862,18 @@ app.post("/tasks", async (req, res) => {
   const { phone, account_id, title, due_at, notes } = req.body;
   // Nome NÃO é obrigatório: sem texto, a tarefa nasce como "Tarefa"
   const titleFinal = String(title || '').trim() || 'Tarefa';
-  const { data, error } = await supabase.from("tasks")
-    .insert({ phone: phone || null, account_id: account_id || null, title: titleFinal, due_at: due_at || null, notes: notes || null, owner: req.owner || null, created_at: new Date().toISOString() })
-    .select().single();
+  const tipo = _tarefaTipoLimpo(req.body.tipo);
+  const linha = { phone: phone || null, account_id: account_id || null, title: titleFinal, due_at: due_at || null, notes: notes || null, owner: req.owner || null, created_at: new Date().toISOString() };
+  if (tipo) linha.tipo = tipo;
+  let { data, error } = await supabase.from("tasks").insert(linha).select().single();
+  let aviso = null;
+  // Banco ainda sem a coluna "tipo": cria a tarefa sem o tipo e avisa (Diagnóstico mostra o SQL)
+  if (error && tipo && _semColunaTipo(error)) {
+    delete linha.tipo; aviso = 'sem_coluna_tipo';
+    ({ data, error } = await supabase.from("tasks").insert(linha).select().single());
+  }
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true, data });
+  res.json({ success: true, data, aviso });
 });
 
 app.put("/tasks/:id", async (req, res) => {
@@ -3832,9 +3883,15 @@ app.put("/tasks/:id", async (req, res) => {
   if (req.body.title != null) upd.title = req.body.title;
   if (req.body.due_at !== undefined) upd.due_at = req.body.due_at || null;
   if (req.body.notes !== undefined) upd.notes = req.body.notes || null;
-  const { error } = await supabase.from("tasks").update(upd).eq("id", req.params.id).eq("owner", req.owner || ' ');
+  if (req.body.tipo !== undefined) upd.tipo = _tarefaTipoLimpo(req.body.tipo);
+  let { error } = await supabase.from("tasks").update(upd).eq("id", req.params.id).eq("owner", req.owner || ' ');
+  let aviso = null;
+  if (error && 'tipo' in upd && _semColunaTipo(error)) {
+    delete upd.tipo; aviso = 'sem_coluna_tipo';
+    ({ error } = Object.keys(upd).length ? await supabase.from("tasks").update(upd).eq("id", req.params.id).eq("owner", req.owner || ' ') : { error: null });
+  }
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
+  res.json({ success: true, aviso });
 });
 
 app.delete("/tasks/:id", async (req, res) => {
@@ -4029,7 +4086,11 @@ app.post("/import/lead", async (req, res) => {
 // que os bots da etapa de destino disparem espaçados. Regras por conta em
 // Quanto tempo a fila precisa ficar VAZIA para o FILAZ considerar que o ciclo
 // terminou de verdade (e só então avisar, uma única vez).
-const _DRIP_CARENCIA_MS = 10 * 60 * 1000; // 10 minutos
+const _DRIP_CARENCIA_MS = 10 * 60 * 1000; // no MÁXIMO 10 minutos
+// A carência acompanha o ritmo da regra: 3 intervalos (mín. 90 s, máx. 10 min).
+// Com 210–300 s ÷ 10 números (um lead a cada 21–30 s) o aviso vinha 10 min depois
+// do último lead — agora vem em ~1,5 min. Regras lentas continuam com 10 min.
+function _dripCarenciaMs(r) { return Math.min(_DRIP_CARENCIA_MS, Math.max(90000, _dripMinMax(r).maxS * 3000)); }
 // settings drip_rules::owner = [{ id, nome, de, para, min_seg, max_seg, ativo,
 // hora_ini, hora_fim, next_at, last }]
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4126,6 +4187,18 @@ async function _dripEtapasDoDono(owner) {
 const _runsTravados = new Map();
 const _dripLock = new Set();
 const _dripAutoAntes = new Map(); // regra → o automático estava rodando no tick anterior?
+// ⏰ Despertador no horário exato do próximo lead (a conferência a cada 2 s continua
+// como segurança): sem ele, cada lead saía até ~2 s depois do horário marcado.
+const _dripDespertador = new Map();
+function _dripAcorda(id, ms) {
+  try {
+    clearTimeout(_dripDespertador.get(id));
+    if (!(ms > 0) || ms > 6 * 3600000) return;
+    const t = setTimeout(() => { _dripDespertador.delete(id); _soMaestro(_dripTick)().catch(() => {}); }, ms + 30);
+    if (t.unref) t.unref();
+    _dripDespertador.set(id, t);
+  } catch (_) {}
+}
 async function _dripTick() {
   if (!supabase) return;
   for (const k in _settings) {
@@ -4163,13 +4236,23 @@ async function _dripTick() {
           r._tocada = true; mudou = true;
           continue;
         }
-        if (!rodaManual && !rodaAuto) continue;
         const nx = r.next_at ? new Date(r.next_at).getTime() : 0;
+        // 🔔 AVISO DE FIM SEM ATRASO: o último lead saiu e a fila ficou vazia. Assim que a
+        // carência passa, confere a fila e avisa — sem esperar o próximo horário. Antes o
+        // aviso esperava DOIS intervalos (ex.: 35–50 min cada) e chegava 1h+ depois.
+        // Só confere; NÃO move ninguém fora do horário (o intervalo continua valendo).
+        const _paradaAgora = !!(r.parado_ate && Date.now() < new Date(r.parado_ate).getTime());
+        const checaFim = !!(r.vazio_desde && !r.ciclo_fechado && nx > Date.now()
+          && (Date.now() - Date.parse(r.vazio_desde)) >= _dripCarenciaMs(r)
+          && (rodaManual || (!!r.agendado && !_paradaAgora)));
+        if (!checaFim) {
+        if (!rodaManual && !rodaAuto) continue;
         if (nx > Date.now()) continue;
         // 🛡️ Garantia absoluta do intervalo mínimo: mesmo que o agendamento se perca
         // (edição/pausa no mesmo instante, redeploy), nunca move antes de min_seg do último
         const _minGuard = _dripMinMax(r).minS * 1000;
         if (r.last && r.last.quando && !r.last.vazio && (Date.now() - new Date(r.last.quando).getTime()) < _minGuard) continue;
+        }
         // 🔒 PALAVRA FINAL É DO BANCO. Relê a regra agora mesmo e só move se ELA
         // ainda estiver ligada. Isso resolve dois casos reais:
         //  • você desligou o Automático e a memória deste servidor ainda estava velha;
@@ -4187,14 +4270,27 @@ async function _dripTick() {
           r.ciclo_ini = rf.ciclo_ini || r.ciclo_ini || null;
           r.vazio_desde = rf.vazio_desde || null; r.avisou_fim = !!rf.avisou_fim;
           r.avisar_fim = (rf.avisar_fim !== false);
+          if (checaFim) {
+            // Conferência do fim: basta a regra continuar ligada (manual ou automático)
+            if (!rf.manual && !rf.agendado) { mudou = true; continue; }
+            if (!r.vazio_desde) continue; // o banco diz que entrou lead depois: não é fim
+          } else {
           const ligadaAgora = !!rf.manual || (!!rf.agendado && _dripDentroDaJanela(r));
           if (!ligadaAgora) { mudou = true; continue; } // DESLIGADA no banco: não move nada
           if (rf.next_at && new Date(rf.next_at).getTime() > Date.now()) { r.next_at = rf.next_at; continue; }
+          }
         } catch (e) { console.error('leitura de segurança do gotejamento:', e.message); continue; }
         // 1) agenda o PRÓXIMO e grava JÁ (antes de mover) — se cair no meio, não repete
         const { minS, maxS } = _dripMinMax(r); // já dividido pela quantidade de números
         const espera = Math.floor(Math.random() * (maxS - minS + 1)) + minS;
-        r.next_at = new Date(Date.now() + espera * 1000).toISOString();
+        if (!checaFim) {
+        // ⏱️ RITMO CERTO: conta a espera a partir do horário PLANEJADO deste lead (e não
+        // do instante em que o robô conseguiu movê-lo). Antes cada atraso (conferência a
+        // cada 2 s, leituras no banco, a outra regra enviando) SOMAVA ao intervalo: com
+        // 210–300 s por número, cada número saía a cada 315–390 s. O mínimo continua garantido.
+        const _plan = (nx && nx <= Date.now() && Date.now() - nx < maxS * 1000) ? nx : Date.now();
+        r.next_at = new Date(Math.max(_plan + espera * 1000, Date.now() + minS * 1000)).toISOString();
+        _dripAcorda(r.id, Date.parse(r.next_at) - Date.now());
         r._tocada = true;
         await _dripSalvaProgresso(owner, regras);
         // (4) POSSE: confere que o horário gravado é o NOSSO. Se outro servidor
@@ -4204,18 +4300,24 @@ async function _dripTick() {
           const rc = conf && conf.value ? (JSON.parse(conf.value) || []).find(x => x.id === r.id) : null;
           if (!rc || rc.next_at !== r.next_at) { r._tocada = false; continue; }
         } catch (_) { r._tocada = false; continue; }
+        }
         // 2) pega UM lead da etapa de origem
         const { data: leads } = await supabase.from('contacts').select('phone, name')
           .eq('owner', owner).eq('stage_id', r.de).order('last_message_at', { ascending: false, nullsFirst: false }).limit(1);
         const lead = leads && leads[0];
         mudou = true;
+        if (lead && checaFim) {
+          // Entrou lead na carência: NÃO é o fim. Ele sai no horário normal (o intervalo vale).
+          r.vazio_desde = null; r._tocada = true;
+          continue;
+        }
         if (!lead) {
           // ⏳ CARÊNCIA: a fila vazia por um instante NÃO é o fim. Se entrar lead
           // novo (planilha, bot, você arrastando) nos próximos minutos, o ciclo
           // simplesmente continua. Sem isto, cada gota que caía virava um "ciclo
           // concluído" e você recebia o mesmo aviso várias vezes seguidas.
           if (!r.vazio_desde) { r.vazio_desde = new Date().toISOString(); r._tocada = true; mudou = true; }
-          if (Date.now() - Date.parse(r.vazio_desde) < _DRIP_CARENCIA_MS) continue;
+          if (Date.now() - Date.parse(r.vazio_desde) < _dripCarenciaMs(r)) continue;
           // Fila acabou de verdade: o ciclo fecha. O total movido vira histórico e a
           // regra volta ao estado PARADA — sem "progresso pendente" (era isso que
           // fazia aparecer Retomar/Parar quando entravam leads novos pela planilha).
@@ -4265,7 +4367,9 @@ async function _dripTick() {
         // outra regra levou). NÃO é "fila vazia": marca como pulado para não derrubar
         // a trava de intervalo nem encerrar uma fila que varou a madrugada.
         if (!mv || !mv.length) { r.last = { quando: new Date().toISOString(), pulado: true }; r._tocada = true; continue; }
-        try { await fireStageBots(lead.phone, r.para, owner); } catch (e) { console.error('drip fireStageBots:', e.message); }
+        // 🤖 O bot da etapa roda POR FORA: o envio (Meta demorando, mídia, vários passos) não
+        // segura o gotejamento — antes a outra regra e os próximos leads esperavam o envio acabar.
+        fireStageBots(lead.phone, r.para, owner).catch(e => console.error('drip fireStageBots:', e.message));
         // 🐞 O ciclo anterior tinha FECHADO (a fila esvaziou) e agora entraram leads
         // novos na etapa: isto aqui é o PRIMEIRO lead de um ciclo novo, então a
         // contagem recomeça do zero. Sem isto, o total do ciclo passado se somava ao
@@ -4276,8 +4380,14 @@ async function _dripTick() {
         if (!r.ciclo_ini) r.ciclo_ini = new Date().toISOString();
         r.vazio_desde = null; // entrou lead: a contagem de carência recomeça
         r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false; r._tocada = true;
-        r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: espera, motivo: rodaManual ? 'manual' : 'automatico' };
-        console.log(`Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${espera}s`);
+        r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: Math.max(0, Math.round((Date.parse(r.next_at) - Date.now()) / 1000)), motivo: rodaManual ? 'manual' : 'automatico' };
+        // 🔔 Era o ÚLTIMO da fila? Marca agora: o aviso de fim sai quando a carência passar
+        // (sem esperar o próximo horário). Leitura de 1 linha só com o telefone.
+        try {
+          const { data: resta } = await supabase.from('contacts').select('phone').eq('owner', owner).eq('stage_id', r.de).limit(1);
+          if (Array.isArray(resta) && !resta.length) r.vazio_desde = new Date().toISOString();
+        } catch (_) {}
+        console.log(`Gotejamento "${r.nome || r.id}" [${rodaManual ? 'MANUAL' : 'AUTOMÁTICO'}] (${owner}): ${lead.phone} movido; próximo em ${Math.max(0, Math.round((Date.parse(r.next_at) - Date.now()) / 1000))}s`);
       }
       if (mudou) await _dripSalvaProgresso(owner, regras);
     } catch (e) { console.error('drip:', e.message); }
@@ -10327,7 +10437,7 @@ app.delete('/equipe/:email', async (req, res) => {
 });
 
 // 🔒 Chaves de settings que NUNCA passam pela rota genérica (segredos/globais)
-const _SETTINGS_PROIBIDAS = /^(maestro_bg|gasto_banco::.*|owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|ia_resumo::.*|ia_quando::.*|.*token.*|.*secret.*)$/i;
+const _SETTINGS_PROIBIDAS = /^(maestro_bg|gasto_banco::.*|owner_default|owner_aliases|vapid_keys|acesso_liberado|pagamento_cfg|custos_cfg(::.*)?|auditoria(::.*)?|bkp::.*|billing(::.*)?|equipe_papel(::.*)?|aceite(::.*)?|api_token(::.*)?|notices(::.*)?|drip_rules(::.*)?|sheets_sync(::.*)?|agendadas(::.*)?|acoes_agendadas(::.*)?|auto_log(::.*)?|tag_cores(::.*)?|equipe_acesso(::.*)?|hist::.*|bot_snap::.*|tmpl_lixeira(::.*)?|msg_trash(::.*)?|ia_mem::.*|ia_resumo::.*|ia_quando::.*|tarefa_tipos(::.*)?|.*token.*|.*secret.*)$/i;
 // ── PÁGINA PÚBLICA (Termos e Privacidade) ──────────────────────────
 // privacy.html e terms.html ficam FORA do login: a Meta, o cliente e qualquer
 // pessoa precisam conseguir abrir. Estas páginas mostram a razão social, o CNPJ
@@ -10408,6 +10518,7 @@ const _ESQUEMA = [
   { tabela: 'messages', coluna: 'waveform', para: 'o desenho do áudio', sql: 'alter table messages add column if not exists waveform text;' },
   { tabela: 'messages', coluna: 'forwarded', para: 'a etiqueta "Encaminhada"', sql: 'alter table messages add column if not exists forwarded boolean default false;' },
   { tabela: 'tasks', coluna: 'created_at', para: 'a data de criação da tarefa', sql: 'alter table tasks add column if not exists created_at timestamptz default now();' },
+  { tabela: 'tasks', coluna: 'tipo', para: 'o tipo da tarefa (Reunião, Acompanhar…)', sql: 'alter table tasks add column if not exists tipo text;' },
   { rpc: 'rr_next', para: 'o rodízio de números não repetir com dois leads ao mesmo tempo', sql: "create or replace function rr_next(p_key text) returns bigint language plpgsql as $$\ndeclare cur bigint;\nbegin\n  insert into settings(key, value, updated_at) values (p_key, '1', now())\n    on conflict (key) do update set value = (coalesce(nullif(settings.value, '')::bigint, 0) + 1)::text, updated_at = now()\n    returning (settings.value::bigint - 1) into cur;\n  return cur;\nend;\n$$;" },
 ];
 let _bancoCache = null;
