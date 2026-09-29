@@ -498,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 317;
+const SERVER_VER = 318;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3924,18 +3924,24 @@ app.post("/contacts/import", async (req, res) => {
   const { contacts, account_id, stage_id } = req.body;
   if (!contacts || !Array.isArray(contacts)) return res.status(400).json({ error: "Lista inválida" });
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
+  // 📊 etapa por linha (coluna "etapa" da planilha) vale mais que a escolhida no menu; e a
+  // resposta diz quantos foram para cada etapa (ela quer ver isso na importação em massa)
+  const idsValidos = new Set();
+  try { const { data: sts } = await supabase.from('pipeline_stages').select('id').eq('owner', req.owner || ' '); (sts || []).forEach(x => idsValidos.add(String(x.id))); } catch (_) {}
   const toInsert = contacts
     .map(c => {
       const obj = { phone: _foneComDDI(c.phone), name: c.name || 'Desconhecido', account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() }; // com ou sem DDI (55)
-      if (stage_id) obj.stage_id = stage_id; // só grava etapa quando escolhida (não apaga a de quem já existe)
+      const daLinha = c && c.stage_id && idsValidos.has(String(c.stage_id)) ? c.stage_id : null;
+      if (daLinha || stage_id) obj.stage_id = daLinha || stage_id; // só grava etapa quando há uma (não apaga a de quem já existe)
       return obj;
     })
     .filter(c => c.phone.length >= 10);
   if (!toInsert.length) return res.status(400).json({ error: "Nenhum contato válido encontrado" });
   const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "owner,phone" });
   if (error) return res.status(500).json({ error: error.message });
+  const por_etapa = {}; for (const c of toInsert) { const k = c.stage_id ? String(c.stage_id) : 'sem'; por_etapa[k] = (por_etapa[k] || 0) + 1; }
   console.log(`${toInsert.length} contatos importados`);
-  res.json({ success: true, count: toInsert.length });
+  res.json({ success: true, count: toInsert.length, por_etapa });
 });
 
 // 🔐 As rotas do n8n agora EXIGEM o token de integração (Configurações →
@@ -3964,6 +3970,7 @@ async function _importarLeads(items, owner, opts) {
   const stageCache = {};
   let imported = 0, atualizados = 0, pulados = 0;
   const errors = [];
+  const porEtapa = {}; const nomeEtapa = {}; // 📊 quantos leads foram para cada etapa (o app mostra enquanto importa)
   let existentes = null;
   if (opts.soNovos) {
     const fones = (items || []).map(it => String(it.phone || it.celular || it["Celular"] || "").replace(/\D/g, "")).filter(p => p.length >= 8);
@@ -3980,15 +3987,16 @@ async function _importarLeads(items, owner, opts) {
     const extId = String(it.id || it["ID"] || it.stage_external_id || "").replace(/^=+\s*/, "").trim();
     const account_id = it.account_id || null;
     _idx++;
-    if (onProg) { try { onProg({ feitos: _idx, importados: imported, pulados, erros: errors.length }); } catch (_) {} }
+    if (onProg) { try { onProg({ feitos: _idx, importados: imported, pulados, erros: errors.length, por_etapa: Object.assign({}, porEtapa) }); } catch (_) {} }
     if (phone.length < 8) { errors.push({ phone, error: "telefone inválido" }); continue; }
     if (existentes && existentes.has(phone)) { pulados++; continue; }
 
     let stage_id = null;
     if (extId) {
       if (stageCache[extId] === undefined) {
-        const { data: st } = await supabase.from("pipeline_stages").select("id").eq("external_id", extId).eq("owner", owner).maybeSingle();
+        const { data: st } = await supabase.from("pipeline_stages").select("id, name").eq("external_id", extId).eq("owner", owner).maybeSingle();
         stageCache[extId] = st ? st.id : null;
+        if (st) nomeEtapa[String(st.id)] = st.name || extId;
       }
       stage_id = stageCache[extId];
     }
@@ -3998,9 +4006,9 @@ async function _importarLeads(items, owner, opts) {
     if (stage_id) row.stage_id = stage_id;
     // Não define last_message_* → o lead aparece só no Pipeline até iniciar conversa
     const { error: e } = await supabase.from("contacts").upsert(row, { onConflict: "owner,phone" });
-    if (e) errors.push({ phone, error: e.message }); else imported++;
+    if (e) errors.push({ phone, error: e.message }); else { imported++; const k = stage_id ? (nomeEtapa[String(stage_id)] || String(stage_id)) : 'sem etapa'; porEtapa[k] = (porEtapa[k] || 0) + 1; }
   }
-  return { imported, atualizados, pulados, errors };
+  return { imported, atualizados, pulados, errors, por_etapa: porEtapa };
 }
 
 app.post("/import/lead", async (req, res) => {
@@ -4011,7 +4019,7 @@ app.post("/import/lead", async (req, res) => {
   if (!_n8nAuthOk(req, n8nOwner)) return res.status(401).json(_n8nAuthErro);
   const r = await _importarLeads(items, n8nOwner);
   console.log(`n8n importou ${r.imported} lead(s)` + (r.errors.length ? `, ${r.errors.length} erro(s)` : ""));
-  res.json({ success: true, imported: r.imported, errors: r.errors });
+  res.json({ success: true, imported: r.imported, errors: r.errors, por_etapa: r.por_etapa || {} });
 });
 
 
@@ -4029,7 +4037,7 @@ function _dripRegras(owner) { try { const a = JSON.parse(_cfg('drip_rules', owne
 async function _dripSalva(owner, regras) {
   const k = 'drip_rules::' + (owner || ' ');
   const value = JSON.stringify(regras);
-  await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
+  await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() }, { onConflict: 'key' });
   _settings[k] = value;
 }
 // O robô só grava os campos DELE (next_at/last/movidos) — se você pausou/editou a
@@ -4117,6 +4125,7 @@ async function _dripEtapasDoDono(owner) {
 // travado até o fim do fluxo (mesmo depois de uma pausa longa)
 const _runsTravados = new Map();
 const _dripLock = new Set();
+const _dripAutoAntes = new Map(); // regra → o automático estava rodando no tick anterior?
 async function _dripTick() {
   if (!supabase) return;
   for (const k in _settings) {
@@ -4143,6 +4152,17 @@ async function _dripTick() {
         //      ou: 🕐 automático ligado E dentro dos dias/horários
         const rodaManual = !!r.manual;
         const rodaAuto = !!r.agendado && _dripDentroDaJanela(r);
+        // 🕐 AUTOMÁTICO não dispara na hora: ao ligar (ou quando a janela do dia abre) o
+        // primeiro lead só sai depois do intervalo — ela ligou o Automático e o bot da etapa
+        // de destino disparou no mesmo segundo. ▶ Iniciar à mão continua imediato.
+        const autoAntes = _dripAutoAntes.get(r.id);
+        _dripAutoAntes.set(r.id, rodaAuto);
+        if (rodaAuto && !rodaManual && (!r.next_at || autoAntes === false)) {
+          const mm = _dripMinMax(r);
+          r.next_at = new Date(Date.now() + (Math.floor(Math.random() * (mm.maxS - mm.minS + 1)) + mm.minS) * 1000).toISOString();
+          r._tocada = true; mudou = true;
+          continue;
+        }
         if (!rodaManual && !rodaAuto) continue;
         const nx = r.next_at ? new Date(r.next_at).getTime() : 0;
         if (nx > Date.now()) continue;
@@ -4348,6 +4368,13 @@ app.put('/drip', async (req, res) => {
       // Se o alvo já passou, conta um intervalo mínimo INTEIRO a partir de agora
       nextAt = new Date(Math.max(alvo, Date.now() + mm.minS * 1000)).toISOString();
     }
+    // 🕐 ligou o Automático agora (estava desligado ou é regra nova): o primeiro lead só
+    // depois do intervalo — não no tick seguinte
+    const agendadoNovo = (r.agendado !== undefined) ? !!r.agendado : (a.agendado !== undefined ? !!a.agendado : !!a.ativo);
+    if (agendadoNovo && !a.agendado && !r.manual && (!nextAt || Date.parse(nextAt) < Date.now())) {
+      const mm = _dripMinMax({ min_seg: minN, max_seg: maxN, numeros: numN });
+      nextAt = new Date(Date.now() + (Math.floor(Math.random() * (mm.maxS - mm.minS + 1)) + mm.minS) * 1000).toISOString();
+    }
     return {
       id: String(r.id || ('drip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7))),
       nome: String(r.nome || '').slice(0, 60),
@@ -4492,7 +4519,7 @@ async function _sheetsSincronizar(owner, motivo) {
     await _sheetsSalvaCfg(owner, cfg);
     console.log(`📊 Planilha (${owner}, ${motivo}): ${linhas.length} linha(s), ${r.imported} importado(s), ${r.pulados} já existiam`);
     const resultado = { ok: true, ...cfg.last, detalhes_erros: r.errors.slice(0, 10) };
-    Object.assign(_sheetsProg[owner], { fase: 'concluido', feitos: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, done: true, resultado });
+    Object.assign(_sheetsProg[owner], { fase: 'concluido', feitos: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, por_etapa: r.por_etapa || {}, done: true, resultado });
     return resultado;
   } catch (e) {
     cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', erro: e.message };
