@@ -498,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 322;
+const SERVER_VER = 323;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6779,8 +6779,11 @@ async function _criaTarefaDoBot(cfg, run) {
   const title = applyVars(cfg.title || 'Tarefa', nome, phone);
   const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours) * 3600000).toISOString() : null;
   const linha = { phone, account_id: run.account_id || null, title, due_at: due, owner: run.owner || null, created_at: new Date().toISOString() };
+  const _tp = _tarefaTipoLimpo(cfg.tipo); if (_tp) linha.tipo = _tp; // tipo escolhido no passo do bot
   for (let tent = 1; tent <= 3; tent++) {
-    const { error } = await supabase.from('tasks').insert(linha);
+    let { error } = await supabase.from('tasks').insert(linha);
+    // banco ainda sem a coluna "tipo": cria a tarefa assim mesmo (sem o tipo)
+    if (error && linha.tipo && _semColunaTipo(error)) { delete linha.tipo; ({ error } = await supabase.from('tasks').insert(linha)); }
     if (!error) return true;
     console.error('Tarefa do bot NÃO gravou (tentativa ' + tent + '):', error.message);
     await new Promise(r => setTimeout(r, 800 * tent));
@@ -7244,7 +7247,10 @@ async function _execAcaoEtapa(a, phone, stageId, owner, depth = 0) {
           const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
           const title = applyVars(a.title, ct?.name || phone, phone);
           const due = a.due_hours ? new Date(Date.now() + Number(a.due_hours) * 3600000).toISOString() : null;
-          await supabase.from('tasks').insert({ phone, title, due_at: due, owner: owner || null, created_at: new Date().toISOString() });
+          const _lt = { phone, title, due_at: due, owner: owner || null, created_at: new Date().toISOString() };
+          const _tp = _tarefaTipoLimpo(a.tipo); if (_tp) _lt.tipo = _tp; // tipo escolhido na automação da etapa
+          let { error: _et } = await supabase.from('tasks').insert(_lt);
+          if (_et && _lt.tipo && _semColunaTipo(_et)) { delete _lt.tipo; await supabase.from('tasks').insert(_lt); }
           await _logAuto(owner, { phone, nome: nomeLead, stage_id: stageId, tipo: 'task', texto: 'Tarefa criada: ' + title });
         } else if (a.type === 'complete_task') {
           let q = supabase.from('tasks').update({ done: true }).eq('phone', phone).eq('done', false).eq('owner', OW);
