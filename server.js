@@ -498,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 318;
+const SERVER_VER = 320;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7781,6 +7781,24 @@ function _iaExemplosParecidos(exemplos, textoLead, n) {
   pont.sort((a, b) => b.sc - a.sc);
   return pont.slice(0, n).map(p => p.e);
 }
+// 🎯 Separa os exemplos que falam do MESMO assunto do lead (têm palavra em comum com a fala
+// dele) dos que só servem de estilo. A memória tem centenas de exemplos de saldo: quando o lead
+// falava de estorno, os 6 "mais parecidos" eram de saldo (parecidos em nada) e a IA copiava o
+// assunto errado. Agora: parecidos = só com palavra em comum; sem eles, no máximo 2 de estilo.
+function _iaExemplosPorAssunto(exemplos, textoLead, n) {
+  const alvo = _iaTok(textoLead);
+  const pont = exemplos.map((e, i) => {
+    const lt = _iaTok([].concat(e.lead || []).join(' '));
+    let comum = 0; alvo.forEach(t => { if (lt.has(t)) comum++; });
+    const ctx = _iaTok([].concat(e.contexto || []).join(' '));
+    let comumCtx = 0; alvo.forEach(t => { if (ctx.has(t)) comumCtx++; });
+    return { e, comum, sc: (comum / Math.max(1, Math.min(alvo.size || 1, lt.size || 1))) + comumCtx * 0.05 + i * 1e-6 };
+  });
+  pont.sort((a, b) => b.sc - a.sc);
+  const parecidos = pont.filter(p => p.comum > 0).slice(0, n).map(p => p.e);
+  const estilo = parecidos.length >= 2 ? [] : pont.filter(p => p.comum === 0).slice(0, 2).map(p => p.e);
+  return { parecidos, estilo };
+}
 // Uma linha da conversa do jeito que a IA lê (mídia vira "(áudio)", com transcrição se houver)
 function _iaLinha(m) {
   const quem = m.direction === 'outbound' ? 'Eu' : 'Lead';
@@ -7953,7 +7971,7 @@ async function _iaResumoAntigo(owner, phone, antigas) {
 // Correções dela: o que a IA sugeriu errado → o que ela mandou (as mais parecidas com a fala atual)
 function _iaCorrecoesParecidas(exemplos, textoLead, n) {
   const ed = exemplos.filter(e => e.origem === 'editada' && [].concat(e.sugerido || []).length && JSON.stringify(e.sugerido) !== JSON.stringify(e.resposta));
-  return _iaExemplosParecidos(ed, textoLead, n);
+  return _iaExemplosPorAssunto(ed, textoLead, n).parecidos; // só correções do MESMO assunto
 }
 // Placar: de tudo que a IA sugeriu, quanto ela aproveitou (aceitou ou editou) — por período
 function _iaPlacar(exemplos, dias) {
@@ -8110,7 +8128,7 @@ async function _iaSugere(owner, phone, forcar) {
   for (const m of doLead.slice(-3)) await _iaTranscreveSePrecisar(m); // os últimos áudios do lead viram texto
   const textoLead = doLead.map(m => m.type === 'audio' && m.transcript ? m.transcript : (m.content || '')).join(' ');
   // 6 exemplos (eram 8) e conversa mais curta: o plano grátis da Groq limita tokens por minuto
-  const exemplos = _iaExemplosParecidos(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6);
+  const { parecidos: exemplos, estilo: exEstilo } = _iaExemplosPorAssunto(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6);
   const correcoes = _iaCorrecoesParecidas(mem.exemplos, textoLead || '', 3);
   const nome = String((lead && lead.name) || '').trim();
   const primeiro = nome.split(/\s+/)[0] || '';
@@ -8119,20 +8137,35 @@ async function _iaSugere(owner, phone, forcar) {
   // 🎯 texto pronto (rápida/bot) só entra na sugestão como ITEM, e só no momento que ela cadastrou
   const quando = await _iaQuando(owner);
   const fixos = await _iaTextosAutomaticos(owner);
-  const rapidasCom = rapidas.filter(r => String(quando.rapidas[r.atalho] || '').trim());
-  const botsCom = bots.filter(b => String(quando.bots[b.id] || '').trim());
-  const _SO_TEXTO = !(rapidasCom.length || botsCom.length); // sem momento cadastrado: só mensagem personalizada
-  const catTxt = (!_SO_TEXTO ? '### RESPOSTAS PRONTAS E BOTS DELA — cada um SÓ no momento cadastrado por ela\n'
-      + rapidasCom.map(r => 'Rápida {"rapida":"/' + r.atalho + '"} — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '') + ' → SÓ QUANDO: ' + String(quando.rapidas[r.atalho]).trim()).join('\n')
+  // 🧠 momentos APRENDIDOS: em que falas do lead ela disparou cada bot/rápida (marcadores na memória)
+  const usos = { bots: {}, rapidas: {} };
+  for (const e of mem.exemplos) {
+    for (const r of [].concat(e.resposta || [])) {
+      const mb = /^\[bot: (.+)\]$/.exec(String(r)), mr = /^\[rapida: \/(.+)\]$/.exec(String(r));
+      const falas = [].concat(e.lead || []).map(x => String(x).slice(0, 90)).filter(Boolean);
+      if (mb) { const b = bots.find(x => x.nome.toLowerCase() === mb[1].trim().toLowerCase()); if (b) (usos.bots[b.id] = usos.bots[b.id] || []).push(...falas); }
+      if (mr) (usos.rapidas[mr[1].trim().toLowerCase()] = usos.rapidas[mr[1].trim().toLowerCase()] || []).push(...falas);
+    }
+  }
+  const _falas = arr => [...new Set(arr || [])].slice(-4).map(f => '"' + f + '"').join(' / ');
+  const _momento = (manual, aprendidas) => [manual ? 'SÓ QUANDO: ' + manual : '', (aprendidas && aprendidas.length) ? 'aprendido dos seus usos — ela dispara quando o lead diz: ' + _falas(aprendidas) : ''].filter(Boolean).join(' · ');
+  const rapidasCom = rapidas.filter(r => String(quando.rapidas[r.atalho] || '').trim() || (usos.rapidas[r.atalho] || []).length);
+  const botsCom = bots.filter(b => String(quando.bots[b.id] || '').trim() || (usos.bots[b.id] || []).length);
+  const podeBot = id => !!(String(quando.bots[id] || '').trim() || (usos.bots[id] || []).length);
+  const podeRapida = at => !!(String(quando.rapidas[at] || '').trim() || (usos.rapidas[at] || []).length);
+  const _SO_TEXTO = !(rapidasCom.length || botsCom.length); // sem momento cadastrado nem aprendido: só mensagem personalizada
+  const catTxt = (!_SO_TEXTO ? '### RESPOSTAS PRONTAS E BOTS DELA — cada um SÓ no momento certo (cadastrado por ela ou aprendido dos usos dela)\n'
+      + rapidasCom.map(r => 'Rápida {"rapida":"/' + r.atalho + '"} — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '') + ' → ' + _momento(String(quando.rapidas[r.atalho] || '').trim(), usos.rapidas[r.atalho])).join('\n')
       + (rapidasCom.length && botsCom.length ? '\n' : '')
-      + botsCom.map(b => 'Bot {"bot":"' + b.nome + '"} → SÓ QUANDO: ' + String(quando.bots[b.id]).trim()).join('\n')
+      + botsCom.map(b => 'Bot {"bot":"' + b.nome + '"} → ' + _momento(String(quando.bots[b.id] || '').trim(), usos.bots[b.id])).join('\n')
       + '\nRegra: se a conversa está EXATAMENTE nesse momento, devolva o item ({"rapida":"/x"} ou {"bot":"Nome"}) no lugar de escrever o texto dele. Fora desse momento, não use nem o item nem o texto dele — escreva a resposta personalizada.\n\n' : '');
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
     + (novidades.length ? '### NOVIDADES RECENTES (o que mudou nos últimos dias, com data — quando bater de frente com o manual, vale a novidade)\n' + novidades.slice(-15).map(n => '[' + String(n.em || '').split('-').reverse().slice(0, 2).join('/') + '] ' + n.texto).join('\n') + '\n\n' : '')
     + '### REGRAS DE SAÍDA\n'
-    + '- Responda SOMENTE com JSON no formato {"mensagens":["...","..."]}: de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
+    + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."]}: "assunto" em 2–5 palavras, e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
     + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
@@ -8157,25 +8190,27 @@ async function _iaSugere(owner, phone, forcar) {
     + (_ultMinha ? 'Última mensagem DELA: ' + _iaDataHora(_ultMinha.timestamp) + ' (há ' + _iaDiasCorridos(_ultMinha.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultMinha.timestamp) + ' útil(eis))\n' : '')
     + (_ultLead ? 'Última mensagem do LEAD: ' + _iaDataHora(_ultLead.timestamp) + ' (há ' + _iaDiasCorridos(_ultLead.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultLead.timestamp) + ' útil(eis))\n' : '');
   const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300)).join('\n---\n');
-  const usr = catTxt + (exTxt ? '### EXEMPLOS REAIS DE COMO ELA RESPONDE\n' + exTxt + '\n\n' : '')
+  const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n')).join('\n');
+  const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
+    + (exEstiloTxt ? '### EXEMPLOS SÓ DE ESTILO (assunto DIFERENTE do atual — copie o jeito de escrever, nunca o conteúdo)\n' + exEstiloTxt + '\n\n' : '')
     + (corrTxt ? '### CORREÇÕES DELA (aprenda com o erro: não repita o que ela trocou)\n' + corrTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
     + tempoTxt
     + (resumoAntigo ? '\n\n### RESUMO DA PARTE ANTIGA DA CONVERSA (' + antigas.length + ' mensagens, de ' + _iaDataHora(antigas[0].timestamp) + ' a ' + _iaDataHora(antigas[antigas.length - 1].timestamp) + ')\n' + resumoAntigo : '')
     + '\n\n### ' + (resumoAntigo ? 'ÚLTIMAS ' + msgs.length + ' MENSAGENS, por inteiro' : 'CONVERSA INTEIRA, do começo') + ' (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs, msgs.length)
-    + '\n\nAntes de escrever: olhe as DATAS acima, veja em que ponto da operação este cliente está e o que já foi feito. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
+    + '\n\nAntes de escrever: diga o ASSUNTO da última fala do lead; se for da operação, olhe as DATAS acima e veja em que fase ele está; se for outro assunto (estorno, cobrança, dúvida, reclamação), responda a ele e deixe a operação de lado. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
   // 🎯 filtro dos itens: rápida/bot só com momento cadastrado; texto que é de rápida/bot vira o
   // item (se tem momento) ou cai fora (era isso que fazia a IA sugerir "Qualquer dúvida me aciona…" na hora errada)
   const brutosIt = _iaExtraiItens(texto, rapidas, bots, false);
   const itensOk = [];
   for (const it of brutosIt) {
-    if (it.tipo === 'rapida') { if (quando.rapidas[it.atalho] && !itensOk.some(x => x.tipo === 'rapida' && x.atalho === it.atalho)) itensOk.push(it); continue; }
-    if (it.tipo === 'bot') { if (quando.bots[it.id] && !itensOk.some(x => x.tipo === 'bot' && x.id === it.id)) itensOk.push(it); continue; }
+    if (it.tipo === 'rapida') { if (podeRapida(it.atalho) && !itensOk.some(x => x.tipo === 'rapida' && x.atalho === it.atalho)) itensOk.push(it); continue; }
+    if (it.tipo === 'bot') { if (podeBot(it.id) && !itensOk.some(x => x.tipo === 'bot' && x.id === it.id)) itensOk.push(it); continue; }
     const dono = _iaDonoDoTexto(it.texto, fixos);
     if (!dono) { itensOk.push(it); continue; }
-    if (dono.rapida && quando.rapidas[dono.rapida]) { const r = rapidas.find(x => x.atalho === dono.rapida); if (r && !itensOk.some(x => x.tipo === 'rapida' && x.atalho === r.atalho)) itensOk.push({ tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
-    if (dono.bot && quando.bots[dono.bot]) { const b = bots.find(x => x.id === dono.bot); if (b && !itensOk.some(x => x.tipo === 'bot' && x.id === b.id)) itensOk.push({ tipo: 'bot', id: b.id, nome: b.nome }); continue; }
+    if (dono.rapida && podeRapida(dono.rapida)) { const r = rapidas.find(x => x.atalho === dono.rapida); if (r && !itensOk.some(x => x.tipo === 'rapida' && x.atalho === r.atalho)) itensOk.push({ tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
+    if (dono.bot && podeBot(dono.bot)) { const b = bots.find(x => x.id === dono.bot); if (b && !itensOk.some(x => x.tipo === 'bot' && x.id === b.id)) itensOk.push({ tipo: 'bot', id: b.id, nome: b.nome }); continue; }
     // texto pronto sem momento: não entra
   }
   const itens = itensOk.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
@@ -8482,6 +8517,7 @@ async function _iaVarreRespostas() {
   const porFone = new Map();
   for (const m of (brutas || [])) { if (!m || m.type === 'note') continue; if (!porFone.has(m.phone)) porFone.set(m.phone, []); porFone.get(m.phone).push(m); }
   const fixos = await _iaTextosAutomaticos(owner);
+  const catalogo = await _iaCatalogo(owner);
   let novos = 0; const paraNovidades = [];
   for (const [fone, lista] of porFone) { // lista: da mais nova para a mais antiga
     let k = 0;
@@ -8493,7 +8529,16 @@ async function _iaVarreRespostas() {
     const enviadas = []; let i = k, ok = true;
     for (; i < lista.length && lista[i].direction === 'outbound'; i++) {
       const m = lista[i], txt = String(m.content || '').trim();
-      if ((m.type && m.type !== 'text') || !txt || _iaTemLink(txt) || _iaEhAutomatica(txt, fixos)) { ok = false; break; } // bot, rápida, modelo, áudio, foto ou link: não é texto dela para aprender
+      if ((m.type && m.type !== 'text') || !txt || _iaTemLink(txt)) { ok = false; break; } // modelo, áudio, foto ou link: não é texto dela para aprender
+      // 🤖 texto de bot/rápida que ELA disparou: vira o marcador "[bot: Nome]"/"[rapida: /x]" — assim a
+      // IA aprende EM QUE MOMENTO ela usa cada um (antes a resposta inteira era jogada fora)
+      const dono = _iaDonoDoTexto(txt, fixos);
+      if (dono) {
+        const marca = dono.bot ? ('[bot: ' + ((catalogo.bots.find(b => b.id === dono.bot) || {}).nome || dono.bot) + ']') : ('[rapida: /' + dono.rapida + ']');
+        if (enviadas[0] !== marca) enviadas.unshift(marca); // vários nós do mesmo bot = um marcador só
+        continue;
+      }
+      if (_iaEhAutomatica(txt, fixos)) { ok = false; break; }
       enviadas.unshift(txt);
     }
     if (!ok || !enviadas.length) continue;
