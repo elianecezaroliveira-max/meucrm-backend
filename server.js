@@ -41,6 +41,25 @@ function _marcaSujo(tabela, fones) {
   }
 }
 let _verGeralMsgs = 0; // escrita em messages SEM telefone conhecido: todas as conversas releem
+// 🔔 CAMPAINHA: o app deixa um pedido "me avise quando mudar" (/acorda) esperando; assim que
+// uma mensagem/conversa do dono é GRAVADA, o pedido volta e o app atualiza na hora. Antes o
+// app só via a mensagem do bot na próxima conferência (a cada 3 s): o lead recebia ~1 s antes.
+// Não lê o banco (custo zero de cota); a conferência a cada 3 s continua como segurança.
+const _acordaVer = new Map();   // dono → versão
+const _acordaFila = new Map();  // dono → [resolve]
+let _acordaTodosVer = 0;        // escrita sem dono conhecido: acorda todo mundo
+function _acorda(donos) {
+  if (!donos) { _acordaTodosVer++; for (const [d, l] of _acordaFila) { _acordaFila.delete(d); l.forEach(f => { try { f(); } catch (_) {} }); } return; }
+  for (const d of new Set(donos.map(String))) {
+    _acordaVer.set(d, (_acordaVer.get(d) || 0) + 1);
+    const l = _acordaFila.get(d); if (l) { _acordaFila.delete(d); l.forEach(f => { try { f(); } catch (_) {} }); }
+  }
+}
+// chama o aviso DEPOIS que a gravação terminou (senão o app relia antes de o dado existir)
+function _depoisDeGravar(fb, cb) {
+  try { const t = fb.then.bind(fb); fb.then = (ok, err) => t(v => { try { cb(v); } catch (_) {} return ok ? ok(v) : v; }, err); } catch (_) {}
+  return fb;
+}
 const _fonePorWamid = new Map(); // wamid → telefone (os recibos de entrega/leitura chegam só com o wamid)
 function _lembraWamid(wamid, fone) {
   if (!wamid || !fone) return;
@@ -68,7 +87,8 @@ function _embrulhaParaCache(cli) {
         const fones = arr.map(r => r && r[campoFone]).filter(Boolean);
         if (tabela === 'messages') arr.forEach(r => { if (r) _lembraWamid(r.wamid, r.phone); });
         _marcaSujo(tabela, fones.length === arr.length && fones.length ? fones : null);
-        return orig(linhas, ...a);
+        const donos = arr.map(r => r && r.owner).filter(Boolean);
+        return _depoisDeGravar(orig(linhas, ...a), (v) => { if (!v || !v.error) _acorda(donos.length ? donos : null); });
       };
     }
     for (const m of ['update', 'delete']) {
@@ -76,16 +96,18 @@ function _embrulhaParaCache(cli) {
       const orig = b[m].bind(b);
       b[m] = (...a) => {
         const fb = orig(...a);
-        const fones = []; let marcado = false, semFone = false;
+        const fones = [], donos = []; let marcado = false, semFone = false;
         try {
           const eqO = fb.eq.bind(fb), inO = fb.in.bind(fb), thenO = fb.then.bind(fb);
           fb.eq = (c, v) => {
+            if (c === 'owner') donos.push(v);
             if (c === campoFone) fones.push(v);
             else if (c === 'wamid' && tabela === 'messages') { const f = _fonePorWamid.get(String(v)); if (f) fones.push(f); else semFone = true; }
             return eqO(c, v);
           };
           fb.in = (c, v) => { if (c === campoFone) (v || []).forEach(x => fones.push(x)); return inO(c, v); };
-          fb.then = (ok, err) => { if (!marcado) { marcado = true; _marcaSujo(tabela, (fones.length && !semFone) ? fones : null); } return thenO(ok, err); };
+          fb.then = (ok, err) => { if (!marcado) { marcado = true; _marcaSujo(tabela, (fones.length && !semFone) ? fones : null); }
+            return thenO(v => { try { if (!v || !v.error) _acorda(donos.length ? donos : null); } catch (_) {} return ok ? ok(v) : v; }, err); };
         } catch (_) { _marcaSujo(tabela, null); }
         return fb;
       };
@@ -498,7 +520,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 324;
+const SERVER_VER = 325;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -511,6 +533,22 @@ function _contasCompartilhadas() {
   };
 }
 const _NO_AR_DESDE = new Date().toISOString();
+// 🔔 "me avise quando mudar": responde assim que algo do dono for gravado (ou em 25 s)
+app.get('/acorda', (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  const dono = String(req.owner);
+  const atual = () => (_acordaVer.get(dono) || 0) + ':' + _acordaTodosVer;
+  const v = String(req.query.v || '');
+  if (!v || v !== atual()) return res.json({ v: atual(), mudou: !!v }); // 1º pedido: só pega a versão
+  let feito = false;
+  const fim = (mudou) => { if (feito) return; feito = true; clearTimeout(t); try { res.json({ v: atual(), mudou }); } catch (_) {} };
+  const t = setTimeout(() => { const l = _acordaFila.get(dono); if (l) { const i = l.indexOf(acordou); if (i >= 0) l.splice(i, 1); } fim(false); }, 25000);
+  const acordou = () => setTimeout(() => fim(true), 150); // junta gravações seguidas num aviso só
+  if (!_acordaFila.has(dono)) _acordaFila.set(dono, []);
+  _acordaFila.get(dono).push(acordou);
+  req.on('close', () => { if (!feito) { feito = true; clearTimeout(t); const l = _acordaFila.get(dono); if (l) { const i = l.indexOf(acordou); if (i >= 0) l.splice(i, 1); } } });
+});
+
 app.get('/versao', async (req, res) => {
   let presCount = 0, presKeys = [];
   try { presKeys = Object.keys(_waPresence || {}); presCount = presKeys.length; } catch (_) {}
@@ -6799,6 +6837,10 @@ async function _criaTarefaDoBot(cfg, run) {
 }
 async function processNode(run, depth=0) {
   if (!supabase) return;
+  // ⏱️ Instante em que a mensagem ANTERIOR saiu: vale só para o passo logo seguinte
+  // (o Cronômetro conta a partir dele — ver o passo 'pause')
+  const _envAnt = run && run._enviadoEm ? run._enviadoEm : null;
+  if (_envAnt) { run = { ...run }; delete run._enviadoEm; }
   // Recupera a trava do número quando a execução volta do banco (após uma pausa)
   if (!run._travaConta && run.id && _runsTravados.has(String(run.id))) {
     run._travaConta = true;
@@ -6871,6 +6913,7 @@ async function processNode(run, depth=0) {
     // A Meta (e o QR) aceitam a mensagem e só DEPOIS avisam que falhou (fora da
     // janela de 24 h, número inválido…). Regra: só avança se NÃO falhou — espera
     // o status antes de escolher a saída ("Enviada ✓" ou "Falha no envio").
+    const _enviadoEm = Date.now(); // a mensagem saiu AGORA (o Cronômetro seguinte conta daqui)
     if (sendOk && typeof sendOk === 'string') sendOk = await _esperaEnvioDoBot(sendOk);
     // resolve as arestas deste nó (sucesso = sem rótulo / falha = __failed__)
     const medges = await _edgesFrom(nodeId);
@@ -6890,7 +6933,7 @@ async function processNode(run, depth=0) {
       await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
     } else if (okNxt) {
       await supabase.from('bot_runs').update({ current_node_id:okNxt, updated_at:new Date().toISOString() }).eq('id',runId);
-      await processNode({...run,current_node_id:okNxt}, depth+1);
+      await processNode({...run,current_node_id:okNxt,_enviadoEm}, depth+1);
     } else {
       await stopRun(runId,'completed');
     }
@@ -6975,7 +7018,10 @@ async function processNode(run, depth=0) {
     await supabase.from('bot_runs').update({ status:'waiting_reply', pause_until:pauseUntil, updated_at:new Date().toISOString() }).eq('id',runId);
 
   } else if (node.type === 'pause') {
-    const _t0 = Date.now(); // marco zero: o relógio começa AQUI, não depois das consultas
+    // ⏱️ CRONÔMETRO FIEL: o relógio começa quando a mensagem anterior SAIU. Antes ele só
+    // começava depois de o bot esperar a confirmação da Meta (até 6 s, para decidir entre
+    // "Enviada ✓" e "Falha no envio") — um Cronômetro de 6 s virava até 12 s.
+    const _t0 = (_envAnt && Date.now() - _envAnt < 120000) ? _envAnt : Date.now();
     const ms = ((cfg.days||0)*24+(cfg.hours||0))*3600000 + (cfg.minutes||0)*60000 + (cfg.seconds||0)*1000;
     const waitMs = Math.max(ms, 1000);
     const _alvoMs = _t0 + waitMs;               // instante exato de retomar
