@@ -498,7 +498,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 323;
+const SERVER_VER = 324;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3861,8 +3861,9 @@ app.post("/tasks", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phone, account_id, title, due_at, notes } = req.body;
   // Nome NÃO é obrigatório: sem texto, a tarefa nasce como "Tarefa"
-  const titleFinal = String(title || '').trim() || 'Tarefa';
   const tipo = _tarefaTipoLimpo(req.body.tipo);
+  // A tarefa não tem mais nome no app: sem texto, leva o nome do TIPO (ou "Tarefa")
+  const titleFinal = String(title || '').trim() || ((_tarefaTipos(req.owner).find(x => x.id === tipo) || {}).nome) || 'Tarefa';
   const linha = { phone: phone || null, account_id: account_id || null, title: titleFinal, due_at: due_at || null, notes: notes || null, owner: req.owner || null, created_at: new Date().toISOString() };
   if (tipo) linha.tipo = tipo;
   let { data, error } = await supabase.from("tasks").insert(linha).select().single();
@@ -6776,9 +6777,13 @@ async function _criaTarefaDoBot(cfg, run) {
   const phone = run.contact_phone, OW = run.owner || ' ';
   let nome = phone;
   try { const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle(); nome = (ct && ct.name) || phone; } catch (_) {}
-  const title = applyVars(cfg.title || 'Tarefa', nome, phone);
+  // Sem nome próprio (o passo agora tem só TIPO + COMENTÁRIO): a tarefa leva o nome do tipo
+  const _tpNome = ((_tarefaTipos(run.owner).find(x => x.id === cfg.tipo) || {}).nome) || 'Tarefa';
+  const title = String(cfg.title || '').trim() ? applyVars(cfg.title, nome, phone) : _tpNome;
+  const _notas = String(cfg.notes || '').trim() ? applyVars(cfg.notes, nome, phone) : null;
   const due = cfg.due_hours ? new Date(Date.now() + Number(cfg.due_hours) * 3600000).toISOString() : null;
   const linha = { phone, account_id: run.account_id || null, title, due_at: due, owner: run.owner || null, created_at: new Date().toISOString() };
+  if (_notas) linha.notes = _notas;
   const _tp = _tarefaTipoLimpo(cfg.tipo); if (_tp) linha.tipo = _tp; // tipo escolhido no passo do bot
   for (let tent = 1; tent <= 3; tent++) {
     let { error } = await supabase.from('tasks').insert(linha);
@@ -7243,11 +7248,12 @@ async function _execAcaoEtapa(a, phone, stageId, owner, depth = 0) {
   const { data: ctInfo } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
   const nomeLead = ctInfo?.name || phone;
   try {
-        if (a.type === 'task' && a.title) {
+        if (a.type === 'task' && (a.title || a.tipo || a.notes)) {
           const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
-          const title = applyVars(a.title, ct?.name || phone, phone);
+          const title = a.title ? applyVars(a.title, ct?.name || phone, phone) : (((_tarefaTipos(owner).find(x => x.id === a.tipo) || {}).nome) || 'Tarefa');
           const due = a.due_hours ? new Date(Date.now() + Number(a.due_hours) * 3600000).toISOString() : null;
           const _lt = { phone, title, due_at: due, owner: owner || null, created_at: new Date().toISOString() };
+          if (a.notes) _lt.notes = applyVars(a.notes, ct?.name || phone, phone);
           const _tp = _tarefaTipoLimpo(a.tipo); if (_tp) _lt.tipo = _tp; // tipo escolhido na automação da etapa
           let { error: _et } = await supabase.from('tasks').insert(_lt);
           if (_et && _lt.tipo && _semColunaTipo(_et)) { delete _lt.tipo; await supabase.from('tasks').insert(_lt); }
