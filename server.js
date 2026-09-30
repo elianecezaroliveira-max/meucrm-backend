@@ -520,7 +520,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 326;
+const SERVER_VER = 328;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2194,6 +2194,8 @@ app.post("/send", async (req, res) => {
   if (_rep) { const r = _rep.promessa ? await _rep.promessa : _rep; return res.status(r.status).json({ ...(r.body || {}), repetido: true }); }
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
+  // o texto NUNCA é editado (ela pediu): acima do limite do WhatsApp, recusa com o motivo
+  if (typeof message === 'string' && message.length > 4096) return res.status(400).json({ error: 'Mensagem com ' + message.length + ' caracteres — o WhatsApp aceita até 4.096. Divida em duas mensagens.' });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
   if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta — envio para si mesmo não é permitido.' });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
