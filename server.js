@@ -520,7 +520,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 325;
+const SERVER_VER = 326;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -4652,7 +4652,7 @@ async function _sheetsSalvaCfg(owner, cfg) {
 }
 const _sheetsRodando = new Set();
 const _sheetsProg = {}; // owner -> { fase, total, feitos, importados, pulados, erros, done, resultado }
-async function _sheetsSincronizar(owner, motivo) {
+async function _sheetsSincronizar(owner, motivo, opcoes) {
   if (_sheetsRodando.has(owner)) return { ok: false, erro: 'já está sincronizando' };
   _sheetsRodando.add(owner);
   const cfg = await _sheetsCfg(owner);
@@ -4662,7 +4662,9 @@ async function _sheetsSincronizar(owner, motivo) {
     if (!cfg.spreadsheet_id) throw new Error('Nenhuma planilha configurada');
     const linhas = await _lerPlanilha(cfg.spreadsheet_id, cfg.sheet_name || 'DISPARO');
     Object.assign(_sheetsProg[owner], { fase: 'importando', total: linhas.length });
-    const r = await _importarLeads(linhas, owner, { soNovos: !cfg.atualizar_etapa,
+    // "Não importar os que já existem" marcado na prévia: pula eles NESTA importação
+    const _pular = !!(opcoes && opcoes.pularExistentes);
+    const r = await _importarLeads(linhas, owner, { soNovos: _pular || !cfg.atualizar_etapa,
       onProgress: p => Object.assign(_sheetsProg[owner], p) });
     cfg.last = { quando: new Date().toISOString(), motivo: motivo || 'manual', linhas: linhas.length, importados: r.imported, pulados: r.pulados, erros: r.errors.length, ms: Date.now() - ini };
     await _sheetsSalvaCfg(owner, cfg);
@@ -4745,10 +4747,10 @@ app.post('/sheets/sync', async (req, res) => {
   if (String(req.query.bg || '') === '1') {
     // Em segundo plano: responde já e o app acompanha o progresso em /sheets/sync/status
     if (_sheetsRodando.has(req.owner)) return res.json({ ok: true, iniciado: false, ja_rodando: true });
-    _sheetsSincronizar(req.owner, 'manual').catch(() => {});
+    _sheetsSincronizar(req.owner, 'manual', { pularExistentes: String(req.query.existentes || '') === 'pular' }).catch(() => {});
     return res.json({ ok: true, iniciado: true });
   }
-  const r = await _sheetsSincronizar(req.owner, 'manual');
+  const r = await _sheetsSincronizar(req.owner, 'manual', { pularExistentes: String(req.query.existentes || '') === 'pular' });
   res.status(r.ok ? 200 : 500).json(r);
 });
 app.get('/sheets/sync/status', (req, res) => {
