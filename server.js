@@ -520,7 +520,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 328;
+const SERVER_VER = 329;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5151,6 +5151,21 @@ app.get("/messages/:phone", async (req, res) => {
 });
 
 // ⭐/📌 Favoritar e fixar MENSAGEM (como no WhatsApp)
+// 🎙️ Onda do áudio calculada por um aparelho (o computador): guardada para todos os outros
+// (o iPhone não decodifica o áudio de voz do WhatsApp e mostrava pauzinhos de enfeite)
+app.put('/messages/:id/waveform', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const arr = Array.isArray(req.body && req.body.waveform) ? req.body.waveform : null;
+  if (!arr || !arr.length || arr.length > 64 || !arr.every(v => Number.isFinite(Number(v)) && v >= 0 && v <= 255)) return res.status(400).json({ error: 'onda inválida' });
+  // com o telefone, só a conversa dele é relida (sem ele, todas — mais leitura do banco)
+  let q = supabase.from('messages').update({ waveform: JSON.stringify(arr.map(v => Math.round(Number(v)))) })
+    .eq('id', req.params.id).eq('owner', req.owner);
+  if (req.body.phone) q = q.eq('phone', String(req.body.phone));
+  const { error } = await q.is('waveform', null);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
 app.put('/messages/:id/star', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('messages').update({ starred: !!req.body.starred })
