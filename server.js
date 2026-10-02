@@ -41,6 +41,7 @@ function _marcaSujo(tabela, fones) {
   }
 }
 let _verGeralMsgs = 0; // escrita em messages SEM telefone conhecido: todas as conversas releem
+let _tarefasVer = 0;   // muda a cada gravação na tabela tasks (cache do GET /tasks)
 // 🔔 CAMPAINHA: o app deixa um pedido "me avise quando mudar" (/acorda) esperando; assim que
 // uma mensagem/conversa do dono é GRAVADA, o pedido volta e o app atualiza na hora. Antes o
 // app só via a mensagem do bot na próxima conferência (a cada 3 s): o lead recebia ~1 s antes.
@@ -76,6 +77,15 @@ function _embrulhaParaCache(cli) {
       if (typeof b[m] !== 'function') continue;
       const o = b[m].bind(b);
       b[m] = (...a) => _medeSaida(o(...a), null);
+    }
+    // 💸 tarefas: toda gravação muda a versão → GET /tasks responde da memória até mudar algo
+    if (tabela === 'tasks') {
+      for (const m of ['insert', 'upsert', 'update', 'delete']) {
+        if (typeof b[m] !== 'function') continue;
+        const orig = b[m].bind(b);
+        b[m] = (...a) => { _tarefasVer++; return _depoisDeGravar(orig(...a), () => { _tarefasVer++; }); };
+      }
+      return b;
     }
     if (tabela !== 'contacts' && tabela !== 'messages') return b;
     const campoFone = tabela === 'contacts' ? 'phone' : 'phone';
@@ -520,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 329;
+const SERVER_VER = 330;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1770,7 +1780,7 @@ async function _limpaMidiasAntigas() {
 
 // Vigia as contas da API oficial a cada 15 min — o aviso chega mesmo sem você
 // abrir a tela de Contas (antes, o problema só era detectado ao abrir a tela).
-setInterval(async () => {
+setInterval(() => _gastoCtx.run({ rota: 'fundo:vigiaContas' }, async () => {
   try {
     if (!supabase) return;
     const { data: accs } = await supabase.from('accounts').select('id')
@@ -1782,7 +1792,7 @@ setInterval(async () => {
       await cloudApiStatus(a.id);
     }
   } catch (_) {}
-}, 15 * 60000);
+}), 15 * 60000);
 
 // Quantas mensagens SAÍRAM por número (hoje e nos últimos 7 dias, horário de Brasília)
 app.get('/accounts/uso', async (req, res) => {
@@ -3879,23 +3889,42 @@ app.put('/tarefa-tipos', async (req, res) => {
 app.get("/tasks", async (req, res) => {
   if (!supabase) return res.json([]);
   const { phone, pending } = req.query;
-  let q = supabase.from("tasks").select("*").eq("owner", req.owner || ' ').order("due_at", { ascending: true, nullsFirst: false });
+  // 💸 A lista de tarefas era relida do banco a CADA pedido (bolinha a cada 2 min por aparelho,
+  // detalhes do lead, tela Tarefas…): 844 MB em 4 dias. Agora fica na memória até alguma
+  // tarefa (ou nome/etapa de lead) mudar.
+  const _chT = 'tasks|' + (req.owner || ' ') + '|' + (phone || '') + '|' + (pending === '1' ? 1 : 0);
+  try {
+    const corpo = await _comCache(_chT, _tarefasVer + '|' + _tabVer.contacts, _CACHE_TTL_MS, async () => {
+      const r = await _tarefasLe(req.owner, phone, pending);
+      if (r.error) throw new Error(r.error);
+      return r.tasks;
+    });
+    return res.json(corpo);
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+async function _tarefasLe(owner, phone, pending) {
+  let q = supabase.from("tasks").select("id, phone, account_id, title, due_at, done, created_at, notes, owner, tipo").eq("owner", owner || ' ').order("due_at", { ascending: true, nullsFirst: false });
   if (phone) q = q.eq("phone", phone);
   if (pending === "1") q = q.eq("done", false);
-  const { data, error } = await q;
-  if (error) return res.status(500).json({ error: error.message });
+  let { data, error } = await q;
+  if (error && /tipo/.test(error.message || '')) { // banco sem a coluna "tipo"
+    let q2 = supabase.from("tasks").select("*").eq("owner", owner || ' ').order("due_at", { ascending: true, nullsFirst: false });
+    if (phone) q2 = q2.eq("phone", phone); if (pending === "1") q2 = q2.eq("done", false);
+    ({ data, error } = await q2);
+  }
+  if (error) return { error: error.message };
   const tasks = data || [];
   // anexa o nome do lead (para a aba global de tarefas)
   const phones = [...new Set(tasks.map(t => t.phone).filter(Boolean))];
   if (phones.length) {
-    const { data: cts } = await supabase.from("contacts").select("phone,name,stage_id").in("phone", phones).eq("owner", req.owner || ' ');
+    const { data: cts } = await supabase.from("contacts").select("phone,name,stage_id").in("phone", phones).eq("owner", owner || ' ');
     const nameMap = {}, etapaMap = {};
     for (const c of cts || []) { nameMap[c.phone] = c.name; etapaMap[c.phone] = c.stage_id || null; }
     // a ETAPA do lead vai junto: a tela Tarefas filtra por etapa do pipeline
     for (const t of tasks) { t.contact_name = t.phone ? (nameMap[t.phone] || t.phone) : null; t.contact_stage_id = t.phone ? (etapaMap[t.phone] || null) : null; }
   }
-  res.json(tasks);
-});
+  return { tasks };
+}
 
 app.post("/tasks", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
@@ -8238,7 +8267,7 @@ async function _iaTranscreveSePrecisar(m) {
 const _iaCatCache = {};
 async function _iaCatalogo(owner) {
   const c = _iaCatCache[owner || ' '];
-  if (c && Date.now() - c.t < 60000) return c;
+  if (c && Date.now() - c.t < 10 * 60000) return c; // 💸 10 min (salvar um bot limpa na hora)
   const out = { t: Date.now(), rapidas: [], bots: [] };
   try {
     const { data } = await supabase.from('settings').select('value').eq('key', 'quick_replies::' + (owner || ' ')).maybeSingle();
@@ -8658,7 +8687,7 @@ async function _iaGuardaExemplo(owner, b) {
 const _iaAutoCache = {};
 async function _iaTextosAutomaticos(owner) {
   const c = _iaAutoCache[owner || ' '];
-  if (c && Date.now() - c.t < 5 * 60000) return c.fixos;
+  if (c && Date.now() - c.t < 60 * 60000) return c.fixos; // 💸 1 h (salvar um bot limpa na hora)
   const fixos = []; const donos = [];
   const junta = (t, dono) => { const fixo = String(t || '').split(/\{\{|\{/)[0].replace(/\s+/g, ' ').trim().toLowerCase(); if (fixo.length >= 12) { fixos.push(fixo.slice(0, 60)); donos.push({ fixo: fixo.slice(0, 60), dono }); } };
   try { const { data } = await supabase.from('bot_nodes').select('config, bot_id').eq('owner', owner || ' ');
@@ -9090,6 +9119,7 @@ app.get('/bots/:id', async (req,res) => {
   res.json(data||{});
 });
 app.post('/bots', async (req,res) => {
+  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { name,trigger_type,trigger_stage_id,account_id } = req.body;
   const { data,error } = await supabase.from('bots').insert({ name:name||'Novo Bot', trigger_type:trigger_type||'manual', trigger_stage_id:trigger_stage_id||null, account_id:account_id||null, active:true, owner:req.owner||null }).select().single();
@@ -9097,6 +9127,7 @@ app.post('/bots', async (req,res) => {
   res.json(data);
 });
 app.put('/bots/:id', async (req,res) => {
+  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { name,trigger_type,trigger_stage_id,active } = req.body;
   const upd = {};
@@ -9153,6 +9184,7 @@ async function _botSnapSalvar(owner, botId, nos, ligacoes) {
   } catch (e) { console.error('cópia do fluxo do bot:', e.message); }
 }
 app.put('/bots/:id/flow', async (req,res) => {
+  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   if (!_exigeAdmin(req, res, 'mexer no fluxo de um bot')) return;
   _audita(req, 'Bot alterado', 'salvou o fluxo do bot ' + req.params.id);
@@ -9476,7 +9508,12 @@ async function loadSettings() {
     let n = 0;
     // Busca em páginas: passar de 1000 linhas deixava configurações de fora em silêncio
     for (let p = 0; p < 40; p++) {
-      const { data, error } = await supabase.from('settings').select('key, value').range(p * 1000, p * 1000 + 999);
+      // 💸 as linhas PESADAS (cópias de backup, memória da IA, histórico…) nem saem do banco:
+      // antes eram baixadas a cada 5 min e só depois descartadas aqui
+      const { data, error } = await supabase.from('settings').select('key, value')
+        .not('key', 'like', 'bkp::%').not('key', 'like', 'hist::%').not('key', 'like', 'bot_snap::%')
+        .not('key', 'like', 'msg_trash::%').not('key', 'like', 'ia_mem::%').not('key', 'like', 'ia_resumo::%')
+        .order('key', { ascending: true }).range(p * 1000, p * 1000 + 999);
       if (error) throw error;
       if (!data || !data.length) break;
       for (const row of data) {
@@ -9489,7 +9526,9 @@ async function loadSettings() {
   } catch(e) { console.error('Settings load error:', e.message); }
 }
 loadSettings();
-setInterval(loadSettings, 5 * 60 * 1000); // recarrega settings (ex.: novos membros da equipe) sem precisar de redeploy
+// recarrega settings (ex.: novos membros da equipe) sem precisar de redeploy — a cada 10 min,
+// com rótulo próprio no medidor de saída do banco
+setInterval(() => _gastoCtx.run({ rota: 'fundo:loadSettings' }, () => loadSettings()), 10 * 60 * 1000);
 // Aviso claro se a configuração antiga de "todos na mesma conta" ainda estiver no banco
 setTimeout(() => {
   if (_settings['owner_default']) console.warn('A configuração antiga "owner_default" existe no banco mas está IGNORADA — cada e-mail agora é uma conta separada. Use a Equipe (Configurações) para compartilhar de propósito.');
