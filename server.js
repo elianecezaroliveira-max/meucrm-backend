@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 335;
+const SERVER_VER = 336;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -11345,6 +11345,18 @@ async function waStart(instanceName) {
         if (!realPn) { try { realPn = await sock.signalRepository?.lidMapping?.getPNForLID?.(_rj) || null; } catch (_) {} }
       } else if (!m.key?.fromMe) {
         realPn = m.key?.senderPn || m.key?.participantPn || null;
+      }
+      // O lead ENVIOU: o "digitando…" dele acaba agora (o WhatsApp nem sempre manda o "paused",
+      // e a prévia ficava "digitando…" por até 12 s depois da mensagem chegar)
+      if (!m.key?.fromMe && type === 'notify') {
+        try {
+          const parado = { state: 'paused', lastSeen: null, at: Date.now() };
+          for (const j of [_rj, String(_rj).replace(/:\d+(?=@)/, ''), lidJid, realPn, m.key?.remoteJidAlt].filter(Boolean)) {
+            const jid = String(j).includes('@') ? String(j) : String(j).replace(/\D/g, '') + '@s.whatsapp.net';
+            _waPresence[instanceName + '|' + jid] = parado;
+            _waPresence[instanceName + '|' + jid.replace(/@.*$/, '')] = parado;
+          }
+        } catch (_) {}
       }
       try {
         await axios.post(`http://127.0.0.1:${PORT}/evolution-webhook`, {
