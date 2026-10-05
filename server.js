@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 333;
+const SERVER_VER = 335;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1140,7 +1140,14 @@ app.post("/webhook", async (req, res) => {
         const it = message.interactive;
         content = it?.button_reply?.title || it?.list_reply?.title || it?.nfm_reply?.name || "[Resposta interativa]";
       } else if (type === 'unsupported') {
-        content = 'Mensagem não suportada pela API — veja no aplicativo do WhatsApp';
+        // A Meta NÃO entrega o conteúdo: só avisa que chegou algo que a API não suporta.
+        // O caso mais comum é mensagem de OUTRA EMPRESA (modelo com botões, como "Fazer recarga"),
+        // além de enquete, evento e afins. O motivo da Meta vai junto para ela entender.
+        const _e0 = (Array.isArray(message.errors) && message.errors[0]) || {};
+        const _det = String((_e0.error_data && _e0.error_data.details) || _e0.message || _e0.title || '').trim();
+        content = '⚠️ Mensagem que a API da Meta não entrega (em geral, mensagem automática de outra empresa — modelo com botões, enquete ou evento). O conteúdo só aparece no aplicativo do WhatsApp.'
+          + (_det ? '\nMotivo da Meta: ' + _det.slice(0, 160) + (_e0.code ? ' (código ' + _e0.code + ')' : '') : '');
+        try { console.log('ℹ️ Mensagem unsupported de', from, '— errors:', JSON.stringify(message.errors || null).slice(0, 300)); } catch (_) {}
       } else {
         content = `[Mensagem do tipo: ${type}]`;
       }
@@ -8272,7 +8279,7 @@ const _iaEhMarcador = (t) => /^\s*\[(image|imagem|document|documento|audio|áudi
 const _iaTemLink = (t) => /https?:\/\/|www\.|\{link\}|\[link\]|\b[a-z0-9-]+\.(io|com|br|net|app|link|me)\b\/?/i.test(String(t || ''));
 function _iaExtraiMensagens(texto) {
   const t = String(texto || '');
-  const limpa = (arr) => arr.map(x => String(x || '').replace(/^\s*\[(image|imagem|document|documento)\]\s*(\[[^\]]*\])?\s*/i, '').trim()).filter(x => x && !_iaEhMarcador(x) && !_iaTemLink(x)).slice(0, 4);
+  const limpa = (arr) => arr.map(x => String(x || '').replace(/^\s*\[(image|imagem|document|documento)\]\s*(\[[^\]]*\])?\s*/i, '').trim()).filter(x => x && !_iaEhMarcador(x) && !_iaTemLink(x) && !_iaPareceCru(x)).slice(0, 4);
   const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
   if (ini >= 0 && fim > ini) {
     try {
@@ -8325,20 +8332,32 @@ async function _iaCatalogo(owner) {
   return out;
 }
 // Itens da sugestão: texto, {rapida:"/atalho"} ou {bot:"Nome"} — só os que existem de verdade
+// A IA às vezes escreve o atalho de um jeito torto: {"rapida":"/tarde"} como TEXTO (string),
+// o objeto solto fora de "mensagens", ou "[rapida: /tarde]" (o formato da memória). Tudo isso
+// vira o item certo — e NUNCA chega na tela como texto cru para ser enviado ao lead.
+function _iaItemTorto(s) {
+  const t = String(s || '').trim();
+  if (/^\{[\s\S]*\}$/.test(t)) { try { const o = JSON.parse(t); if (o && typeof o === 'object' && (o.rapida != null || o.bot != null)) return o; } catch (_) {} }
+  let m = t.match(/^\[?\s*r[aá]pida\s*:\s*\/?\s*([\w-]+)\s*\]?$/i); if (m) return { rapida: m[1] };
+  m = t.match(/^\[?\s*bot\s*:\s*([^\]]+?)\s*\]?$/i); if (m) return { bot: m[1] };
+  return null;
+}
+function _iaPareceCru(s) { return /^\s*\{[\s\S]*"(rapida|bot|mensagens)"[\s\S]*\}\s*$/i.test(String(s || '')); }
 function _iaExtraiItens(texto, rapidas, bots, soTexto) {
   const t = String(texto || '');
   let brutos = null;
   const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
-  if (ini >= 0 && fim > ini) { try { const o = JSON.parse(t.slice(ini, fim + 1)); if (o && Array.isArray(o.mensagens)) brutos = o.mensagens; } catch (_) {} }
+  if (ini >= 0 && fim > ini) { try { const o = JSON.parse(t.slice(ini, fim + 1)); if (o && Array.isArray(o.mensagens)) brutos = o.mensagens; else if (o && typeof o === 'object' && (o.rapida != null || o.bot != null)) brutos = [o]; } catch (_) {} }
   if (!brutos) return _iaExtraiMensagens(t).map(x => ({ tipo: 'texto', texto: x }));
-  const norm = x => String(x || '').trim().toLowerCase().replace(/^\//, '');
+  const norm = x => String(x || '').trim().toLowerCase().replace(/^\//, '').replace(/[\s-]+/g, '_');
   const out = [];
-  for (const b of brutos) {
+  for (let b of brutos) {
     if (out.length >= 4) break;
+    if (typeof b === 'string') { const o = _iaItemTorto(b); if (o) b = o; else if (_iaPareceCru(b)) continue; }
     if (b && typeof b === 'object') {
       // soTexto: a sugestão é só mensagem personalizada — atalho vira o TEXTO da resposta
       // rápida e bot é descartado (ela dispara pelo "/" e pelo "#" quando quiser)
-      if (b.rapida != null) { const r = (rapidas || []).find(x => x.atalho === norm(b.rapida)); if (r && !_iaTemLink(r.texto)) out.push(soTexto ? { tipo: 'texto', texto: r.texto } : { tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
+      if (b.rapida != null) { const r = (rapidas || []).find(x => norm(x.atalho) === norm(b.rapida)); if (r && !_iaTemLink(r.texto)) out.push(soTexto ? { tipo: 'texto', texto: r.texto } : { tipo: 'rapida', atalho: r.atalho, texto: r.texto, previa: r.previa, anexo: r.anexo }); continue; }
       if (b.bot != null) { if (soTexto) continue; const al = String(b.bot).trim().toLowerCase(); const bt = (bots || []).find(x => x.nome.toLowerCase() === al || x.id === String(b.bot)); if (bt) out.push({ tipo: 'bot', id: bt.id, nome: bt.nome }); continue; }
       continue;
     }
