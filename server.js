@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 330;
+const SERVER_VER = 331;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5466,18 +5466,41 @@ app.delete('/tmpl-lixeira/:id', async (req, res) => {
 });
 
 // ── Enviar template ──
+// 🔒 Nunca o MESMO modelo duas vezes sem querer: enquanto um envio está no ar, o 2º clique é
+// recusado; e se o mesmo modelo (mesmo texto) saiu para o lead há menos de 90 s, o app
+// pergunta antes ("forcar" = você confirmou). O mesmo client_id nunca envia de novo.
+const _tmplEnvios = new Map(); // dono|fone|modelo|texto → { emVoo, quando, ids:Set }
+const _TMPL_JANELA_MS = 90000;
 app.post("/send-template", async (req, res) => {
   if (_planoBarra(req, res)) return;
   let { to, account_id, template_name, language_code, components, body_text } = req.body;
   if (!to || !account_id || !template_name)
     return res.status(400).json({ error: "Campos obrigatórios: to, account_id, template_name" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
-  if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta.' });
-  stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
-  const { data: account, error: accErr } = await supabase
-    .from("accounts").select("phone_number_id, token").eq("id", account_id).eq("owner", req.owner || ' ').single();
-  if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
+  // conferência do "não duplicar" — síncrona, antes de qualquer espera
+  const _tk = [req.owner || '', to, template_name, String(body_text || '').trim()].join('|');
+  const _cid = String(req.body.client_id || '');
+  for (const [k, v] of _tmplEnvios) if (!v.emVoo && Date.now() - v.quando > _TMPL_JANELA_MS * 4) _tmplEnvios.delete(k);
+  const _ant = _tmplEnvios.get(_tk);
+  if (_ant && _cid && _ant.ids.has(_cid)) return res.json({ success: true, duplicado: true }); // o mesmo pedido de novo: não reenvia
+  if (_ant && _ant.emVoo) return res.status(409).json({ error: 'Este modelo já está sendo enviado para este lead — aguarde aparecer na conversa.', em_envio: true });
+  if (_ant && !req.body.forcar && Date.now() - _ant.quando < _TMPL_JANELA_MS) {
+    const seg = Math.max(1, Math.round((Date.now() - _ant.quando) / 1000));
+    return res.status(409).json({ error: 'Este mesmo modelo foi enviado para este lead há ' + seg + ' s.', recente: true, segundos: seg });
+  }
+  const _reg = { emVoo: true, quando: Date.now(), ids: new Set(_ant ? _ant.ids : []) };
+  if (_cid) _reg.ids.add(_cid);
+  _tmplEnvios.set(_tk, _reg);
+  const _falhou = () => { if (_ant) _tmplEnvios.set(_tk, _ant); else _tmplEnvios.delete(_tk); };
+  const [_proprio, _acc] = await Promise.all([
+    _isSelfSend(to, account_id),
+    supabase.from("accounts").select("phone_number_id, token").eq("id", account_id).eq("owner", req.owner || ' ').single(),
+  ]);
+  if (_proprio) { _falhou(); return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta.' }); }
+  stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
+  const { data: account, error: accErr } = _acc || {};
+  if (accErr || !account) { _falhou(); return res.status(404).json({ error: "Conta não encontrada" }); }
   try {
     const templateMsg = {
       messaging_product: "whatsapp", to, type: "template",
@@ -5492,22 +5515,28 @@ app.post("/send-template", async (req, res) => {
     const safeAccountId = account_id || null;
     const shownText = (body_text && String(body_text).trim()) ? String(body_text).trim() : `[Template: ${template_name}]`;
     const preview = shownText.length > 80 ? shownText.substring(0, 80) + '…' : shownText;
-    await supabase.from("contacts").upsert(
-      { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
-        last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
-      { onConflict: "owner,phone" }
-    );
+    _reg.emVoo = false; _reg.quando = Date.now(); // saiu para a Meta: daqui em diante conta a janela
     const tplWamid = response.data?.messages?.[0]?.id || null;
-    await supabase.from("messages").insert(await _comAutor({
+    // conversa e lista gravadas JUNTAS (antes uma esperava a outra) → aparece mais rápido
+    const _linhaMsg = await _comAutor({
       phone: to, content: shownText, type: "template",
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
       status: tplWamid ? 'sent' : 'pending', wamid: tplWamid, owner: req.owner || null,
-    }, req));
-    await applyPendingStatus(tplWamid);
-    await _previaEnviada(req.owner, to, tplWamid ? 'sent' : 'pending');
+    }, req);
+    await Promise.all([
+      supabase.from("contacts").upsert(
+        { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
+          last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
+        { onConflict: "owner,phone" }
+      ),
+      supabase.from("messages").insert(_linhaMsg),
+    ]);
     console.log("Template enviado:", template_name, "→", to, "wamid:", tplWamid);
     res.json({ success: true, data: response.data });
+    // o resto (status que chegou antes, prévia) não segura a resposta
+    applyPendingStatus(tplWamid).then(() => _previaEnviada(req.owner, to, tplWamid ? 'sent' : 'pending')).catch(() => {});
   } catch (err) {
+    if (_reg.emVoo) _falhou(); // a Meta recusou: pode tentar de novo na hora
     const e = err.response?.data?.error || {};
     const msg = e.error_user_msg || e.message || err.message || "Erro ao enviar template";
     const detail = e.error_user_title || e.error_data?.details || "";
