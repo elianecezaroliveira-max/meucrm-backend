@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 331;
+const SERVER_VER = 332;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3857,6 +3857,13 @@ function _tarefaTipos(owner) {
   try { const v = JSON.parse(_cfg('tarefa_tipos', owner) || 'null'); if (Array.isArray(v)) return v; } catch (_) {}
   return _TAREFA_TIPOS_PADRAO.map(t => Object.assign({}, t));
 }
+// Tarefa criada SEM tipo → "Acompanhar" (ela pediu). Se ela apagou/renomeou esse tipo, fica sem tipo.
+function _tarefaTipoPadrao(owner) {
+  const lista = _tarefaTipos(owner);
+  const norm = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+  const tp = lista.find(x => x.id === 'acompanhar') || lista.find(x => norm(x.nome) === 'acompanhar');
+  return tp ? tp.id : null;
+}
 app.get('/tarefa-tipos', (req, res) => {
   if (!_exigeLogin(req, res)) return;
   res.json({ tipos: _tarefaTipos(req.owner), icones: _TAREFA_ICONES });
@@ -3930,9 +3937,12 @@ app.post("/tasks", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const { phone, account_id, title, due_at, notes } = req.body;
   // Nome NÃO é obrigatório: sem texto, a tarefa nasce como "Tarefa"
-  const tipo = _tarefaTipoLimpo(req.body.tipo);
+  const _tipoVeio = _tarefaTipoLimpo(req.body.tipo);
+  const tipo = _tipoVeio || _tarefaTipoPadrao(req.owner); // sem tipo escolhido → Acompanhar
   // A tarefa não tem mais nome no app: sem texto, leva o nome do TIPO (ou "Tarefa")
-  const titleFinal = String(title || '').trim() || ((_tarefaTipos(req.owner).find(x => x.id === tipo) || {}).nome) || 'Tarefa';
+  const _nomeTipo = (_tarefaTipos(req.owner).find(x => x.id === tipo) || {}).nome;
+  let titleFinal = String(title || '').trim() || _nomeTipo || 'Tarefa';
+  if (!_tipoVeio && _nomeTipo && titleFinal === 'Tarefa') titleFinal = _nomeTipo; // o app mandou o nome genérico
   const linha = { phone: phone || null, account_id: account_id || null, title: titleFinal, due_at: due_at || null, notes: notes || null, owner: req.owner || null, created_at: new Date().toISOString() };
   if (tipo) linha.tipo = tipo;
   let { data, error } = await supabase.from("tasks").insert(linha).select().single();
@@ -6892,6 +6902,8 @@ async function _criaTarefaDoBot(cfg, run) {
   const phone = run.contact_phone, OW = run.owner || ' ';
   let nome = phone;
   try { const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle(); nome = (ct && ct.name) || phone; } catch (_) {}
+  // Passo sem tipo escolhido → Acompanhar
+  cfg = Object.assign({}, cfg, { tipo: _tarefaTipoLimpo(cfg.tipo) || _tarefaTipoPadrao(run.owner) });
   // Sem nome próprio (o passo agora tem só TIPO + COMENTÁRIO): a tarefa leva o nome do tipo
   const _tpNome = ((_tarefaTipos(run.owner).find(x => x.id === cfg.tipo) || {}).nome) || 'Tarefa';
   const title = String(cfg.title || '').trim() ? applyVars(cfg.title, nome, phone) : _tpNome;
@@ -7373,6 +7385,7 @@ async function _execAcaoEtapa(a, phone, stageId, owner, depth = 0) {
   try {
         if (a.type === 'task' && (a.title || a.tipo || a.notes)) {
           const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle();
+          a = Object.assign({}, a, { tipo: _tarefaTipoLimpo(a.tipo) || _tarefaTipoPadrao(owner) }); // sem tipo → Acompanhar
           const title = a.title ? applyVars(a.title, ct?.name || phone, phone) : (((_tarefaTipos(owner).find(x => x.id === a.tipo) || {}).nome) || 'Tarefa');
           const due = a.due_hours ? new Date(Date.now() + Number(a.due_hours) * 3600000).toISOString() : null;
           const _lt = { phone, title, due_at: due, owner: owner || null, created_at: new Date().toISOString() };
