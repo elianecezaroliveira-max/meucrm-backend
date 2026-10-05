@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 336;
+const SERVER_VER = 337;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8246,7 +8246,25 @@ function _iaPlacar(exemplos, dias) {
   const aceitas = sug.filter(e => e.origem === 'aceita').length, editadas = sug.filter(e => e.origem === 'editada').length;
   return { dias, aprendidos: no.length, sugeridas: sug.length, aceitas, editadas, ignoradas: sug.length - aceitas - editadas, aproveitamento_pct: sug.length ? Math.round((aceitas + editadas) / sug.length * 100) : null };
 }
-async function _iaChamaGroq(sys, usr, owner) {
+// 📏 Pedido grande demais para o limite do Groq ("Request too large… tokens per minute (TPM)"):
+// encurta o que menos importa (exemplos de estilo, correções, conversa antiga) e tenta de novo.
+// Nível 1: tira os exemplos só de estilo, corta a conversa para as últimas 30 linhas.
+// Nível 2: tira também os exemplos parecidos e as correções; conversa nas últimas 14 linhas.
+function _iaEncurta(usr, nivel) {
+  let t = String(usr || '');
+  const tiraBloco = (titulo) => { const i = t.indexOf('\n### ' + titulo); if (i < 0) return; const j = t.indexOf('\n\n### ', i + 5); t = t.slice(0, i) + (j < 0 ? '' : t.slice(j)); };
+  const cortaConversa = (n) => {
+    const m = /\n\n### (ÚLTIMAS \d+ MENSAGENS|CONVERSA INTEIRA)[^\n]*\n/.exec(t); if (!m) return;
+    const ini = m.index + m[0].length; const fim = t.indexOf('\n\nAntes de escrever:', ini); if (fim < 0) return;
+    const linhas = t.slice(ini, fim).split('\n'); if (linhas.length <= n) return;
+    t = t.slice(0, m.index) + '\n\n### ÚLTIMAS ' + n + ' MENSAGENS, por inteiro (as anteriores foram omitidas por tamanho; mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + linhas.slice(-n).join('\n') + t.slice(fim);
+  };
+  tiraBloco('EXEMPLOS SÓ DE ESTILO'); cortaConversa(30);
+  if (nivel >= 2) { tiraBloco('EXEMPLOS PARECIDOS COM A FALA DO LEAD'); tiraBloco('CORREÇÕES DELA'); tiraBloco('RESUMO DA PARTE ANTIGA DA CONVERSA'); cortaConversa(14); }
+  return t;
+}
+const _iaErroGrande = (e) => { const st = e && e.response && e.response.status; const em = String((e && e.response && e.response.data && e.response.data.error && e.response.data.error.message) || (e && e.message) || ''); return st === 413 || /request too large|reduce your message size|tokens per minute \(TPM\)/i.test(em); };
+async function _iaChamaGroq(sys, usr, owner, _nivel) {
   const pref = _cfg('ia_sug_model', owner);
   const modelos = (pref ? [pref] : []).concat(IA_SUG_MODELOS.filter(m => m !== pref));
   let ultimoErro = null;
@@ -8256,16 +8274,22 @@ async function _iaChamaGroq(sys, usr, owner) {
     try {
       const r = await axios.post(GROQ_URL, body, { headers: { Authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' }, timeout: 25000 });
       const msg = (r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message) || {};
-      return { texto: String(msg.content || ''), model };
+      return { texto: String(msg.content || ''), model, encurtado: _nivel || 0 };
     } catch (e) {
       ultimoErro = e;
       const st = e.response && e.response.status;
       const em = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message || '');
-      // modelo desligado/fora do ar OU no limite de uso por minuto (429, cada modelo tem o seu)
-      // → tenta o próximo; outro erro (chave inválida) → para
-      if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429) continue;
+      // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
+      // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
+      if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e)) continue;
       throw e;
     }
+  }
+  // todos recusaram e o motivo é tamanho: encurta e tenta de novo (até 2 níveis)
+  if (ultimoErro && _iaErroGrande(ultimoErro) && (_nivel || 0) < 2) {
+    const menor = _iaEncurta(usr, (_nivel || 0) + 1);
+    console.log('IA: pedido grande demais (' + usr.length + ' → ' + menor.length + ' caracteres), tentando de novo encurtado, nível ' + ((_nivel || 0) + 1));
+    return _iaChamaGroq(sys, menor, owner, (_nivel || 0) + 1);
   }
   throw ultimoErro || new Error('sem modelo');
 }
