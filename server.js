@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 343;
+const SERVER_VER = 344;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -544,6 +544,20 @@ function _contasCompartilhadas() {
 }
 const _NO_AR_DESDE = new Date().toISOString();
 // 🔔 "me avise quando mudar": responde assim que algo do dono for gravado (ou em 25 s)
+// 🔴 Quantas conversas estão NÃO LIDAS (para o pontinho na aba do navegador, mesmo com a aba
+// em segundo plano). Só a contagem (head:true = zero bytes de saída), guardada até a lista mudar.
+app.get('/nao-lidas', async (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login' });
+  if (!supabase) return res.json({ n: 0 });
+  try {
+    const n = await _comCache('naolidas|' + req.owner, String(_tabVer.contacts), _CACHE_TTL_MS, async () => {
+      const { count, error } = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('owner', req.owner).gt('unread_count', 0);
+      if (error) throw new Error(error.message);
+      return Number(count) || 0;
+    });
+    res.json({ n });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/acorda', (req, res) => {
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
   const dono = String(req.owner);
