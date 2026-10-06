@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 337;
+const SERVER_VER = 340;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8001,21 +8001,33 @@ function _iaLinhasJsonl(txt) {
   }
   return out;
 }
+// 💸 A memória (310 KB de exemplos) era baixada INTEIRA a cada minuto: a varredura de 3 em 3 min
+// e cada sugestão pagavam 310 KB — 1,2 GB em 9 dias. Agora: depois de 1 min, só se confere o
+// updated_at das 3 chaves (uns 200 bytes); a memória inteira só desce de novo se alguém gravou.
 async function _iaMemoria(owner, semCache) {
-  const c = _iaMemCache[owner || ' '];
+  const k = owner || ' ', c = _iaMemCache[k];
   if (c && !semCache && Date.now() - c.t < 60000) return c;
-  const m = { t: Date.now(), estilo: '', fluxo: '', exemplos: [], brutoExemplos: '' };
+  const chaves = [_iaMemK(owner, 'estilo'), _iaMemK(owner, 'fluxo'), _iaMemK(owner, 'exemplos')];
+  if (c && !semCache && supabase) {
+    try {
+      const { data: carimbos } = await supabase.from('settings').select('key, updated_at').in('key', chaves);
+      const ass = (carimbos || []).map(r => r.key + '@' + r.updated_at).sort().join('|');
+      if (ass === c.assinatura) { c.t = Date.now(); return c; } // nada mudou: a cópia da memória vale
+    } catch (_) {}
+  }
+  const m = { t: Date.now(), estilo: '', fluxo: '', exemplos: [], brutoExemplos: '', assinatura: '' };
   if (supabase) {
     try {
-      const { data } = await supabase.from('settings').select('key, value').in('key', [_iaMemK(owner, 'estilo'), _iaMemK(owner, 'fluxo'), _iaMemK(owner, 'exemplos')]);
+      const { data } = await supabase.from('settings').select('key, value, updated_at').in('key', chaves);
       for (const r of (data || [])) {
         if (r.key.endsWith('::estilo')) m.estilo = r.value || '';
         else if (r.key.endsWith('::fluxo')) m.fluxo = r.value || '';
         else if (r.key.endsWith('::exemplos')) { m.brutoExemplos = r.value || ''; m.exemplos = _iaLinhasJsonl(r.value); }
       }
+      m.assinatura = (data || []).map(r => r.key + '@' + r.updated_at).sort().join('|');
     } catch (e) { console.error('IA memória:', e.message); }
   }
-  _iaMemCache[owner || ' '] = m;
+  _iaMemCache[k] = m;
   return m;
 }
 async function _iaMemoriaGrava(owner, parte, valor) {
@@ -8499,7 +8511,7 @@ async function _iaSugere(owner, phone, forcar) {
     + tempoTxt
     + (resumoAntigo ? '\n\n### RESUMO DA PARTE ANTIGA DA CONVERSA (' + antigas.length + ' mensagens, de ' + _iaDataHora(antigas[0].timestamp) + ' a ' + _iaDataHora(antigas[antigas.length - 1].timestamp) + ')\n' + resumoAntigo : '')
     + '\n\n### ' + (resumoAntigo ? 'ÚLTIMAS ' + msgs.length + ' MENSAGENS, por inteiro' : 'CONVERSA INTEIRA, do começo') + ' (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs, msgs.length)
-    + '\n\nAntes de escrever: diga o ASSUNTO da última fala do lead; se for da operação, olhe as DATAS acima e veja em que fase ele está; se for outro assunto (estorno, cobrança, dúvida, reclamação), responda a ele e deixe a operação de lado. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
+    + '\n\nAntes de escrever: diga o ASSUNTO da última fala do lead; se for da operação, olhe as DATAS acima e veja em que fase ele está; se for outro assunto (estorno, cobrança, dúvida, reclamação), responda a ele e deixe a operação de lado. NUNCA repita uma mensagem que ela já mandou nesta conversa (as linhas "Eu:" acima): o lead já leu; responda ao que ele disse AGORA. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
   // 🎯 filtro dos itens: rápida/bot só com momento cadastrado; texto que é de rápida/bot vira o
   // item (se tem momento) ou cai fora (era isso que fazia a IA sugerir "Qualquer dúvida me aciona…" na hora errada)
@@ -8514,7 +8526,13 @@ async function _iaSugere(owner, phone, forcar) {
     if (dono.bot && podeBot(dono.bot)) { const b = bots.find(x => x.id === dono.bot); if (b && !itensOk.some(x => x.tipo === 'bot' && x.id === b.id)) itensOk.push({ tipo: 'bot', id: b.id, nome: b.nome }); continue; }
     // texto pronto sem momento: não entra
   }
-  const itens = itensOk.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
+  // 🔁 NUNCA repetir o que ela acabou de dizer nesta conversa: a resposta dela vira exemplo na
+  // varredura e a IA devolvia o mesmo texto na sugestão seguinte ("Foi cadastrada a mesma conta…").
+  const _normRep = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const _minhasRecentes = todas.filter(m => m.direction === 'outbound' && m.type !== 'note').slice(-12).map(m => _normRep(m.content)).filter(x => x.length >= 12);
+  const _repetida = it => { if (it.tipo !== 'texto') return false; const t = _normRep(it.texto); if (!t) return false; return _minhasRecentes.some(m => m === t || (t.length >= 25 && m.includes(t)) || (m.length >= 25 && t.includes(m))); };
+  const itensSemRep = itensOk.filter(it => !_repetida(it));
+  const itens = itensSemRep.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
   const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
     transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)) }; // o app mostra o que o lead disse no áudio
@@ -11840,6 +11858,11 @@ app.post('/evolution-webhook', async (req, res) => {
       // Sinal INTERNO do WhatsApp (sem conteúdo de verdade)? Ignora — não vira bolha
       const _reais = Object.keys(msg).filter(k => k !== 'messageContextInfo' && k !== 'senderKeyDistributionMessage' && k !== 'deviceSentMessage');
       if (!_reais.length) return;
+      // Sinais do WhatsApp que NÃO são mensagem (álbum = só o "envelope" das fotos, que chegam
+      // separadas; fixar, manter no chat, pacote de figurinhas, reação cifrada, status…):
+      // nada de bolha "[Mensagem enviada]" — era isso que aparecia "do nada" na conversa dela
+      const _SINAIS = ['albumMessage', 'pinInChatMessage', 'keepInChatMessage', 'stickerPackMessage', 'encReactionMessage', 'encEventResponseMessage', 'encCommentMessage', 'placeholderMessage', 'groupStatusMessage', 'statusMentionMessage', 'protocolMessage', 'reactionMessage', 'messageHistoryBundle', 'botInvokeMessage', 'secretEncryptedMessage', 'bcallMessage', 'callLogMesssage', 'callLogMessage'];
+      if (_reais.every(k => _SINAIS.includes(k))) { console.log('ℹ️ Sinal do WhatsApp ignorado (QR):', _reais.join(','), fromMe ? 'meu' : 'do lead'); return; }
       if      (msg.conversation)          { content = msg.conversation; type = 'text'; }
       else if (msg.extendedTextMessage)   { content = msg.extendedTextMessage.text || ''; type = 'text'; }
       else if (msg.imageMessage)          { content = msg.imageMessage.caption || '[Imagem]'; type = 'image'; }
@@ -11850,6 +11873,8 @@ app.post('/evolution-webhook', async (req, res) => {
         try { const wfB = msg.audioMessage?.waveform; if (wfB && wfB.length) data._wfJson = JSON.stringify(Array.from(wfB)); } catch (_) {}
       }
       else if (msg.videoMessage)          { content = msg.videoMessage.caption || '[Vídeo]'; type = 'video'; }
+      else if (msg.ptvMessage)            { content = '[Vídeo curto (bolha)]'; type = 'video'; }
+      else if (msg.eventMessage)          { content = '📅 ' + ((msg.eventMessage.name) || 'Evento'); type = 'text'; }
       else if (msg.documentMessage)       { content = `[Documento: ${msg.documentMessage.fileName || 'arquivo'}]`; type = 'document'; }
       else if (msg.stickerMessage)        { content = '[Figurinha]'; type = 'sticker'; }
       else if (msg.locationMessage)       { const l = msg.locationMessage; content = `📍 ${l.name || 'Localização'}\nhttps://maps.google.com/?q=${l.degreesLatitude},${l.degreesLongitude}`; type = 'location'; }
@@ -11896,6 +11921,10 @@ app.post('/evolution-webhook', async (req, res) => {
         type = 'text';
       }
 
+      if (content === '[Mensagem enviada]' || content === '[Mensagem recebida]') {
+        console.log('ℹ️ Mensagem de tipo não reconhecido (QR):', _reais.join(','), fromMe ? 'minha' : 'do lead', 'para', phone);
+        content = (fromMe ? '[Mensagem enviada pelo celular' : '[Mensagem recebida') + ' de um tipo que o FILAZ ainda não mostra (' + _reais[0] + ') — veja no aplicativo do WhatsApp]';
+      }
       // A mesma mensagem já chegou (pelo @lid e pelo número, retry, reconexão)?
       // Carimbo em memória, ANTES de qualquer ida ao banco — é o que barra a
       // cópia que chega no mesmo instante da primeira.
@@ -12032,4 +12061,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
