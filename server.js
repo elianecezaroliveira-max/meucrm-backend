@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 341;
+const SERVER_VER = 342;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2420,6 +2420,20 @@ function _qrDentro(m) {
     x = d;
   }
   return x || {};
+}
+// ✏️ Texto novo de uma mensagem EDITADA (texto comum, ou legenda de foto/vídeo/arquivo)
+function _qrTextoEditado(ed) {
+  const e = _qrDentro(ed || {});
+  return e.conversation || (e.extendedTextMessage && e.extendedTextMessage.text) || (e.imageMessage && e.imageMessage.caption)
+      || (e.videoMessage && e.videoMessage.caption) || (e.documentMessage && e.documentMessage.caption) || null;
+}
+async function _qrAplicaEdicao(wamidAlvo, novoTxt) {
+  if (!supabase || !wamidAlvo || !novoTxt) return false;
+  try {
+    const { error } = await supabase.from('messages').update({ content: novoTxt, edited: true }).eq('wamid', wamidAlvo);
+    if (error) await supabase.from('messages').update({ content: novoTxt }).eq('wamid', wamidAlvo); // banco sem a coluna "edited"
+    return true;
+  } catch (_) { return false; }
 }
 function _qrBotoesTxt(botoes) {
   const nomes = (botoes || []).map(b => String(b == null ? '' : b).replace(/\s+/g, ' ').trim()).filter(Boolean);
@@ -5590,6 +5604,19 @@ app.post("/pipeline/stages", async (req, res) => {
 setTimeout(async () => {
   try {
     if (!supabase) return;
+    // 🧹 Contatos fantasmas "558291036609:0" (sufixo do aparelho que o QR deixava passar):
+    // as mensagens vão para o número limpo e o fantasma some. Roda a cada subida (é barato: só acha se existir).
+    try {
+      const { data: fant } = await supabase.from('contacts').select('id, phone, owner, unread_count, name').like('phone', '%:%');
+      for (const f of (fant || [])) {
+        const limpo = String(f.phone).replace(/:\d+$/, ''); if (limpo === f.phone) continue;
+        await supabase.from('messages').update({ phone: limpo }).eq('phone', f.phone);
+        const { data: real } = await supabase.from('contacts').select('id, unread_count').eq('phone', limpo).eq('owner', f.owner || ' ').maybeSingle();
+        if (real) { if (f.unread_count) await supabase.from('contacts').update({ unread_count: (Number(real.unread_count) || 0) + Number(f.unread_count) }).eq('id', real.id); await supabase.from('contacts').delete().eq('id', f.id); }
+        else await supabase.from('contacts').update({ phone: limpo, name: (f.name === f.phone ? limpo : f.name) }).eq('id', f.id);
+        console.log('🧹 Contato fantasma', f.phone, '→', limpo);
+      }
+    } catch (e) { console.error('faxina de contatos com sufixo:', e.message); }
     // Ajuste pontual (roda UMA única vez): SIAPE3 do vendetta = 104721840 (ID da planilha dele)
     try {
       const K = 'fix_siape3_vendetta';
@@ -11236,6 +11263,8 @@ async function waStart(instanceName) {
   sock.ev.on('messages.update', async (updates) => {
     if (!supabase) return;
     for (const u of updates || []) {
+      // ✏️ edição entregue por este canal (o Baileys traduz o sinal de edição em update.message)
+      try { if (u.update && u.update.message && u.key?.id) { const t = _qrTextoEditado(u.update.message); if (t) await _qrAplicaEdicao(u.key.id, t); } } catch (_) {}
       const st = u.update?.status, id = u.key?.id;
       if (st == null || !id) continue; // (status 0 = ERRO do WhatsApp — precisa passar)
       // Só recibo do OUTRO lado sobre mensagem MINHA (key.fromMe). O "read-self"
@@ -11356,22 +11385,19 @@ async function waStart(instanceName) {
       try { const _seg = _waEfemeroDaMensagem(m); if (_seg != null) _waEfemeroAnota(instanceName, m.key?.remoteJidAlt || m.key?.remoteJid, _seg); if (_seg != null && m.key?.remoteJid && m.key?.remoteJidAlt) _waEfemeroAnota(instanceName, m.key.remoteJid, _seg); } catch (_) {}
       // Mensagem EDITADA (pelo CRM ou pelo celular) → atualiza o texto da bolha
       // original, em vez de criar uma bolha nova "[Mensagem enviada]"
-      const _pm = m.message.protocolMessage;
+      // (a edição pode vir EMBRULHADA — conversa com mensagens temporárias: era por isso que a
+      //  mensagem editada pelo lead não aparecia editada no FILAZ)
+      const _pm = m.message.protocolMessage || (_qrDentro(m.message) || {}).protocolMessage;
       if (_pm && _pm.editedMessage && _pm.key?.id) {
-        const novoTxt = _pm.editedMessage.conversation || _pm.editedMessage.extendedTextMessage?.text || null;
-        if (novoTxt && supabase) {
-          try {
-            const { error: eEd2 } = await supabase.from('messages').update({ content: novoTxt, edited: true }).eq('wamid', _pm.key.id);
-            if (eEd2) await supabase.from('messages').update({ content: novoTxt }).eq('wamid', _pm.key.id);
-          } catch (_) {}
-        }
+        const novoTxt = _qrTextoEditado(_pm.editedMessage);
+        if (novoTxt) await _qrAplicaEdicao(_pm.key.id, novoTxt);
         continue;
       }
       // Outras mensagens de protocolo (controle interno do WhatsApp) não viram bolha
       if (_pm) continue;
       // Reação (emoji sobre uma mensagem) → atualiza a mensagem alvo, não cria nova
-      if (m.message.reactionMessage) {
-        const r = m.message.reactionMessage;
+      if (m.message.reactionMessage || (_qrDentro(m.message) || {}).reactionMessage) {
+        const r = m.message.reactionMessage || _qrDentro(m.message).reactionMessage;
         // (o WhatsApp reentrega a mesma reação: só conta uma vez)
         if (m.key?.id && !_carimbaChegada(instanceName + '|reacao|' + m.key.id)) continue;
         if (supabase && r.key?.id) {
@@ -11904,7 +11930,9 @@ app.post('/evolution-webhook', async (req, res) => {
                      || (!fromMe ? (data.key?.senderPn || data.key?.participantPn) : null) || null;
       const remoteJid = String(chatPn || _rjRaw);
 
-      let phone       = remoteJid.replace('@s.whatsapp.net', '');
+      // (o WhatsApp às vezes manda o número com o sufixo do aparelho, "558291036609:0" —
+      //  sem tirar, nascia um contato fantasma "…:0" com a conversa vazia)
+      let phone       = remoteJid.replace('@s.whatsapp.net', '').replace(/:\d+$/, '');
       const isLid     = String(phone).endsWith('@lid');
       const name      = data.pushName || (isLid ? 'Contato (número oculto)' : phone);
       const timestamp = new Date((data.messageTimestamp || Date.now() / 1000) * 1000).toISOString();
