@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 342;
+const SERVER_VER = 343;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -811,14 +811,35 @@ async function updateMsgStatus(wamid, upd) {
   const upd2 = { ...upd };
   if (upd.status === 'delivered') upd2.delivered_at = new Date().toISOString();
   if (upd.status === 'read') upd2.read_at = new Date().toISOString();
-  const { error: eCol } = await supabase.from('messages').update(upd2).eq('wamid', wamid).eq('direction', 'outbound')
-    .or('status.is.null,status.in.(' + lower.join(',') + ')');
+  let { data: mexeu, error: eCol } = await supabase.from('messages').update(upd2).eq('wamid', wamid).eq('direction', 'outbound')
+    .or('status.is.null,status.in.(' + lower.join(',') + ')').select('id');
   if (eCol) { // colunas de horário ainda não existem no banco: segue só com o status
-    await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound')
-      .or('status.is.null,status.in.(' + lower.join(',') + ')');
+    ({ data: mexeu } = await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound')
+      .or('status.is.null,status.in.(' + lower.join(',') + ')').select('id'));
+  }
+  // 🕐 O recibo chegou ANTES de a mensagem ser gravada (no QR o "entregue" de um grupo volta em
+  // milissegundos, antes do insert): guarda e aplica assim que a linha existir — senão o tique
+  // ficava num ✓ só para sempre (ela viu num grupo)
+  if (!mexeu || !mexeu.length) {
+    try {
+      const { data: existe } = await supabase.from('messages').select('id').eq('wamid', wamid).limit(1);
+      if (!existe || !existe.length) { _cachePendingStatus(wamid, upd); _reaplicaStatusDepois(wamid); return; }
+    } catch (_) {}
   }
   _mirrorContactStatus(wamid, upd.status);
   _avisaEsperaStatus(wamid, upd.status);
+}
+// tenta aplicar o status guardado de novo em 2 s, 6 s e 15 s (tempo de a gravação terminar)
+const _reaplicaTimers = new Map();
+function _reaplicaStatusDepois(wamid) {
+  if (_reaplicaTimers.has(wamid)) return;
+  const ts = [2000, 6000, 15000];
+  const tenta = async (i) => {
+    try { if (_pendingStatuses[wamid]) { await applyPendingStatus(wamid); } } catch (_) {}
+    if (i + 1 < ts.length && _pendingStatuses[wamid]) _reaplicaTimers.set(wamid, setTimeout(() => tenta(i + 1), ts[i + 1] - ts[i]));
+    else _reaplicaTimers.delete(wamid);
+  };
+  _reaplicaTimers.set(wamid, setTimeout(() => tenta(0), ts[0]));
 }
 
 // Buffer de status que chegam ANTES da mensagem ser salva (corrige ✓ que não vira ✓✓)
@@ -842,6 +863,7 @@ async function applyPendingStatus(wamid) {
   if (!p) return;
   const u = { status: p.status };
   if (p.error_info) u.error_info = p.error_info;
+  delete _pendingStatuses[wamid]; // (se a linha ainda não existir, updateMsgStatus guarda de novo)
   await updateMsgStatus(wamid, u);
 }
 
@@ -2253,6 +2275,7 @@ app.post("/send", async (req, res) => {
         // Inclui owner — sem ele a mensagem não aparece no CRM (o GET /messages filtra por owner)
         await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
         await supabase.from('messages').insert(await _comAutor({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, status: wamid ? 'sent' : 'pending', wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null }, req));
+        await applyPendingStatus(wamid); // recibo que chegou antes da gravação (grupos respondem em ms)
         await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
       }
       return res.json({ success: true, via: 'evolution' });
