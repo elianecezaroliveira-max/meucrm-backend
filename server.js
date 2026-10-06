@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 340;
+const SERVER_VER = 341;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6065,6 +6065,8 @@ function _embrulhaEnvio(sock) {
         if (!o.messageId && _baileys) o.messageId = (_baileys.generateMessageIDV2 ? _baileys.generateMessageIDV2(sock.user?.id) : (_baileys.generateMessageID ? _baileys.generateMessageID() : null));
       } catch (_) {}
       if (o.messageId) _marcaEnvioDoServidor(o.messageId);
+      // conversa com mensagens temporárias: vai com o mesmo prazo (senão o lead vê o "i" cinza)
+      try { if (o.ephemeralExpiration == null && sock._filazInst) { const seg = _waEfemero.get(sock._filazInst + '|' + _waEfemeroJid(jid)); if (seg > 0) o.ephemeralExpiration = seg; } } catch (_) {}
       const r = await _sendOrig(jid, conteudo, o);
       try { if (r && r.key && r.key.id) _marcaEnvioDoServidor(r.key.id); } catch (_) {}
       return r;
@@ -11013,6 +11015,57 @@ const _waRetryCounter = (() => { const m = new Map(); return {
   del: k => m.delete(k), flushAll: () => m.clear()
 }; })();
 const _waPresence = {}; // 'instancia|jid' -> { state, lastSeen, at } (online/visto por último)
+// ⏳ MENSAGENS TEMPORÁRIAS (QR): se a conversa está com "mensagens temporárias" ligadas, o que o
+// FILAZ manda tem de ir com o MESMO prazo — senão o WhatsApp marca a bolha com o "i" cinza
+// "Esta mensagem não desaparecerá / a pessoa pode estar usando uma versão antiga" (ela viu isso).
+// 'instancia|jid' -> segundos (0 = desligado). Aprendido de cada mensagem que passa e guardado
+// em settings (wa_efemero::instancia) para sobreviver ao reinício do servidor.
+const _waEfemero = new Map();
+const _waEfemeroJid = (j) => { const t = String(j || ''); if (!t) return ''; return t.includes('@') ? t.replace(/:\d+(?=@)/, '') : t.replace(/\D/g, '') + '@s.whatsapp.net'; };
+let _waEfemeroGravaT = null;
+function _waEfemeroAnota(instanceName, jid, segundos) {
+  const j = _waEfemeroJid(jid); if (!instanceName || !j) return;
+  const k = instanceName + '|' + j;
+  let seg = Number(segundos) || 0;
+  if (seg < 0) seg = (_waEfemero.get(k) > 0) ? _waEfemero.get(k) : 604800; // prazo desconhecido: o que já se sabia, senão 7 dias
+  seg = Math.max(0, seg);
+  if (_waEfemero.get(k) === seg) return;
+  _waEfemero.set(k, seg);
+  // grava com folga (muda pouco): uma linha por instância
+  clearTimeout(_waEfemeroGravaT);
+  _waEfemeroGravaT = setTimeout(async () => {
+    try {
+      if (!supabase) return;
+      const porInst = {};
+      for (const [kk, v] of _waEfemero) { const [inst, jj] = kk.split('|'); if (v > 0) (porInst[inst] = porInst[inst] || {})[jj] = v; }
+      for (const inst of Object.keys(porInst)) await supabase.from('settings').upsert({ key: 'wa_efemero::' + inst, value: JSON.stringify(porInst[inst]), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    } catch (e) { console.error('mensagens temporárias: não gravou', e.message); }
+  }, 5000);
+}
+async function _waEfemeroCarrega(instanceName) {
+  try {
+    if (!supabase) return;
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_efemero::' + instanceName).maybeSingle();
+    const o = data && data.value ? JSON.parse(data.value) : {};
+    for (const [jid, seg] of Object.entries(o || {})) _waEfemero.set(instanceName + '|' + jid, Number(seg) || 0);
+  } catch (_) {}
+}
+// Lê o prazo de uma mensagem que passou (recebida ou enviada pelo celular)
+function _waEfemeroDaMensagem(m) {
+  try {
+    const raw = m && m.message; if (!raw) return null;
+    const pm = raw.protocolMessage;
+    if (pm && (pm.type === 3 || pm.type === 'EPHEMERAL_SETTING')) return Number(pm.ephemeralExpiration) || 0; // ligou/desligou na conversa
+    const dentro = raw.ephemeralMessage && raw.ephemeralMessage.message;
+    const corpo = dentro || raw;
+    const tipos = Object.keys(corpo).filter(k => k !== 'messageContextInfo' && k !== 'senderKeyDistributionMessage');
+    if (!tipos.length) return null;
+    if (raw.reactionMessage || raw.protocolMessage || corpo.pollUpdateMessage) return null; // sinais: não dizem nada sobre o prazo
+    for (const k of tipos) { const ci = corpo[k] && corpo[k].contextInfo; if (ci && ci.expiration != null) return Number(ci.expiration) || 0; }
+    if (dentro) return -1; // temporária, mas sem o prazo escrito (texto simples): mantém o que se sabe, ou 7 dias
+    return 0; // mensagem comum SEM embrulho temporário: a conversa não é temporária
+  } catch (_) { return null; }
+}
 const _waPolls = {};    // wamid da enquete -> { options, encKey, creatorJid } (para decifrar votos)
 const _waQrRetries = {}, _waCreatedAt = {}, _waRegistered = {}; // controle de instâncias que nunca parearam
 const _waDono = {}; // instância → dono que pediu o QR (o QR é a chave do WhatsApp: ninguém mais pode ver)
@@ -11137,7 +11190,11 @@ async function waStart(instanceName) {
   _waState[instanceName] = 'connecting';
   // Todo envio pelo servidor ganha o id ANTES de sair (o eco pode voltar antes de
   // o sendMessage terminar) — assim o eco é reconhecido como nosso, não do celular
+  sock._filazInst = instanceName; _waEfemeroCarrega(instanceName).catch(() => {});
   _embrulhaEnvio(sock);
+  // o celular ligou/desligou as mensagens temporárias numa conversa
+  sock.ev.on('chats.update', (ups) => { try { for (const c of (ups || [])) if (c && c.id && c.ephemeralExpiration != null) _waEfemeroAnota(instanceName, c.id, c.ephemeralExpiration); } catch (_) {} });
+  sock.ev.on('chats.upsert', (cs) => { try { for (const c of (cs || [])) if (c && c.id && c.ephemeralExpiration != null) _waEfemeroAnota(instanceName, c.id, c.ephemeralExpiration); } catch (_) {} });
 
   sock.ev.on('creds.update', () => {
     // Credenciais registradas = o QR FOI LIDO no celular; a conexão ainda vai
@@ -11295,6 +11352,8 @@ async function waStart(instanceName) {
         const chatDigits = (String(m.key?.remoteJidAlt || '') || rjSelf).split('@')[0].replace(/\D/g, '');
         if (own && chatDigits && chatDigits === own) continue;
       } catch (_) {}
+      // ⏳ aprende se ESTA conversa está com mensagens temporárias (e por quanto tempo)
+      try { const _seg = _waEfemeroDaMensagem(m); if (_seg != null) _waEfemeroAnota(instanceName, m.key?.remoteJidAlt || m.key?.remoteJid, _seg); if (_seg != null && m.key?.remoteJid && m.key?.remoteJidAlt) _waEfemeroAnota(instanceName, m.key.remoteJid, _seg); } catch (_) {}
       // Mensagem EDITADA (pelo CRM ou pelo celular) → atualiza o texto da bolha
       // original, em vez de criar uma bolha nova "[Mensagem enviada]"
       const _pm = m.message.protocolMessage;
@@ -12061,4 +12120,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
