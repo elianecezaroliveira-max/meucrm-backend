@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 345;
+const SERVER_VER = 346;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -12161,7 +12161,10 @@ app.post('/evolution-webhook', async (req, res) => {
         } catch (_) {}
 
         // Notificação push só para mensagens RECEBIDAS (e não silenciadas 🔇)
-        if (!fromMe && !(await _isContactMuted(phone, ownerEmail))) sendPushToOwner(ownerEmail, { title: name || phone, body: preview, phone, tag: 'chat-' + phone }).catch(() => {});
+        // TÍTULO = o nome que ELA salvou no FILAZ (editado no CRM), não o nome público
+        // do WhatsApp (pushName): ela editava o lead e o celular seguia avisando com o nome velho.
+        const tituloPush = contactData.name || (existC && existC.name) || name || phone;
+        if (!fromMe && !(await _isContactMuted(phone, ownerEmail))) sendPushToOwner(ownerEmail, { title: tituloPush, body: preview, phone, tag: 'chat-' + phone }).catch(() => {});
 
         // Bot e n8n só para mensagens RECEBIDAS
         if (!fromMe && type === 'text' && content) {
