@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 346;
+const SERVER_VER = 347;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6466,6 +6466,14 @@ app.put("/contacts/:phone/read", async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   if (tinhaNaoLida) _badgeAvisa(req.owner, req.params.phone);
   res.json({ success: true });
+  // QR Code: lida aqui = lida no celular (recibo de leitura). Só quando havia algo a ler
+  // (ou chegou mensagem há pouco): o app chama esta rota a cada envio.
+  try {
+    const _num = String(req.params.phone || '').replace(/@.*$/, '').replace(/\D/g, '');
+    const _recente = Array.from(_waUltimaMsgIn.entries()).some(([k, t]) => k.endsWith('|' + _num) && Date.now() - t < 15 * 60 * 1000);
+    const _temChave = Array.from(_qrChaves.keys()).some(k => k.endsWith('|' + _num));
+    if (tinhaNaoLida || _recente || _temChave) _qrMarcaLidaNoCelular(req.params.phone, req.owner).catch(() => {});
+  } catch (_) {}
 });
 
 // Favoritar / desfavoritar conversa (swipe no celular)
@@ -11080,6 +11088,62 @@ const _waRetryCounter = (() => { const m = new Map(); return {
 }; })();
 const _waPresence = {}; // 'instancia|jid' -> { state, lastSeen, at } (online/visto por último)
 const _waUltimaMsgIn = new Map(); // 'instancia|numero' -> quando chegou a última mensagem do lead (barra o "digitando" atrasado)
+// 📖 LIDA NO FILAZ = LIDA NO CELULAR (QR Code). Antes, você abria e até respondia pelo FILAZ e o
+// WhatsApp do celular seguia mostrando a conversa como não lida. Agora, ao marcar como lida no
+// FILAZ, o servidor manda o RECIBO DE LEITURA das mensagens recebidas (igual a abrir no aparelho):
+// o celular tira a bolinha e o lead vê os ticks azuis.
+const _qrChaves = new Map(); // 'instancia|numero' -> [chaves das últimas mensagens recebidas ainda sem recibo]
+const _qrRecibos = new Set(); // ids que já receberam recibo (não repete)
+function _qrChaveGuarda(instanceName, numero, chave) {
+  if (!numero || !chave || !chave.id) return;
+  const k = instanceName + '|' + numero;
+  const lista = _qrChaves.get(k) || [];
+  if (lista.some(c => c.id === chave.id)) return;
+  lista.push(chave); if (lista.length > 60) lista.splice(0, lista.length - 60);
+  _qrChaves.set(k, lista);
+  if (_qrChaves.size > 3000) _qrChaves.delete(_qrChaves.keys().next().value);
+}
+async function _qrMarcaLidaNoCelular(phone, owner) {
+  try {
+    if (!supabase) return false;
+    const numero = String(phone || '').replace(/@.*$/, '').replace(/\D/g, '');
+    if (!numero) return false;
+    // Qual conta QR atende esta conversa? (a do contato; se não tiver, a primeira QR conectada da dona)
+    const { data: c } = await supabase.from('contacts').select('account_id').eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+    let inst = null;
+    if (c && c.account_id) {
+      const { data: a } = await supabase.from('accounts').select('evolution_instance').eq('id', c.account_id).maybeSingle();
+      inst = (a && a.evolution_instance) || null;
+    }
+    if (!inst) {
+      const { data: as } = await supabase.from('accounts').select('evolution_instance').eq('owner', owner || ' ').not('evolution_instance', 'is', null);
+      inst = ((as || []).map(a => a.evolution_instance).find(i => i && _waState[i] === 'open')) || null;
+    }
+    if (!inst) return false; // conta da API oficial: não há celular pareado
+    const sock = _waSocks[inst];
+    if (!sock || _waState[inst] !== 'open') return false;
+    const k = inst + '|' + numero;
+    let chaves = _qrChaves.get(k) || [];
+    if (!chaves.length) {
+      // Servidor reiniciou e perdeu as chaves: usa as últimas recebidas gravadas no banco
+      const { data: ms } = await supabase.from('messages').select('wamid').eq('phone', phone).eq('owner', owner || ' ').eq('direction', 'inbound').order('timestamp', { ascending: false }).limit(10);
+      chaves = (ms || []).filter(m => m.wamid).map(m => ({ remoteJid: numero + '@s.whatsapp.net', id: m.wamid, fromMe: false }));
+    }
+    _qrChaves.delete(k);
+    chaves = chaves.filter(c => !_qrRecibos.has(c.id));
+    if (!chaves.length) return false;
+    chaves.forEach(c => _qrRecibos.add(c.id));
+    if (_qrRecibos.size > 5000) { let n = 0; for (const id of _qrRecibos) { _qrRecibos.delete(id); if (++n >= 2500) break; } }
+    await sock.readMessages(chaves);
+    // Também marca a CONVERSA como lida no aparelho (some a bolinha da lista). Se o WhatsApp
+    // recusar (chave de estado ainda não sincronizada), o recibo acima já fez o principal.
+    try {
+      const ult = chaves[chaves.length - 1];
+      await sock.chatModify({ markRead: true, lastMessages: [{ key: ult, messageTimestamp: Math.floor(Date.now() / 1000) }] }, ult.remoteJid);
+    } catch (_) {}
+    return true;
+  } catch (e) { console.error('QR: recibo de leitura:', e.message); return false; }
+}
 // ⏳ MENSAGENS TEMPORÁRIAS (QR): se a conversa está com "mensagens temporárias" ligadas, o que o
 // FILAZ manda tem de ir com o MESMO prazo — senão o WhatsApp marca a bolha com o "i" cinza
 // "Esta mensagem não desaparecerá / a pessoa pode estar usando uma versão antiga" (ela viu isso).
@@ -11517,6 +11581,14 @@ async function waStart(instanceName) {
         if (!realPn) { try { realPn = await sock.signalRepository?.lidMapping?.getPNForLID?.(_rj) || null; } catch (_) {} }
       } else if (!m.key?.fromMe) {
         realPn = m.key?.senderPn || m.key?.participantPn || null;
+      }
+      // Guarda a CHAVE da mensagem recebida: é ela que vai no recibo de leitura quando
+      // você abre a conversa no FILAZ (o celular tira o "não lida" e o lead vê os ticks azuis)
+      if (!m.key?.fromMe && m.key?.id) {
+        try {
+          const _num = String(realPn || m.key?.remoteJidAlt || _rj).replace(/@.*$/, '').replace(/:\d+$/, '').replace(/\D/g, '');
+          _qrChaveGuarda(instanceName, _num, { remoteJid: _rj, id: m.key.id, fromMe: false, participant: m.key.participant || undefined });
+        } catch (_) {}
       }
       // O lead ENVIOU: o "digitando…" dele acaba agora (o WhatsApp nem sempre manda o "paused",
       // e a prévia ficava "digitando…" por até 12 s depois da mensagem chegar)
@@ -12197,4 +12269,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
