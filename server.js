@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 344;
+const SERVER_VER = 345;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -11079,6 +11079,7 @@ const _waRetryCounter = (() => { const m = new Map(); return {
   del: k => m.delete(k), flushAll: () => m.clear()
 }; })();
 const _waPresence = {}; // 'instancia|jid' -> { state, lastSeen, at } (online/visto por último)
+const _waUltimaMsgIn = new Map(); // 'instancia|numero' -> quando chegou a última mensagem do lead (barra o "digitando" atrasado)
 // ⏳ MENSAGENS TEMPORÁRIAS (QR): se a conversa está com "mensagens temporárias" ligadas, o que o
 // FILAZ manda tem de ir com o MESMO prazo — senão o WhatsApp marca a bolha com o "i" cinza
 // "Esta mensagem não desaparecerá / a pessoa pode estar usando uma versão antiga" (ela viu isso).
@@ -11278,6 +11279,13 @@ async function waStart(instanceName) {
         lastSeen: pr.lastSeen ? pr.lastSeen * 1000 : null,
         at: Date.now()
       };
+      // 🕐 "digitando" que chega DEPOIS da mensagem (o WhatsApp entrega fora de ordem): é o
+      // digitar da mensagem que já veio — não vale. Ela via "digitando…" por 12 s depois do texto chegar.
+      if (dado.state === 'composing' || dado.state === 'recording') {
+        const chave = instanceName + '|' + String(pu.id).replace(/@.*$/, '').split(':')[0];
+        const t = _waUltimaMsgIn.get(chave);
+        if (t && Date.now() - t < 5000) { dado.state = 'paused'; }
+      }
       _waPresence[instanceName + '|' + pu.id] = dado;
       // O WhatsApp costuma anexar o sufixo do aparelho (":0") ao número —
       // guarda TAMBÉM a versão limpa, senão a busca nunca encontra
@@ -11519,6 +11527,7 @@ async function waStart(instanceName) {
             const jid = String(j).includes('@') ? String(j) : String(j).replace(/\D/g, '') + '@s.whatsapp.net';
             _waPresence[instanceName + '|' + jid] = parado;
             _waPresence[instanceName + '|' + jid.replace(/@.*$/, '')] = parado;
+            _waUltimaMsgIn.set(instanceName + '|' + jid.replace(/@.*$/, '').split(':')[0], Date.now()); // o "digitando" que chegar ATRASADO (logo após) é da mensagem que já veio
           }
         } catch (_) {}
       }
