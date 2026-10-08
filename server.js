@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 347;
+const SERVER_VER = 348;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -716,6 +716,31 @@ async function _somaNaoLida(phone, owner, timestamp) {
 
 // Reação do lead = conversa NÃO LIDA (igual WhatsApp): soma 1 no contador e
 // manda o aviso no celular, como se fosse uma mensagem.
+// Trecho da mensagem alvo na prévia da reação (igual WhatsApp): mídia vira uma palavra
+function _trechoReacao(content) {
+  const c = String(content || '').replace(/\s+/g, ' ').trim();
+  if (!c) return 'sua mensagem';
+  if (/^\[Figurinha\]/i.test(c)) return 'figurinha';
+  if (/^\[(?:Imagem|Foto)/i.test(c)) return 'foto';
+  if (/^\[(?:Áudio|Audio)/i.test(c)) return 'áudio';
+  if (/^\[(?:Vídeo|Video)/i.test(c)) return 'vídeo';
+  const d = c.match(/^\[Documento: (.+)\]$/i); if (d) return d[1].slice(0, 40);
+  return c.slice(0, 40);
+}
+// VOCÊ reagiu (pelo FILAZ ou pelo celular, QR): prévia da lista "Você reagiu com 🙏 a: …" (igual WhatsApp)
+async function _previaMinhaReacao(wamid, emoji, owner) {
+  try {
+    if (!supabase || !wamid || !emoji) return;
+    let q0 = supabase.from('messages').select('content, phone, owner').eq('wamid', wamid);
+    if (owner) q0 = q0.eq('owner', owner);
+    const { data: alvo } = await q0.maybeSingle();
+    if (!alvo) return;
+    const previa = `Você reagiu com ${emoji} a: ${_trechoReacao(alvo.content)}`;
+    let q = supabase.from('contacts').update({ last_message_preview: previa, last_message_at: new Date().toISOString(), last_message_direction: 'outbound', last_message_status: null }).eq('phone', alvo.phone);
+    if (alvo.owner) q = q.eq('owner', alvo.owner);
+    await q;
+  } catch (e) { console.error('Prévia da reação:', e.message); }
+}
 async function _reacaoNaoLida(phone, owner, nome, previa) {
   try {
     await _somaNaoLida(phone, owner, new Date().toISOString());
@@ -1075,8 +1100,7 @@ app.post("/webhook", async (req, res) => {
           if (emoji) { try {
             const { data: alvo } = await supabase.from('messages').select('content, phone, owner').eq('wamid', targetWamid).maybeSingle();
             if (alvo) {
-              const trecho = String(alvo.content || 'sua mensagem').replace(/\s+/g, ' ').slice(0, 40);
-              const previa = `Reagiu com ${emoji} a: ${trecho}`;
+              const previa = `Reagiu com ${emoji} a: ${_trechoReacao(alvo.content)}`;
               let q = supabase.from('contacts').update({
                 last_message_preview: previa,
                 last_message_at: new Date().toISOString(),
@@ -2379,7 +2403,9 @@ app.post("/react", async (req, res) => {
           react: { text: emoji || '', key: { remoteJid: jid, fromMe: msgRow?.direction === 'outbound', id: wamid } },
         });
         await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid).eq('owner', req.owner || ' ');
-        return res.json({ success: true, via: 'qr' });
+        res.json({ success: true, via: 'qr' });
+        _previaMinhaReacao(wamid, emoji, req.owner).catch(() => {});
+        return;
       } catch (e) {
         console.error('Reação via QR:', e.message);
         return res.status(500).json({ error: 'Falha ao reagir pelo WhatsApp QR: ' + e.message });
@@ -2397,6 +2423,7 @@ app.post("/react", async (req, res) => {
     );
     if (supabase) await supabase.from("messages").update({ reaction: emoji || null, reaction_by: 'me' }).eq("wamid", wamid).eq('owner', req.owner || ' ');
     res.json({ success: true });
+    _previaMinhaReacao(wamid, emoji, req.owner).catch(() => {});
   } catch (err) {
     console.error("Erro ao reagir:", err.response?.data || err.message);
     res.status(500).json({ error: "Falha ao reagir", detail: err.response?.data });
@@ -11518,8 +11545,7 @@ async function waStart(instanceName) {
             if (r.text && !m.key?.fromMe) {
               const { data: alvo } = await supabase.from('messages').select('content, phone, owner').eq('wamid', r.key.id).maybeSingle();
               if (alvo) {
-                const trecho = String(alvo.content || 'sua mensagem').replace(/\s+/g, ' ').slice(0, 40);
-                const previa = `Reagiu com ${r.text} a: ${trecho}`;
+                const previa = `Reagiu com ${r.text} a: ${_trechoReacao(alvo.content)}`;
                 let q = supabase.from('contacts').update({
                   last_message_preview: previa,
                   last_message_at: new Date().toISOString(),
@@ -11530,6 +11556,8 @@ async function waStart(instanceName) {
                 // Igual WhatsApp: a reação do lead conta como NÃO LIDA e avisa no celular
                 await _reacaoNaoLida(alvo.phone, alvo.owner, m.pushName || '', previa);
               }
+            } else if (r.text && m.key?.fromMe) {
+              await _previaMinhaReacao(r.key.id, r.text, null); // você reagiu pelo celular (ou eco do FILAZ)
             }
           } catch (_) {}
         }
@@ -12269,4 +12297,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
