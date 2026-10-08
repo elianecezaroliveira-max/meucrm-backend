@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 350;
+const SERVER_VER = 351;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8188,18 +8188,29 @@ function _iaExemplosParecidos(exemplos, textoLead, n) {
 // dele) dos que só servem de estilo. A memória tem centenas de exemplos de saldo: quando o lead
 // falava de estorno, os 6 "mais parecidos" eram de saldo (parecidos em nada) e a IA copiava o
 // assunto errado. Agora: parecidos = só com palavra em comum; sem eles, no máximo 2 de estilo.
-function _iaExemplosPorAssunto(exemplos, textoLead, n) {
+// 🧭 CONTEXTO (v351): ela pediu que a IA "entenda o contexto da sugestão" ao aprender. O exemplo
+// guarda o que veio ANTES da fala do lead (contexto); agora a escolha compara também esse
+// contexto com o da conversa atual. "Ok", "sim", "pode ser" têm respostas diferentes conforme o
+// que EU tinha dito antes — com fala curta do lead, o contexto é o que decide.
+function _iaExemplosPorAssunto(exemplos, textoLead, n, ctxAtual) {
   const alvo = _iaTok(textoLead);
+  const alvoCtx = _iaTok(ctxAtual || '');
+  const curta = alvo.size <= 1; // "ok", "sim", "pode ser": a fala em si não diz o assunto (só sobra 0–1 palavra útil)
   const pont = exemplos.map((e, i) => {
     const lt = _iaTok([].concat(e.lead || []).join(' '));
     let comum = 0; alvo.forEach(t => { if (lt.has(t)) comum++; });
     const ctx = _iaTok([].concat(e.contexto || []).join(' '));
     let comumCtx = 0; alvo.forEach(t => { if (ctx.has(t)) comumCtx++; });
-    return { e, comum, sc: (comum / Math.max(1, Math.min(alvo.size || 1, lt.size || 1))) + comumCtx * 0.05 + i * 1e-6 };
+    let comumCtx2 = 0; alvoCtx.forEach(t => { if (ctx.has(t)) comumCtx2++; });
+    const simLead = comum / Math.max(1, Math.min(alvo.size || 1, lt.size || 1));
+    const simCtx = alvoCtx.size ? comumCtx2 / Math.max(1, Math.min(alvoCtx.size, ctx.size || 1)) : 0;
+    return { e, comum, comumCtx2, sc: simLead + (curta ? 1.0 : 0.5) * simCtx + comumCtx * 0.05 + i * 1e-6 };
   });
   pont.sort((a, b) => b.sc - a.sc);
-  const parecidos = pont.filter(p => p.comum > 0).slice(0, n).map(p => p.e);
-  const estilo = parecidos.length >= 2 ? [] : pont.filter(p => p.comum === 0).slice(0, 2).map(p => p.e);
+  // parecido = mesmo assunto na fala do lead; com fala curta, vale também o mesmo contexto
+  const bate = p => p.comum > 0 || (curta && p.comumCtx2 >= 2);
+  const parecidos = pont.filter(bate).slice(0, n).map(p => p.e);
+  const estilo = parecidos.length >= 2 ? [] : pont.filter(p => !bate(p)).slice(0, 2).map(p => p.e);
   return { parecidos, estilo };
 }
 // Uma linha da conversa do jeito que a IA lê (mídia vira "(áudio)", com transcrição se houver)
@@ -8372,9 +8383,9 @@ async function _iaResumoAntigo(owner, phone, antigas) {
   } catch (e) { console.error('IA resumo:', e.message); return ''; }
 }
 // Correções dela: o que a IA sugeriu errado → o que ela mandou (as mais parecidas com a fala atual)
-function _iaCorrecoesParecidas(exemplos, textoLead, n) {
+function _iaCorrecoesParecidas(exemplos, textoLead, n, ctxAtual) {
   const ed = exemplos.filter(e => e.origem === 'editada' && [].concat(e.sugerido || []).length && JSON.stringify(e.sugerido) !== JSON.stringify(e.resposta));
-  return _iaExemplosPorAssunto(ed, textoLead, n).parecidos; // só correções do MESMO assunto
+  return _iaExemplosPorAssunto(ed, textoLead, n, ctxAtual).parecidos; // só correções do MESMO assunto/contexto
 }
 // Placar: de tudo que a IA sugeriu, quanto ela aproveitou (aceitou ou editou) — por período
 function _iaPlacar(exemplos, dias) {
@@ -8533,6 +8544,23 @@ function _iaExtraiItens(texto, rapidas, bots, soTexto) {
   }
   return out;
 }
+// 🏦 BANCOS: para onde ela porta HOJE (configurável; os exemplos antigos citam BRB e a IA
+// copiava) + qual banco aparece NESTA conversa (é o da operação deste cliente)
+const _IA_BANCOS_RE = /\b(Paran[áa]\s*Banco|Safra|Facta|BRB|Daycoval|Banco\s*Inter|Inter|C6|Banco\s*Pan|Pan|Ita[úu]|Bradesco|Banrisul|Mercantil|Crefisa|Digio|Ol[ée]|Santander|Caixa|Banco\s*do\s*Brasil|BMG|Agibank|Sicoob|PagBank|Master|Zema|Quero-?Quero|Will\s*Bank)\b/gi;
+function _iaBancosAtuais(owner) {
+  const v = String(_cfg('ia_bancos', owner) || '').trim();
+  if (v) return v;
+  return (String(owner || '').toLowerCase() === OWNER_LEGADO) ? 'Paraná Banco, Safra e Facta (não porto mais para o BRB)' : '';
+}
+function _iaBancoDaConversa(msgs) {
+  const achados = []; // [{ banco, quando, quem }] na ordem da conversa
+  for (const m of msgs || []) {
+    const t = String(m.type || 'text') === 'audio' ? String(m.transcript || '') : String(m.content || '');
+    const hits = t.match(_IA_BANCOS_RE) || [];
+    for (const h of hits) { const nome = h.replace(/\s+/g, ' ').trim(); if (/^inter$/i.test(nome) && !/\bbanco inter\b|\bpara o inter\b|\bdo inter\b|\bno inter\b/i.test(t)) continue; achados.push({ banco: nome, quando: m.timestamp, quem: m.direction === 'outbound' ? 'eu' : 'lead' }); }
+  }
+  return achados;
+}
 // Monta e pede a sugestão. Devolve { mensagens, itens, model } — nunca envia nada.
 async function _iaSugere(owner, phone, forcar) {
   if (_iaEhTeste(phone, owner)) return { mensagens: [], itens: [], motivo: 'conversa de teste' };
@@ -8567,8 +8595,25 @@ async function _iaSugere(owner, phone, forcar) {
   for (const m of doLead.slice(-3)) await _iaTranscreveSePrecisar(m); // os últimos áudios do lead viram texto
   const textoLead = doLead.map(m => m.type === 'audio' && m.transcript ? m.transcript : (m.content || '')).join(' ');
   // 6 exemplos (eram 8) e conversa mais curta: o plano grátis da Groq limita tokens por minuto
-  const { parecidos: exemplos, estilo: exEstilo } = _iaExemplosPorAssunto(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6);
-  const correcoes = _iaCorrecoesParecidas(mem.exemplos, textoLead || '', 3);
+  // contexto ATUAL: o que veio antes da fala do lead (sobretudo o que EU disse por último)
+  const ctxAtual = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha).join(' ');
+  const { parecidos: exemplos, estilo: exEstilo } = _iaExemplosPorAssunto(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6, ctxAtual);
+  const correcoes = _iaCorrecoesParecidas(mem.exemplos, textoLead || '', 3, ctxAtual);
+  // 🏦 banco desta operação (o que a conversa cita) + para onde ela porta hoje
+  let bancosTxt = '';
+  try {
+    const atuais = _iaBancosAtuais(owner);
+    const naConv = _iaBancoDaConversa(todas);
+    const ultB = naConv.length ? naConv[naConv.length - 1] : null;
+    const lista = Array.from(new Set(naConv.map(b => b.banco)));
+    if (atuais || ultB) {
+      bancosTxt = '### BANCO DA PORTABILIDADE (regra fixa)\n'
+        + (atuais ? '- Hoje eu porto para: ' + atuais + '. Os exemplos e o manual podem citar outro banco de outra época: NUNCA copie o nome do banco de um exemplo.\n' : '')
+        + (ultB ? '- NESTA conversa o banco citado é ' + ultB.banco + (lista.length > 1 ? ' (também apareceram: ' + lista.filter(b => b !== ultB.banco).join(', ') + ')' : '') + ' — quando precisar citar o banco deste cliente, é esse.\n'
+                : '- Esta conversa ainda não cita banco nenhum: não invente nome de banco (fale "o banco" ou pergunte).\n')
+        + '\n';
+    }
+  } catch (_) {}
   const nome = String((lead && lead.name) || '').trim();
   const primeiro = nome.split(/\s+/)[0] || '';
   // ⚡ respostas rápidas e 🤖 bots dela: a IA sugere USAR o que já existe em vez de reescrever o bloco padrão
@@ -8602,6 +8647,7 @@ async function _iaSugere(owner, phone, forcar) {
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
     + (novidades.length ? '### NOVIDADES RECENTES (o que mudou nos últimos dias, com data — quando bater de frente com o manual, vale a novidade)\n' + novidades.slice(-15).map(n => '[' + String(n.em || '').split('-').reverse().slice(0, 2).join('/') + '] ' + n.texto).join('\n') + '\n\n' : '')
+    + bancosTxt
     + '### REGRAS DE SAÍDA\n'
     + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
     + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."]}: "assunto" em 2–5 palavras, e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
@@ -8630,7 +8676,7 @@ async function _iaSugere(owner, phone, forcar) {
     + (_ultLead ? 'Última mensagem do LEAD: ' + _iaDataHora(_ultLead.timestamp) + ' (há ' + _iaDiasCorridos(_ultLead.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultLead.timestamp) + ' útil(eis))\n' : '');
   const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300)).join('\n---\n');
   const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n')).join('\n');
-  const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
+  const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
     + (exEstiloTxt ? '### EXEMPLOS SÓ DE ESTILO (assunto DIFERENTE do atual — copie o jeito de escrever, nunca o conteúdo)\n' + exEstiloTxt + '\n\n' : '')
     + (corrTxt ? '### CORREÇÕES DELA (aprenda com o erro: não repita o que ela trocou)\n' + corrTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
@@ -8726,7 +8772,7 @@ app.get('/ia/status', async (req, res) => {
     const nov = await _iaNovidades(req.owner);
     res.json({ ligada: await _iaSugLigada(req.owner), chave: !!process.env.GROQ_API_KEY, model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
       memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length, novidades: nov.length },
-      placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) } });
+      placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) }, bancos: _iaBancosAtuais(req.owner) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // 🎯 Momentos: quando cada rápida/bot pode ser sugerido pela IA
@@ -9780,7 +9826,8 @@ const CHAVES_POR_CONTA = new Set([
   'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
   'onboarding',  // passos de estreia já concluídos/dispensados
   'bots_fav',    // bots favoritos: sobem para o topo na hora de escolher
-  'ia_sug_on', 'ia_sug_model' // sugestões de resposta por IA (cartão acima do campo)
+  'ia_sug_on', 'ia_sug_model', // sugestões de resposta por IA (cartão acima do campo)
+  'ia_bancos', 'ia_fones_teste' // IA: bancos para onde ela porta hoje; números de teste
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
@@ -12332,4 +12379,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
