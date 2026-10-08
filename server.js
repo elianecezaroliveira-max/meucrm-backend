@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 348;
+const SERVER_VER = 349;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5899,9 +5899,17 @@ app.post('/edit-message', async (req, res) => {
   if (!to || !wamid || !text) return res.status(400).json({ error: 'to, wamid e text obrigatórios' });
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   let acct = null;
-  if (account_id) {
-    const { data } = await supabase.from('accounts').select('type, evolution_instance').eq('id', account_id).eq('owner', req.owner || ' ').maybeSingle();
-    acct = data;
+  // Conta: a informada; senão a conta DA MENSAGEM; senão a QR conectada da dona
+  // (conversa sem conta marcada deixava a edição sem saída, mesmo sendo QR)
+  const pega = async (id) => { if (!id) return null; const { data } = await supabase.from('accounts').select('type, evolution_instance').eq('id', id).eq('owner', req.owner || ' ').maybeSingle(); return data; };
+  acct = await pega(account_id);
+  if (!acct?.evolution_instance) {
+    const { data: mRow } = await supabase.from('messages').select('account_id').eq('wamid', wamid).eq('phone', to).eq('owner', req.owner || ' ').maybeSingle();
+    if (mRow?.account_id && mRow.account_id !== account_id) acct = await pega(mRow.account_id);
+  }
+  if (!acct?.evolution_instance) {
+    const { data: qrs } = await supabase.from('accounts').select('type, evolution_instance').eq('owner', req.owner || ' ').not('evolution_instance', 'is', null);
+    acct = (qrs || []).find(a => a.evolution_instance && _waState[a.evolution_instance] === 'open') || acct;
   }
   if (!acct?.evolution_instance)
     return res.status(400).json({ error: 'Editar mensagem só é possível em conversas do QR Code — a API oficial da Meta não permite edição.' });
