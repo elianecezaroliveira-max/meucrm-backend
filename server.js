@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 349;
+const SERVER_VER = 350;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6202,12 +6202,25 @@ app.get('/typing-list', async (req, res) => {
   let minhas = new Set();
   try { minhas = await _minhasInstancias(req.owner); } catch (_) { return res.json({}); }
   const out = {}; const now = Date.now();
+  // Um mesmo número pode ter VÁRIAS chaves (sufixo do aparelho, nono dígito, id oculto): vale a
+  // presença mais recente dele — um "composing" velho numa chave esquecida não pode vencer o "paused"
+  const porNum = {};
   for (const [k, p] of Object.entries(_waPresence)) {
-    if (!minhas.has(String(k.split('|')[0] || ''))) continue; // número de outra conta: não é da sua conta
-    if ((p.state === 'composing' || p.state === 'recording') && now - p.at < 12000) {
-      const ph = (k.split('|')[1] || '').split('@')[0].split(':')[0];
-      if (ph) _brPhoneVariants(ph).forEach(v => { out[v] = p.state; });
-    }
+    const inst = String(k.split('|')[0] || '');
+    if (!minhas.has(inst)) continue; // número de outra conta: não é da sua conta
+    const ph = (k.split('|')[1] || '').split('@')[0].split(':')[0];
+    if (!ph || !p || !p.at) continue;
+    const ck = inst + '|' + ph;
+    if (!porNum[ck] || p.at > porNum[ck].at) porNum[ck] = p;
+  }
+  for (const [ck, p] of Object.entries(porNum)) {
+    if (!(p.state === 'composing' || p.state === 'recording') || now - p.at >= 12000) continue;
+    const [inst, ph] = ck.split('|');
+    // o lead já ENVIOU depois desse "digitando": não vale mais
+    const vars = _brPhoneVariants(ph);
+    const ultIn = Math.max(0, ...vars.map(v => _waUltimaMsgIn.get(inst + '|' + v) || 0));
+    if (ultIn && ultIn >= p.at) continue;
+    vars.forEach(v => { out[v] = p.state; });
   }
   res.json(out);
 });
@@ -6344,6 +6357,10 @@ app.get('/presence', async (req, res) => {
       }
     }
     if (!pr) return res.json({});
+    if (pr.state === 'composing' || pr.state === 'recording') {
+      const ultIn = Math.max(0, ..._brPhoneVariants(_limpo).map(v => _waUltimaMsgIn.get(inst + '|' + v) || 0));
+      if (ultIn && ultIn >= pr.at) return res.json({ state: 'paused', lastSeen: pr.lastSeen, at: ultIn }); // o lead já enviou depois
+    }
     res.json({ state: pr.state, lastSeen: pr.lastSeen, at: pr.at });
   } catch (_) { res.json({}); }
 });
@@ -11631,11 +11648,21 @@ async function waStart(instanceName) {
       if (!m.key?.fromMe && type === 'notify') {
         try {
           const parado = { state: 'paused', lastSeen: null, at: Date.now() };
+          const _nums = new Set();
           for (const j of [_rj, String(_rj).replace(/:\d+(?=@)/, ''), lidJid, realPn, m.key?.remoteJidAlt].filter(Boolean)) {
             const jid = String(j).includes('@') ? String(j) : String(j).replace(/\D/g, '') + '@s.whatsapp.net';
             _waPresence[instanceName + '|' + jid] = parado;
             _waPresence[instanceName + '|' + jid.replace(/@.*$/, '')] = parado;
-            _waUltimaMsgIn.set(instanceName + '|' + jid.replace(/@.*$/, '').split(':')[0], Date.now()); // o "digitando" que chegar ATRASADO (logo após) é da mensagem que já veio
+            const _n = jid.replace(/@.*$/, '').split(':')[0];
+            _waUltimaMsgIn.set(instanceName + '|' + _n, Date.now()); // o "digitando" que chegar ATRASADO (logo após) é da mensagem que já veio
+            try { _brPhoneVariants(_n).forEach(v => { _nums.add(v); _waUltimaMsgIn.set(instanceName + '|' + v, Date.now()); }); } catch (_) { _nums.add(_n); }
+          }
+          // A presença pode ter ficado guardada sob OUTRA chave do mesmo número (sufixo do aparelho
+          // ":12", nono dígito, id oculto): varre todas — era por isso que o "digitando…" sobrevivia
+          for (const k of Object.keys(_waPresence)) {
+            if (!k.startsWith(instanceName + '|')) continue;
+            const ph = (k.split('|')[1] || '').split('@')[0].split(':')[0];
+            if (_nums.has(ph)) _waPresence[k] = parado;
           }
         } catch (_) {}
       }
@@ -12305,4 +12332,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
