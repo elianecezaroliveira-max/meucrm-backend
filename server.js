@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 351;
+const SERVER_VER = 352;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6542,13 +6542,32 @@ app.put("/contacts/:phone/favorite", async (req, res) => {
 // SISTEMA DE BOTS — motor de execução
 // ═══════════════════════════════════════
 
+const _VAR_NOTAS_RE = /[\{\(\[]{1,2}\s*(?:notas?|anota[cç][aã]o|anota[cç][oõ]es|observa[cç][aã]o|observa[cç][oõ]es)\s*[\}\)\]]{1,2}/gi;
+// 📷 FOTOS DAS ANOTAÇÕES: o passo "Enviar mensagem" que usa {notas} manda também as fotos
+// coladas nas Anotações do lead (notas internas marcadas), uma a uma, depois do texto.
+const _FOTO_ANOTACAO_MARCA = '[Foto das anotações]';
+async function _fotosDasAnotacoes(phone, owner) {
+  try {
+    const { data } = await supabase.from('messages').select('id, media_id, media_mime_type, timestamp')
+      .in('phone', phoneVariants(phone)).eq('owner', owner || ' ').eq('type', 'note').eq('content', _FOTO_ANOTACAO_MARCA)
+      .order('timestamp', { ascending: true }).limit(10);
+    return (data || []).filter(n => n && n.media_id && /^image\//.test(String(n.media_mime_type || '')));
+  } catch (_) { return []; }
+}
+// Link temporário (1 h) para o WhatsApp baixar a foto do cofre
+async function _linkTemporarioDoCofre(caminho) {
+  try {
+    const r = await supabase.storage.from('wa-media').createSignedUrl(caminho, 3600);
+    return (r && r.data && r.data.signedUrl) || null;
+  } catch (_) { return null; }
+}
 // Substitui variáveis aceitando vários formatos: {nome} (nome) [nome] {{nome}}, maiúsc/minúsc
 function applyVars(str, name, phone, notes) {
   if (!str) return str;
   return String(str)
     .replace(/[\{\(\[]{1,2}\s*nome\s*[\}\)\]]{1,2}/gi, name || '')
     .replace(/[\{\(\[]{1,2}\s*telefone\s*[\}\)\]]{1,2}/gi, phone || '')
-    .replace(/[\{\(\[]{1,2}\s*(?:notas?|anota[cç][aã]o|anota[cç][oõ]es|observa[cç][aã]o|observa[cç][oõ]es)\s*[\}\)\]]{1,2}/gi, notes || '');
+    .replace(_VAR_NOTAS_RE, notes || '');
 }
 
 // Registra no CRM uma mensagem de bot que FALHOU — fica visível na conversa com ⚠️ e o MOTIVO,
@@ -6602,7 +6621,7 @@ async function _acctPadraoDoLead(phone, owner) {
 }
 
 // 📷 FOTO DO BOT: envia a imagem (link público) com o texto como legenda
-async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
+async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner, midiaPath) {
   const ts = new Date().toISOString();
   const prev = legenda ? (legenda.length > 80 ? legenda.slice(0, 80) + '…' : legenda) : '[Imagem]';
   // Caminho da foto no NOSSO cofre (o link é .../bot-media/<arquivo>): guardar isso
@@ -6610,7 +6629,11 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
   let _mediaPath = null, _mediaMime = null;
   try {
     const mm = String(imgUrl || '').match(/\/bot-media\/([^?#]+)/);
-    if (mm) {
+    if (midiaPath) { // foto do cofre (ex.: foto das Anotações): a bolha do chat mostra a mesma foto
+      _mediaPath = String(midiaPath);
+      const ext = (_mediaPath.split('.').pop() || '').toLowerCase();
+      _mediaMime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+    } else if (mm) {
       _mediaPath = 'bot/' + decodeURIComponent(mm[1]).replace(/^bot\//, '');
       const ext = (_mediaPath.split('.').pop() || '').toLowerCase();
       _mediaMime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif'
@@ -6654,7 +6677,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner) {
   return wamid;
 }
 
-async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) {
+async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, midiaPath) {
   let acct, usedAcctId;
   if (nodeAccountId) {
     // Nó com número CONFIGURADO: obedece exatamente — sem troca automática
@@ -6677,7 +6700,7 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl) 
   const phoneNumberId = acct.phone_number_id, token = acct.token;
   // 📷 Passo com FOTO: manda a imagem (o texto vira legenda)
   if (imgUrl) {
-    try { return await sendBotFoto(phone, acct, usedAcctId, imgUrl, text, owner); }
+    try { return await sendBotFoto(phone, acct, usedAcctId, imgUrl, text, owner, midiaPath); }
     catch (e) {
       console.error('Bot foto:', e.response?.data || e.message);
       await _recordBotFail(phone, text || '[Imagem]', 'Falha ao enviar a foto do bot: ' + (metaErrorText(e.response?.data?.error) || e.message || ''), usedAcctId, owner, 'text');
@@ -7131,6 +7154,21 @@ async function processNode(run, depth=0) {
       const text = applyVars(cfg.text || '', name, phone, notes);
       // Passo pode ter FOTO (com o texto de legenda) — sem texto e sem foto = nada a fazer
       sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null) : true;
+      // 📷 O passo usa {notas}: as FOTOS coladas nas Anotações do lead vão junto, depois do texto
+      // (ela anexou a simulação nas Anotações e esperava que o bot mandasse)
+      if (sendOk && cfg.text && new RegExp(_VAR_NOTAS_RE.source, 'i').test(String(cfg.text))) {
+        try {
+          if (typeof sendOk === 'string') sendOk = await _esperaEnvioDoBot(sendOk); // o texto precisa sair antes das fotos
+          const fotos = sendOk ? await _fotosDasAnotacoes(phone, botOwner) : [];
+          for (const f of fotos) {
+            const url = await _linkTemporarioDoCofre(f.media_id);
+            if (!url) { console.error('Foto das anotações sem link:', f.media_id); continue; }
+            const r = await sendBotMsg(phone, acctId, '', botOwner, nodeAcct, url, f.media_id);
+            if (typeof r === 'string') await _esperaEnvioDoBot(r);
+            await new Promise(res => setTimeout(res, 500));
+          }
+        } catch (e) { console.error('Fotos das anotações no bot:', e.message); }
+      }
     }
     // A Meta (e o QR) aceitam a mensagem e só DEPOIS avisam que falhou (fora da
     // janela de 24 h, número inválido…). Regra: só avança se NÃO falhou — espera
@@ -12379,4 +12417,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _fotosDasAnotacoes, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
