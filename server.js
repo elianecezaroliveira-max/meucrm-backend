@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 361;
+const SERVER_VER = 362;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -10150,7 +10150,7 @@ app.get('/meu-acesso', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 // Liga/desliga e os dias ficam em pagamento_cfg (Painel do fornecedor ▸ Cobrança).
 // Cada e-mail só ganha o teste UMA vez. No fim do prazo o envio pausa (sem tolerância)
-// e a faixa oferece "Assinar" com o link de pagamento padrão.
+// e a faixa oferece "Assinar" com o link de pagamento padrão. O teste tem tudo liberado (números ilimitados).
 function _testeCfg() {
   const c = _pagCfg();
   return { ligado: c.teste_ligado !== false, dias: Math.min(90, Math.max(1, parseInt(c.teste_dias, 10) || 7)) };
@@ -10176,7 +10176,7 @@ app.post('/teste-gratis', async (req, res) => {
   const ate = new Date(Date.parse(hoje + 'T00:00:00Z') + info.dias * 86400000).toISOString().slice(0, 10);
   const b = req.body || {};
   const plano = { plano: 'Teste grátis', validade: ate, suspenso: false, teste: true, teste_inicio: new Date().toISOString(),
-    limite_numeros: 1, limite_msgs_mes: null, contato: String(b.whatsapp || '').slice(0, 30) || null,
+    limite_numeros: null, limite_msgs_mes: null, // teste com números ilimitados (igual ao plano pago) contato: String(b.whatsapp || '').slice(0, 30) || null,
     obs: [String(b.nome || '').slice(0, 80), String(b.empresa || '').slice(0, 80)].filter(Boolean).join(' · ') || null, pagamentos: [] };
   const K = 'billing::' + email;
   await supabase.from('settings').upsert({ key: K, value: JSON.stringify(plano), updated_at: new Date().toISOString() });
