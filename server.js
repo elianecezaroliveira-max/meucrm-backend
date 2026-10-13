@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 353;
+const SERVER_VER = 354;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8272,7 +8272,10 @@ const _iaHoje = () => { const d = new Date(Date.now() - 3 * 3600000); return ['d
 // ═══════════════════════════════════════════════════════════════════
 const _IA_FONES_TESTE_PADRAO = ['5515981651975'];
 function _iaFonesTeste(owner) {
-  const extra = String(_cfg('ia_fones_teste', owner) || '').split(/[,;\s]+/).map(x => String(x || '').replace(/\D/g, '')).filter(Boolean);
+  // aceita "(48) 99951-0343, 11 95315-7933": separa só por vírgula/ponto e vírgula/linha, tira o
+  // que não é dígito e põe o 55 quando vier sem DDI (antes "(48) 99951-0343" virava "48" e "999510343")
+  const extra = String(_cfg('ia_fones_teste', owner) || '').split(/[,;\n]+/).map(x => String(x || '').replace(/\D/g, '')).filter(Boolean)
+    .map(d => (d.length === 10 || d.length === 11) ? '55' + d : d);
   const todos = _IA_FONES_TESTE_PADRAO.concat(extra);
   const set = new Set();
   for (const f of todos) for (const v of phoneVariants(f)) set.add(String(v).replace(/\D/g, ''));
@@ -8824,7 +8827,7 @@ app.get('/ia/status', async (req, res) => {
     const nov = await _iaNovidades(req.owner);
     res.json({ ligada: await _iaSugLigada(req.owner), chave: !!process.env.GROQ_API_KEY, model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
       memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length, novidades: nov.length },
-      placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) }, bancos: _iaBancosAtuais(req.owner) });
+      placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) }, bancos: _iaBancosAtuais(req.owner), fones_ignorados: String(_cfg('ia_fones_teste', req.owner) || '') });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // 🎯 Momentos: quando cada rápida/bot pode ser sugerido pela IA
@@ -10923,6 +10926,9 @@ app.put('/settings/:key', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   _settings[k] = value;
   res.json({ success: true });
+  // 🚫 números que a IA deve ignorar (suporte do banco, marido…): além de não sugerir nem
+  // aprender dali daqui em diante, tira da memória o que já tinha aprendido nessas conversas
+  if (req.params.key === 'ia_fones_teste') _iaLimpaTestes(req.owner).catch(() => {});
 });
 
 
