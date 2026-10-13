@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 357;
+const SERVER_VER = 359;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -4732,7 +4732,7 @@ async function _googleAccessToken() {
   const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
   const now = Math.floor(Date.now() / 1000);
   const header = b64({ alg: 'RS256', typ: 'JWT' });
-  const claim = b64({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/spreadsheets.readonly',
+  const claim = b64({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/spreadsheets', // leitura (importar) + escrita (backup semanal)
     aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 });
   const sig = crypto.sign('RSA-SHA256', Buffer.from(header + '.' + claim), sa.private_key).toString('base64url');
   const jwt = header + '.' + claim + '.' + sig;
@@ -4825,7 +4825,7 @@ app.get('/sheets/status', async (req, res) => {
   const cfg = await _sheetsCfg(req.owner);
   res.json({ robo_configurado: !!sa, robo_email: sa ? sa.client_email : null,
     spreadsheet_id: cfg.spreadsheet_id || '', sheet_name: cfg.sheet_name || 'DISPARO', auto: !!cfg.auto, atualizar_etapa: !!cfg.atualizar_etapa,
-    drip_rule_id: cfg.drip_rule_id || '', regras_drip: _dripRegras(req.owner).map(r => ({ id: r.id, nome: r.nome, ativo: !!r.ativo })), last: cfg.last || null });
+    drip_rule_id: cfg.drip_rule_id || '', regras_drip: _dripRegras(req.owner).map(r => ({ id: r.id, nome: r.nome, ativo: !!r.ativo })), last: cfg.last || null, backup: cfg.backup || null });
 });
 app.post('/sheets/config', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -4895,6 +4895,97 @@ app.get('/sheets/sync/status', (req, res) => {
   if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
   res.json(_sheetsProg[req.owner] || { fase: 'parado', done: true });
 });
+// ═══════════════════════════════════════════════════════════════════════════
+// 💾 BACKUP SEMANAL NA PLANILHA DO GOOGLE: Anotações, Etiquetas e Tarefas de cada lead
+// vão para abas "FILAZ Anotações", "FILAZ Etiquetas" e "FILAZ Tarefas" da planilha já
+// configurada (o robô precisa ser EDITOR nela). Roda toda segunda às 6h (horário de
+// Brasília) e também pelo botão "Fazer backup agora". Seguro contra qualquer problema no banco.
+// ═══════════════════════════════════════════════════════════════════════════
+async function _sheetsGaranteAba(spreadsheetId, tok, titulo) {
+  try {
+    await axios.post(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+      { requests: [{ addSheet: { properties: { title: titulo } } }] },
+      { headers: { Authorization: 'Bearer ' + tok }, timeout: 20000 });
+  } catch (e) {
+    const msg = String(e.response?.data?.error?.message || e.message || '');
+    if (!/already exists|já existe/i.test(msg)) throw new Error(msg);
+  }
+}
+async function _sheetsEscreveAba(spreadsheetId, tok, titulo, linhas) {
+  await _sheetsGaranteAba(spreadsheetId, tok, titulo);
+  const aba = "'" + titulo.replace(/'/g, "''") + "'";
+  await axios.post(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(aba + '!A1:Z')}:clear`, {},
+    { headers: { Authorization: 'Bearer ' + tok }, timeout: 20000 });
+  await axios.put(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(aba + '!A1')}`,
+    { range: aba + '!A1', majorDimension: 'ROWS', values: linhas },
+    { headers: { Authorization: 'Bearer ' + tok }, params: { valueInputOption: 'RAW' }, timeout: 60000 });
+}
+const _bkpSheetsAndando = {};
+async function _sheetsBackup(owner, motivo) {
+  if (_bkpSheetsAndando[owner]) return { ok: false, erro: 'já está rodando' };
+  _bkpSheetsAndando[owner] = true;
+  const cfg = await _sheetsCfg(owner);
+  try {
+    if (!supabase) throw new Error('sem banco');
+    if (!_googleSA()) throw new Error('GOOGLE_SA_JSON não configurada no Railway');
+    if (!cfg.spreadsheet_id) throw new Error('Nenhuma planilha configurada — cole o link em Ferramentas ▸ Planilha do Google e salve.');
+    const tok = await _googleAccessToken();
+    const brt = d => d ? new Date(new Date(d).getTime() - 3 * 3600000).toISOString().replace('T', ' ').slice(0, 16) : '';
+    const [{ data: cts }, { data: sts }, { data: tks }] = await Promise.all([
+      supabase.from('contacts').select('phone, name, notes, tags, stage_id, last_message_at, favorite').eq('owner', owner || ' ').order('last_message_at', { ascending: false, nullsFirst: false }).limit(5000),
+      supabase.from('pipeline_stages').select('id, name').eq('owner', owner || ' '),
+      supabase.from('tasks').select('id, phone, title, tipo, due_at, done, created_at, notes').eq('owner', owner || ' ').order('due_at', { ascending: true, nullsFirst: false }).limit(5000),
+    ]);
+    const etapa = {}; (sts || []).forEach(x => { etapa[String(x.id)] = x.name; });
+    const nome = {}; (cts || []).forEach(c => { nome[String(c.phone)] = c.name || ''; });
+    let resp = {}; try { resp = JSON.parse(_cfg('responsaveis', owner) || '{}') || {}; } catch (_) {}
+    const tipos = {}; try { const t = JSON.parse(_cfg('tarefa_tipos', owner) || '[]'); (Array.isArray(t) ? t : []).forEach(x => { if (x && x.id) tipos[String(x.id)] = x.nome || x.name || ''; }); } catch (_) {}
+    const quando = brt(new Date().toISOString());
+    const abaNotas = [['Telefone', 'Nome', 'Etapa', 'Responsável', 'Favorito', 'Última mensagem', 'Anotações', 'Backup em']]
+      .concat((cts || []).map(c => [String(c.phone || ''), c.name || '', etapa[String(c.stage_id)] || '', resp[String(c.phone)] || '', c.favorite ? 'sim' : '', brt(c.last_message_at), String(c.notes || ''), quando]));
+    const abaTags = [['Telefone', 'Nome', 'Etiquetas', 'Backup em']]
+      .concat((cts || []).filter(c => Array.isArray(c.tags) ? c.tags.length : !!c.tags).map(c => [String(c.phone || ''), c.name || '', Array.isArray(c.tags) ? c.tags.join(', ') : String(c.tags || ''), quando]));
+    const abaTarefas = [['Telefone', 'Nome', 'Tarefa', 'Tipo', 'Prazo', 'Concluída', 'Criada em', 'Observações', 'Backup em']]
+      .concat((tks || []).map(t => [String(t.phone || ''), nome[String(t.phone)] || '', t.title || '', tipos[String(t.tipo)] || String(t.tipo || ''), brt(t.due_at), t.done ? 'sim' : 'não', brt(t.created_at), String(t.notes || ''), quando]));
+    await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Anotações', abaNotas);
+    await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Etiquetas', abaTags);
+    await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Tarefas', abaTarefas);
+    const r = { quando: new Date().toISOString(), ok: true, leads: (cts || []).length, tarefas: (tks || []).length, motivo: motivo || 'manual' };
+    cfg.backup = r; await _sheetsSalvaCfg(owner, cfg);
+    console.log('💾 Backup na planilha (' + owner + '): ' + r.leads + ' leads, ' + r.tarefas + ' tarefas');
+    return r;
+  } catch (e) {
+    const msg = String(e.response?.data?.error?.message || e.message || 'erro');
+    const amig = /PERMISSION_DENIED|does not have permission|insufficient/i.test(msg)
+      ? 'O robô do Google não tem permissão para ESCREVER na planilha. Compartilhe a planilha com o robô como Editor (não só Leitor) e tente de novo.' : msg;
+    const r = { quando: new Date().toISOString(), ok: false, erro: amig, motivo: motivo || 'manual' };
+    try { cfg.backup = r; await _sheetsSalvaCfg(owner, cfg); } catch (_) {}
+    console.error('💾 Backup na planilha falhou:', amig);
+    return r;
+  } finally { _bkpSheetsAndando[owner] = false; }
+}
+app.post('/sheets/backup', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const r = await _sheetsBackup(req.owner, 'manual');
+  res.status(r.ok ? 200 : 400).json(r);
+});
+// toda segunda-feira às 6h (Brasília), uma vez por semana por conta
+setInterval(async () => {
+  try {
+    if (!supabase || !_googleSA()) return;
+    const agora = new Date(Date.now() - 3 * 3600000); // horário de Brasília
+    if (agora.getUTCDay() !== 1 || agora.getUTCHours() !== 6) return;
+    for (const k in _settings) {
+      if (!k.startsWith('sheets_sync::')) continue;
+      const owner = k.slice('sheets_sync::'.length).trim();
+      let cfg = {}; try { cfg = JSON.parse(_settings[k] || '{}'); } catch (_) {}
+      if (!owner || !cfg.spreadsheet_id) continue;
+      const ult = cfg.backup && cfg.backup.quando ? Date.parse(cfg.backup.quando) : 0;
+      if (Date.now() - ult < 6 * 86400000) continue; // já fez nesta semana
+      await _sheetsBackup(owner, 'semanal');
+    }
+  } catch (e) { console.error('💾 backup semanal:', e.message); }
+}, 10 * 60 * 1000);
 // ⏰ Sincronização automática: a cada hora, para as contas que ligaram "auto"
 setInterval(async () => {
   try {
@@ -5871,7 +5962,44 @@ app.get("/contacts", async (req, res) => {
       return buscaTudo(null); // primeira vez, ou mudança sem telefone conhecido: relê tudo
     });
   } catch (e) { return res.status(500).json({ error: e.message }); }
+  // 👤 responsável de cada conversa (mapa pequeno em settings; não mexe no cache da lista)
+  try {
+    const resp = _responsaveis(req.owner);
+    if (Object.keys(resp).length && Array.isArray(r)) r = r.map(c => (c && resp[String(c.phone)]) ? Object.assign({}, c, { responsavel: resp[String(c.phone)] }) : c);
+  } catch (_) {}
   res.json(r);
+});
+// ═══════════════ 👤 RESPONSÁVEL PELA CONVERSA (passar para alguém da equipe) ═══════════════
+// Mapa telefone → e-mail em settings responsaveis::dono (sem coluna nova no banco).
+// Quem recebe ganha um aviso no celular; a lista tem os filtros "Minhas" e "Sem responsável".
+function _responsaveis(owner) { try { return JSON.parse(_cfg('responsaveis', owner) || '{}') || {}; } catch (_) { return {}; } }
+async function _responsaveisGrava(owner, mapa) {
+  const k = 'responsaveis::' + (owner || ' ');
+  const v = JSON.stringify(mapa);
+  await supabase.from('settings').upsert({ key: k, value: v, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  _settings[k] = v; _marcaSujo && _marcaSujo('contacts');
+}
+app.get('/responsaveis', (req, res) => { if (!_exigeLogin(req, res)) return; res.json(_responsaveis(req.owner)); });
+app.put('/contacts/:phone/responsavel', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const phone = String(req.params.phone || '').replace(/\D/g, '');
+  const email = String((req.body || {}).email || '').trim().toLowerCase();
+  if (!phone) return res.status(400).json({ error: 'telefone' });
+  const mapa = _responsaveis(req.owner);
+  if (email) mapa[phone] = email; else delete mapa[phone];
+  await _responsaveisGrava(req.owner, mapa);
+  // aviso no celular de quem recebeu (só se não for ela mesma)
+  try {
+    const quem = String(req.usuario || req.owner || '').toLowerCase();
+    if (email && email !== quem) {
+      let nome = phone;
+      try { const { data: c } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', req.owner || ' ').maybeSingle(); nome = (c && c.name) || phone; } catch (_) {}
+      const de = quem.split('@')[0].replace(/[._+-]+/g, ' ');
+      sendPushToOwner(req.owner, { title: 'Conversa passada para ' + email.split('@')[0], body: nome + ' — por ' + de, phone, tag: 'resp-' + phone, para: email }).catch(() => {});
+    }
+  } catch (_) {}
+  res.json({ success: true, phone, email: email || null });
 });
 
 // Mover lead para estágio
@@ -12460,4 +12588,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
