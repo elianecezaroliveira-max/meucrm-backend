@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 355;
+const SERVER_VER = 357;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -551,9 +551,12 @@ app.get('/nao-lidas', async (req, res) => {
   if (!supabase) return res.json({ n: 0 });
   try {
     const n = await _comCache('naolidas|' + req.owner, String(_tabVer.contacts), _CACHE_TTL_MS, async () => {
-      const { count, error } = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('owner', req.owner).gt('unread_count', 0);
-      if (error) throw new Error(error.message);
-      return Number(count) || 0;
+      // 🔇 conversa silenciada não conta (a bolinha vermelha da aba acendia por ela); se a coluna
+      // "muted" ainda não existir no banco, conta todas
+      let r = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('owner', req.owner).gt('unread_count', 0).or('muted.is.null,muted.eq.false');
+      if (r.error) r = await supabase.from('contacts').select('id', { count: 'exact', head: true }).eq('owner', req.owner).gt('unread_count', 0);
+      if (r.error) throw new Error(r.error.message);
+      return Number(r.count) || 0;
     });
     res.json({ n });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -6009,10 +6012,21 @@ async function botTypingPulse(phone, accountId) {
   return null;
 }
 
+// 📷 Prévia da lista para FOTO/VÍDEO com legenda, igual WhatsApp ("📷 legenda"): a legenda vai
+// marcada como mídia ("[Imagem: legenda]") para o app desenhar o ícone — antes a prévia era só o
+// texto da legenda e parecia uma mensagem comum.
+function _previaMidia(type, content) {
+  const c = String(content == null ? '' : content).replace(/\s+/g, ' ').trim();
+  const t = String(type || 'text');
+  if (t === 'image' && !/^\[Imagem/i.test(c)) return c ? '[Imagem: ' + c + ']' : '[Imagem recebida]';
+  if (t === 'video' && !/^\[V[ií]deo/i.test(c)) return c ? '[Vídeo: ' + c + ']' : '[Vídeo recebido]';
+  return c;
+}
+const _previaCurta = (txt) => { const x = String(txt || ''); return x.length > 80 ? x.substring(0, 80) + '…' : x; };
 // Grava a mensagem enviada + atualiza a prévia da conversa (recursos especiais)
 async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
   if (!supabase) return;
-  const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
+  const preview = _previaCurta(_previaMidia(type, content));
   await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
   await supabase.from('messages').insert(await _comAutor({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, status: wamid ? 'sent' : 'pending', wamid: wamid || null, owner: req.owner || null }, req));
   await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
@@ -6632,7 +6646,7 @@ async function _acctPadraoDoLead(phone, owner) {
 // 📷 FOTO DO BOT: envia a imagem (link público) com o texto como legenda
 async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner, midiaPath) {
   const ts = new Date().toISOString();
-  const prev = legenda ? (legenda.length > 80 ? legenda.slice(0, 80) + '…' : legenda) : '[Imagem]';
+  const prev = _previaCurta(_previaMidia(/\.(mp4|mov)(\?|$)/i.test(String(imgUrl || '')) ? 'video' : 'image', legenda)); // "[Imagem: legenda]" → a lista mostra 📷 legenda
   // Caminho da foto no NOSSO cofre (o link é .../bot-media/<arquivo>): guardar isso
   // faz a imagem APARECER na conversa do CRM, em vez do texto "[Imagem]"
   let _mediaPath = null, _mediaMime = null;
@@ -12364,7 +12378,7 @@ app.post('/evolution-webhook', async (req, res) => {
           if (exists) return;
         }
 
-        const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
+        const preview = _previaCurta(_previaMidia(type, content));
         const contactData = { phone, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
         if (ownerEmail) contactData.owner = ownerEmail;
         // Estado atual do contato (para decidir NOME e NÚMERO sem sobrescrever indevidamente)
@@ -12446,4 +12460,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _fotosDasAnotacoes, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
