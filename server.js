@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 352;
+const SERVER_VER = 353;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8721,7 +8721,7 @@ async function _iaSugere(owner, phone, forcar) {
     + tempoTxt
     + (resumoAntigo ? '\n\n### RESUMO DA PARTE ANTIGA DA CONVERSA (' + antigas.length + ' mensagens, de ' + _iaDataHora(antigas[0].timestamp) + ' a ' + _iaDataHora(antigas[antigas.length - 1].timestamp) + ')\n' + resumoAntigo : '')
     + '\n\n### ' + (resumoAntigo ? 'ÚLTIMAS ' + msgs.length + ' MENSAGENS, por inteiro' : 'CONVERSA INTEIRA, do começo') + ' (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs, msgs.length)
-    + '\n\nAntes de escrever: diga o ASSUNTO da última fala do lead; se for da operação, olhe as DATAS acima e veja em que fase ele está; se for outro assunto (estorno, cobrança, dúvida, reclamação), responda a ele e deixe a operação de lado. NUNCA repita uma mensagem que ela já mandou nesta conversa (as linhas "Eu:" acima): o lead já leu; responda ao que ele disse AGORA. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
+    + '\n\nAntes de escrever: diga o ASSUNTO da última fala do lead; se for da operação, olhe as DATAS acima e veja em que fase ele está; se for outro assunto (estorno, cobrança, dúvida, reclamação), responda a ele e deixe a operação de lado. NUNCA repita uma mensagem que ela já mandou nesta conversa (as linhas "Eu:" acima): o lead já leu; responda ao que ele disse AGORA. NUNCA devolva ao lead a própria fala dele (nem reescrita, nem com emoji): se ele perguntou "pode ser a conta do mês passado?", a resposta é SIM/NÃO com a orientação dela — não a mesma pergunta. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
   const { texto, model } = await _iaChamaGroq(sys, usr, owner);
   // 🎯 filtro dos itens: rápida/bot só com momento cadastrado; texto que é de rápida/bot vira o
   // item (se tem momento) ou cai fora (era isso que fazia a IA sugerir "Qualquer dúvida me aciona…" na hora errada)
@@ -8741,7 +8741,21 @@ async function _iaSugere(owner, phone, forcar) {
   const _normRep = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   const _minhasRecentes = todas.filter(m => m.direction === 'outbound' && m.type !== 'note').slice(-12).map(m => _normRep(m.content)).filter(x => x.length >= 12);
   const _repetida = it => { if (it.tipo !== 'texto') return false; const t = _normRep(it.texto); if (!t) return false; return _minhasRecentes.some(m => m === t || (t.length >= 25 && m.includes(t)) || (m.length >= 25 && t.includes(m))); };
-  const itensSemRep = itensOk.filter(it => !_repetida(it));
+  // 🪞 NUNCA devolver ao lead o que ELE acabou de dizer: a IA sugeria "Pode ser a conta do mês
+  // passado? 👆" — a própria pergunta do lead, só com um emoji. Compara palavra a palavra (sem
+  // emoji/pontuação): se quase tudo da sugestão está na fala do lead, é eco, não resposta.
+  const _doLeadRecentes = doLead.map(m => _normRep(m.type === 'audio' && m.transcript ? m.transcript : m.content)).filter(x => x.length >= 6);
+  const _ecoDoLead = it => {
+    if (it.tipo !== 'texto') return false;
+    const t = _normRep(it.texto); if (!t) return false;
+    const pal = t.split(' ').filter(w => w.length > 1); if (!pal.length) return false;
+    return _doLeadRecentes.some(l => {
+      if (l === t || (t.length >= 12 && l.includes(t)) || (l.length >= 12 && t.includes(l))) return true;
+      const lp = new Set(l.split(' ')); const comum = pal.filter(w => lp.has(w)).length;
+      return pal.length >= 3 && comum / pal.length >= 0.8; // 80% das palavras são as do lead
+    });
+  };
+  const itensSemRep = itensOk.filter(it => !_repetida(it) && !_ecoDoLead(it));
   const itens = itensSemRep.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
   const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
