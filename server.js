@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 354;
+const SERVER_VER = 355;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -758,9 +758,18 @@ async function _previaEnviada(owner, phone, status) {
   try {
     let tinhaNaoLida = false;
     try { const { data: c } = await supabase.from('contacts').select('unread_count').eq('phone', phone).eq('owner', owner || ' ').maybeSingle(); tinhaNaoLida = !!(c && c.unread_count > 0); } catch (_) {}
-    await supabase.from('contacts')
+    // ⏱️ NUNCA rebaixa o tique da prévia: o recibo "entregue" às vezes chega ANTES de esta função
+    // rodar (o WhatsApp responde em ms) e ela escrevia "sent" por cima — a bolha ficava ✓✓ e a
+    // lista ficava num ✓ só (ela viu no Siddartha). Só grava se o que está lá for menor.
+    const _rk = _ST_RANK[status];
+    const _menores = _rk !== undefined ? Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < _rk) : null;
+    let qS = supabase.from('contacts')
       .update({ last_message_status: status || null, unread_count: 0, first_unread_at: null })
       .eq('phone', phone).eq('owner', owner || ' ').eq('last_message_direction', 'outbound');
+    if (_menores) qS = qS.or('last_message_status.is.null,last_message_status.in.(' + _menores.join(',') + ')');
+    await qS;
+    // a conversa fica lida de qualquer jeito (mesmo quando o tique já estava mais alto)
+    await supabase.from('contacts').update({ unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ').gt('unread_count', 0);
     if (tinhaNaoLida) _badgeAvisa(owner, phone); // respondida (por mim ou pelo bot) → o celular tira o aviso
   } catch (e) { console.error('Prévia da conversa enviada:', e.message); }
 }
