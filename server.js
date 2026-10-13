@@ -443,7 +443,7 @@ async function _acessoSalva(v) {
 }
 // Rotas que respondem mesmo para quem ainda não foi liberado — senão o app não
 // teria como explicar o motivo e a pessoa veria só telas quebradas.
-const _PORTARIA_LIVRE = new Set(['/', '/versao', '/meu-acesso', '/webhook', '/favicon.ico', '/solicitar-acesso']);
+const _PORTARIA_LIVRE = new Set(['/', '/versao', '/meu-acesso', '/webhook', '/favicon.ico', '/solicitar-acesso', '/teste-gratis']);
 // Guarda quem tentou entrar sem liberação, para aparecer no seu painel.
 const _tentUlt = {};
 async function _anotaTentativa(email) {
@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 359;
+const SERVER_VER = 360;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -10116,8 +10116,53 @@ app.get('/meu-acesso', async (req, res) => {
   res.json({
     email: req.usuario || req.owner, dono: req.owner, papel: _papelDe(req),
     fornecedor: _ehDono(req), plano: _planoInfo(req.owner),
-    liberado: _temLiberacao(req), portaria: l.ligado
+    liberado: _temLiberacao(req), portaria: l.ligado,
+    teste_gratis: _testeGratisInfo(req)
   });
+});
+// ═══════════════════════════════════════════════════════════════════
+// 🎁 TESTE GRÁTIS — quem chegou sem liberação começa a usar sozinho, na hora
+// ═══════════════════════════════════════════════════════════════════
+// Liga/desliga e os dias ficam em pagamento_cfg (Painel do fornecedor ▸ Cobrança).
+// Cada e-mail só ganha o teste UMA vez. No fim do prazo o envio pausa (sem tolerância)
+// e a faixa oferece "Assinar" com o link de pagamento padrão.
+function _testeCfg() {
+  const c = _pagCfg();
+  return { ligado: c.teste_ligado !== false, dias: Math.min(90, Math.max(1, parseInt(c.teste_dias, 10) || 7)) };
+}
+function _testeGratisInfo(req) {
+  const t = _testeCfg();
+  const email = String(req.usuario || req.owner || '').toLowerCase();
+  const l = _acessoLista();
+  const p = _planoBruto(email) || {};
+  const jaUsou = !!p.teste_inicio;
+  return { ligado: t.ligado, dias: t.dias, ja_usou: jaUsou, disponivel: !!(t.ligado && l.ligado && email && !l.emails[email] && !jaUsou) };
+}
+app.post('/teste-gratis', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const email = String(req.usuario || req.owner || '').toLowerCase();
+  const info = _testeGratisInfo(req);
+  const l = _acessoLista();
+  if (l.emails[email]) return res.json({ ok: true, ja_liberado: true });
+  if (!info.ligado || !l.ligado) return res.status(403).json({ error: 'O teste grátis não está disponível no momento. Deixe seus dados em "Quero contratar".' });
+  if (info.ja_usou) return res.status(409).json({ error: 'Este e-mail já usou o teste grátis. Para continuar, fale com quem fornece o FILAZ ou deixe seus dados em "Quero contratar".', ja_usou: true });
+  const hoje = _hojeBrtISO();
+  const ate = new Date(Date.parse(hoje + 'T00:00:00Z') + info.dias * 86400000).toISOString().slice(0, 10);
+  const b = req.body || {};
+  const plano = { plano: 'Teste grátis', validade: ate, suspenso: false, teste: true, teste_inicio: new Date().toISOString(),
+    limite_numeros: 1, limite_msgs_mes: null, contato: String(b.whatsapp || '').slice(0, 30) || null,
+    obs: [String(b.nome || '').slice(0, 80), String(b.empresa || '').slice(0, 80)].filter(Boolean).join(' · ') || null, pagamentos: [] };
+  const K = 'billing::' + email;
+  await supabase.from('settings').upsert({ key: K, value: JSON.stringify(plano), updated_at: new Date().toISOString() });
+  _settings[K] = JSON.stringify(plano);
+  l.emails[email] = { desde: new Date().toISOString(), obs: 'teste grátis de ' + info.dias + ' dias' + (plano.obs ? ' · ' + plano.obs : ''), teste: true };
+  delete l.tentativas[email]; if (l.pedidos) delete l.pedidos[email];
+  await _acessoSalva(l);
+  console.log('🎁 Teste grátis iniciado: ' + email + ' até ' + ate);
+  // aviso no SEU celular: é a hora de ligar para a pessoa
+  try { sendPushToOwner(OWNER_LEGADO, { title: 'Teste grátis iniciado', body: email + (plano.obs ? ' — ' + plano.obs : '') + ' · ' + info.dias + ' dias', tag: 'teste-' + email }).catch(() => {}); } catch (_) {}
+  res.json({ ok: true, validade: ate, plano: _planoInfo(email) });
 });
 
 app.put('/equipe/:email/papel', async (req, res) => {
@@ -10156,17 +10201,20 @@ function _planoInfo(owner) {
   const val = /^\d{4}-\d{2}-\d{2}$/.test(String(p.validade || '')) ? p.validade : null;
   let dias = null, vencido = false, bloqueado = !!p.suspenso;
   let motivo = p.suspenso ? 'Esta conta está suspensa.' : null;
+  const teste = !!p.teste;
+  const tolerancia = teste ? 0 : _TOLERANCIA_DIAS; // teste grátis: acabou, pausou (sem dias extras)
   if (val) {
     dias = Math.round((Date.parse(val + 'T00:00:00Z') - Date.parse(hoje + 'T00:00:00Z')) / 86400000);
     vencido = dias < 0;
-    if (dias < -_TOLERANCIA_DIAS) { bloqueado = true; motivo = 'O plano venceu em ' + _brDia(val) + '.'; }
+    if (dias < -tolerancia) { bloqueado = true; motivo = (teste ? 'O teste grátis terminou em ' : 'O plano venceu em ') + _brDia(val) + '.'; }
   }
+  let padrao = {}; try { padrao = _pagCfg(); } catch (_) {}
   return {
-    plano: p.plano || 'FILAZ', validade: val, validade_br: _brDia(val), dias_restantes: dias,
-    vencido, bloqueado, motivo, tolerancia_dias: _TOLERANCIA_DIAS,
+    plano: p.plano || 'FILAZ', validade: val, validade_br: _brDia(val), dias_restantes: dias, teste,
+    vencido, bloqueado, motivo, tolerancia_dias: tolerancia,
     limite_numeros: p.limite_numeros || null, limite_msgs_mes: p.limite_msgs_mes || null,
     contato: p.contato || null, obs: p.obs || null, sem_plano: !val && !p.plano,
-    link_pagamento: p.link_pagamento || null, valor: p.valor || null,
+    link_pagamento: p.link_pagamento || padrao.link_pagamento_padrao || null, valor: p.valor || padrao.valor_padrao || null,
     ciclo_dias: p.ciclo_dias || null, pagamentos: p.pagamentos || []
   };
 }
@@ -10176,7 +10224,7 @@ function _planoBarra(req, res) {
   try { i = _planoInfo(req.owner); } catch (_) { return false; }
   if (!i.bloqueado) return false;
   res.status(402).json({
-    error: (i.motivo || 'Plano suspenso.') + ' Fale com quem te forneceu o FILAZ para reativar. Nada foi perdido: suas conversas, leads e configurações continuam aqui.',
+    error: (i.motivo || 'Plano suspenso.') + (i.teste && i.link_pagamento ? ' Assine para continuar enviando.' : ' Fale com quem te forneceu o FILAZ para reativar.') + ' Nada foi perdido: suas conversas, leads e configurações continuam aqui.',
     plano_bloqueado: true
   });
   return true;
@@ -10202,7 +10250,11 @@ app.put('/billing', async (req, res) => {
     link_pagamento: b.link_pagamento !== undefined ? (/^https?:\/\//i.test(String(b.link_pagamento || '')) ? String(b.link_pagamento).slice(0, 400) : null) : (atual.link_pagamento || null),
     valor: b.valor !== undefined ? String(b.valor || '').slice(0, 30) : (atual.valor || null),
     ciclo_dias: b.ciclo_dias !== undefined ? (parseInt(b.ciclo_dias, 10) || null) : (atual.ciclo_dias || null),
-    pagamentos: atual.pagamentos || []
+    pagamentos: atual.pagamentos || [],
+    // 🎁 teste grátis: continua teste até você trocar o nome do plano (ou registrar um pagamento);
+    // teste_inicio fica para sempre — é o que garante "só um teste por e-mail"
+    teste: b.teste !== undefined ? !!b.teste : !!(atual.teste && (b.plano === undefined || String(b.plano || '') === String(atual.plano || ''))),
+    teste_inicio: atual.teste_inicio || null
   };
   const K = 'billing::' + alvo;
   const { error } = await supabase.from('settings').upsert({ key: K, value: JSON.stringify(novo), updated_at: new Date().toISOString() });
@@ -10597,6 +10649,7 @@ app.get('/relatorios', async (req, res) => {
     const horas = new Array(24).fill(0);
     const conversas = new Set();
     const porAutor = {};
+    const automacao = { enviadas: 0, conversas: new Set() }; // bot, drip, automações e mensagens sem autor
     for (const m of msgs) {
       const ms = Date.parse(m.timestamp);
       if (!isFinite(ms)) continue;
@@ -10605,7 +10658,8 @@ app.get('/relatorios', async (req, res) => {
       if (m.direction === 'outbound') {
         if (alvo) alvo.enviadas++;
         const a = String(m.sent_by || '').toLowerCase();
-        if (a) { const o = porAutor[a] = porAutor[a] || { email: a, enviadas: 0, conversas: new Set(), respostas: [] }; o.enviadas++; o.conversas.add(m.phone); }
+        if (a) { const o = porAutor[a] = porAutor[a] || { email: a, enviadas: 0, conversas: new Set(), respostas: [], sem_resposta: 0, sem_resposta_max_min: 0 }; o.enviadas++; o.conversas.add(m.phone); }
+        else { automacao.enviadas++; automacao.conversas.add(m.phone); }
       } else {
         if (alvo) alvo.recebidas++;
         horas[new Date(ms - 3 * 3600000).getUTCHours()]++;
@@ -10633,8 +10687,35 @@ app.get('/relatorios', async (req, res) => {
         }
       }
     }
-    const med = arr => { if (!arr.length) return null; const o = arr.slice().sort((a, b) => a - b); return Math.round(o[Math.floor(o.length / 2)]); };
+    const med = arr => { if (!arr.length) return null; const o = arr.slice().sort((a, b) => a - b); const m = o.length >> 1; return Math.round(o.length % 2 ? o[m] : (o[m - 1] + o[m]) / 2); }; // mediana de verdade (par: média dos dois do meio)
     const mediaDe = arr => arr.length ? Math.round(arr.reduce((s, v) => s + v, 0) / arr.length) : null;
+    const ate10 = arr => arr.length ? Math.round(arr.filter(v => v <= 10).length / arr.length * 100) : null;
+
+    // ── conversas esperando resposta (a última mensagem é do cliente) ──
+    // De quem é: o responsável (Passar para…) ou a última pessoa que respondeu ali.
+    let respMapa = {}; try { respMapa = _responsaveis(req.owner); } catch (_) {}
+    const agoraMs = Date.now();
+    const esperando = [];
+    for (const f in porFone) {
+      const lista = porFone[f];
+      const ult = lista[lista.length - 1];
+      if (!ult || ult.direction === 'outbound') continue;
+      const ms = Date.parse(ult.timestamp); if (!isFinite(ms)) continue;
+      let quem = String(respMapa[String(f)] || '').toLowerCase();
+      if (!quem) for (let i = lista.length - 1; i >= 0; i--) { if (lista[i].direction === 'outbound' && lista[i].sent_by) { quem = String(lista[i].sent_by).toLowerCase(); break; } }
+      const min = Math.max(0, Math.round((agoraMs - ms) / 60000));
+      esperando.push({ phone: f, minutos: min, quem: quem || null });
+      if (quem) { const o = porAutor[quem] = porAutor[quem] || { email: quem, enviadas: 0, conversas: new Set(), respostas: [], sem_resposta: 0, sem_resposta_max_min: 0 }; o.sem_resposta++; o.sem_resposta_max_min = Math.max(o.sem_resposta_max_min, min); }
+    }
+    esperando.sort((a, b) => b.minutos - a.minutos);
+    const topo = esperando.slice(0, 20);
+    try {
+      if (topo.length) {
+        const { data: cs } = await supabase.from('contacts').select('phone, name, account_id').eq('owner', req.owner).in('phone', topo.map(x => x.phone));
+        const nm = {}; (cs || []).forEach(c => { nm[String(c.phone)] = c; });
+        topo.forEach(x => { const c = nm[x.phone]; if (c) { x.nome = c.name || null; x.account_id = c.account_id || null; } });
+      }
+    } catch (_) {}
 
     // ── funil ──
     let funil = [];
@@ -10670,7 +10751,8 @@ app.get('/relatorios', async (req, res) => {
 
     const atendentes = Object.values(porAutor).map(o => ({
       email: o.email, enviadas: o.enviadas, conversas: o.conversas.size,
-      resposta_media_min: mediaDe(o.respostas), respostas: o.respostas.length
+      resposta_media_min: mediaDe(o.respostas), resposta_mediana_min: med(o.respostas), ate10_pct: ate10(o.respostas), respostas: o.respostas.length,
+      sem_resposta: o.sem_resposta || 0, sem_resposta_max_min: o.sem_resposta_max_min || 0
     })).sort((a, b) => b.enviadas - a.enviadas);
 
     res.json({
@@ -10682,8 +10764,10 @@ app.get('/relatorios', async (req, res) => {
         conversas: conversas.size, leads_novos: leadsNovos, leads_total: leadsTotal
       },
       horas, funil,
-      resposta: { media_min: mediaDe(esperas), mediana_min: med(esperas), amostras: esperas.length },
-      atendentes
+      resposta: { media_min: mediaDe(esperas), mediana_min: med(esperas), ate10_pct: ate10(esperas), amostras: esperas.length },
+      atendentes,
+      automacao: { enviadas: automacao.enviadas, conversas: automacao.conversas.size },
+      sem_resposta: { n: esperando.length, lista: topo }
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -10735,7 +10819,8 @@ async function _renovaPlano(email, dias, origem) {
   const hoje = _hojeBrtISO();
   const base = (atual.validade && atual.validade > hoje) ? atual.validade : hoje;
   const nova = new Date(Date.parse(base + 'T00:00:00Z') + dias * 86400000).toISOString().slice(0, 10);
-  const novo = Object.assign({}, atual, { validade: nova, suspenso: false });
+  const novo = Object.assign({}, atual, { validade: nova, suspenso: false, teste: false }); // pagou: deixou de ser teste
+  if (novo.plano === 'Teste grátis') novo.plano = 'FILAZ';
   novo.pagamentos = [{ quando: new Date().toISOString(), dias, ate: nova, origem: origem || 'manual' }]
     .concat(atual.pagamentos || []).slice(0, 24);
   const K = 'billing::' + email;
@@ -10747,15 +10832,21 @@ async function _renovaPlano(email, dias, origem) {
 app.get('/admin/pagamento', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê isto.' });
   const c = _pagCfg();
-  res.json({ token: c.token || null, ciclo_dias: c.ciclo_dias || 30, log: c.log || [] });
+  const t = _testeCfg();
+  res.json({ token: c.token || null, ciclo_dias: c.ciclo_dias || 30, log: c.log || [], teste_ligado: t.ligado, teste_dias: t.dias, link_pagamento_padrao: c.link_pagamento_padrao || null, valor_padrao: c.valor_padrao || null });
 });
 app.put('/admin/pagamento', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode mexer nisto.' });
   const c = _pagCfg();
   if (req.body?.gerar_token) c.token = 'pag_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   if (req.body?.ciclo_dias !== undefined) c.ciclo_dias = Math.min(400, Math.max(1, parseInt(req.body.ciclo_dias, 10) || 30));
+  if (req.body?.teste_ligado !== undefined) c.teste_ligado = !!req.body.teste_ligado;
+  if (req.body?.teste_dias !== undefined) c.teste_dias = Math.min(90, Math.max(1, parseInt(req.body.teste_dias, 10) || 7));
+  if (req.body?.link_pagamento_padrao !== undefined) c.link_pagamento_padrao = /^https?:\/\//i.test(String(req.body.link_pagamento_padrao || '')) ? String(req.body.link_pagamento_padrao).slice(0, 400) : null;
+  if (req.body?.valor_padrao !== undefined) c.valor_padrao = String(req.body.valor_padrao || '').slice(0, 30) || null;
   await _pagSalva(c);
-  res.json({ ok: true, token: c.token || null, ciclo_dias: c.ciclo_dias || 30 });
+  const t = _testeCfg();
+  res.json({ ok: true, token: c.token || null, ciclo_dias: c.ciclo_dias || 30, teste_ligado: t.ligado, teste_dias: t.dias, link_pagamento_padrao: c.link_pagamento_padrao || null, valor_padrao: c.valor_padrao || null });
 });
 app.post('/admin/pagamento/registrar', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode registrar pagamento.' });
