@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 360;
+const SERVER_VER = 361;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1955,6 +1955,8 @@ app.post("/accounts", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' }); // adicionar número exige login
   const { name, phone_number_id } = req.body;
+  // 📏 limite de números do plano (reenviar o token de um número que já existe não conta)
+  try { const { data: _jaTem } = phone_number_id ? await supabase.from('accounts').select('id').eq('phone_number_id', String(phone_number_id)).eq('owner', req.owner).maybeSingle() : { data: null }; if (!_jaTem && await _numerosBarra(req, res)) return; } catch (_) {}
   let token = String(req.body.token || '').trim();
   // REAPROVEITAR O TOKEN DE OUTRA CONTA: a Meta mostra o token de usuário do
   // sistema uma única vez. Quem já colou um aqui não precisa gerar outro a cada
@@ -4143,8 +4145,10 @@ app.post("/contacts", async (req, res) => {
   if (cleanPhone.length < 10) return res.status(400).json({ error: "Número de celular inválido: informe DDD + número (ex.: 11 99999-0001)" });
   // UNIFICAÇÃO: se o número JÁ existe (com OU sem o nono dígito), reaproveita o
   // registro existente — o nome vira o último informado e o chat continua UM só
-  let phoneFinal = cleanPhone;
+  let phoneFinal = cleanPhone, jaExiste = false;
   try { phoneFinal = (await resolveExistingPhone(cleanPhone, req.owner)) || cleanPhone; } catch (_) {}
+  if (_limiteLeads(req.owner) != null) { try { const { data: ja } = await supabase.from('contacts').select('phone').eq('owner', req.owner).eq('phone', phoneFinal).maybeSingle(); jaExiste = !!ja; } catch (_) {} }
+  if (!jaExiste && await _leadsBarra(req, res, 1)) return; // 📏 limite de leads do plano (número que já existe não conta)
   const { data, error } = await supabase.from("contacts")
     .upsert({ phone: phoneFinal, name, account_id: account_id || null, owner: req.owner || null, last_message_at: new Date().toISOString() }, { onConflict: "owner,phone" })
     .select().single();
@@ -4171,6 +4175,14 @@ app.post("/contacts/import", async (req, res) => {
     })
     .filter(c => c.phone.length >= 10);
   if (!toInsert.length) return res.status(400).json({ error: "Nenhum contato válido encontrado" });
+  // 📏 limite de leads: só os números que ainda não existem contam como novos
+  if (_limiteLeads(req.owner) != null) {
+    const ja = new Set();
+    const fones = toInsert.map(c => c.phone);
+    for (let k = 0; k < fones.length; k += 500) { try { const { data } = await supabase.from('contacts').select('phone').eq('owner', req.owner).in('phone', fones.slice(k, k + 500)); (data || []).forEach(c => ja.add(String(c.phone))); } catch (_) {} }
+    const novos = toInsert.filter(c => !ja.has(c.phone)).length;
+    if (novos && await _leadsBarra(req, res, novos)) return;
+  }
   const { error } = await supabase.from("contacts").upsert(toInsert, { onConflict: "owner,phone" });
   if (error) return res.status(500).json({ error: error.message });
   const por_etapa = {}; for (const c of toInsert) { const k = c.stage_id ? String(c.stage_id) : 'sem'; por_etapa[k] = (por_etapa[k] || 0) + 1; }
@@ -4206,14 +4218,22 @@ async function _importarLeads(items, owner, opts) {
   const errors = [];
   const porEtapa = {}; const nomeEtapa = {}; // 📊 quantos leads foram para cada etapa (o app mostra enquanto importa)
   let existentes = null;
-  if (opts.soNovos) {
+  // 📏 limite de leads do plano: precisa saber quem já existe para contar só os novos
+  const limiteLeads = _limiteLeads(owner);
+  let restantes = null;
+  if (limiteLeads != null) { try { restantes = Math.max(0, limiteLeads - await _leadsUsados(owner)); } catch (_) { restantes = null; } }
+  let jaExistem = new Set();
+  if (opts.soNovos || restantes != null) {
     const fones = (items || []).map(it => String(it.phone || it.celular || it["Celular"] || "").replace(/\D/g, "")).filter(p => p.length >= 8);
     existentes = new Set();
     for (let k = 0; k < fones.length; k += 500) {
       const { data } = await supabase.from('contacts').select('phone').eq('owner', owner).in('phone', fones.slice(k, k + 500));
       for (const c of (data || [])) existentes.add(c.phone);
     }
+    jaExistem = existentes;
+    if (!opts.soNovos) existentes = null;
   }
+  let barradosPorLimite = 0;
   for (const it of (items || [])) {
     // remove um "=" no início (marcador de expressão do n8n que às vezes vaza como texto)
     const name  = (String(it.name || it.title || it["Lead Titulo"] || "").replace(/^=+\s*/, "").trim()) || "Lead";
@@ -4224,6 +4244,10 @@ async function _importarLeads(items, owner, opts) {
     if (onProg) { try { onProg({ feitos: _idx, importados: imported, pulados, erros: errors.length, por_etapa: Object.assign({}, porEtapa) }); } catch (_) {} }
     if (phone.length < 8) { errors.push({ phone, error: "telefone inválido" }); continue; }
     if (existentes && existentes.has(phone)) { pulados++; continue; }
+    if (restantes != null && !jaExistem.has(phone)) {
+      if (restantes <= 0) { barradosPorLimite++; if (barradosPorLimite === 1) errors.push({ phone, error: 'limite de ' + _fmtN(limiteLeads) + ' leads do plano atingido — os demais novos não foram cadastrados' }); continue; }
+      restantes--; jaExistem.add(phone);
+    }
 
     let stage_id = null;
     if (extId) {
@@ -4242,7 +4266,7 @@ async function _importarLeads(items, owner, opts) {
     const { error: e } = await supabase.from("contacts").upsert(row, { onConflict: "owner,phone" });
     if (e) errors.push({ phone, error: e.message }); else { imported++; const k = stage_id ? (nomeEtapa[String(stage_id)] || String(stage_id)) : 'sem etapa'; porEtapa[k] = (porEtapa[k] || 0) + 1; }
   }
-  return { imported, atualizados, pulados, errors, por_etapa: porEtapa };
+  return { imported, atualizados, pulados, errors, por_etapa: porEtapa, barrados_por_limite: barradosPorLimite };
 }
 
 app.post("/import/lead", async (req, res) => {
@@ -10117,7 +10141,8 @@ app.get('/meu-acesso', async (req, res) => {
     email: req.usuario || req.owner, dono: req.owner, papel: _papelDe(req),
     fornecedor: _ehDono(req), plano: _planoInfo(req.owner),
     liberado: _temLiberacao(req), portaria: l.ligado,
-    teste_gratis: _testeGratisInfo(req)
+    teste_gratis: _testeGratisInfo(req),
+    leads: await _leadsInfo(req.owner)
   });
 });
 // ═══════════════════════════════════════════════════════════════════
@@ -10212,7 +10237,7 @@ function _planoInfo(owner) {
   return {
     plano: p.plano || 'FILAZ', validade: val, validade_br: _brDia(val), dias_restantes: dias, teste,
     vencido, bloqueado, motivo, tolerancia_dias: tolerancia,
-    limite_numeros: p.limite_numeros || null, limite_msgs_mes: p.limite_msgs_mes || null,
+    limite_numeros: p.limite_numeros || null, limite_msgs_mes: p.limite_msgs_mes || null, limite_leads: _limiteLeads(owner),
     contato: p.contato || null, obs: p.obs || null, sem_plano: !val && !p.plano,
     link_pagamento: p.link_pagamento || padrao.link_pagamento_padrao || null, valor: p.valor || padrao.valor_padrao || null,
     ciclo_dias: p.ciclo_dias || null, pagamentos: p.pagamentos || []
@@ -10230,6 +10255,62 @@ function _planoBarra(req, res) {
   return true;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 📏 LIMITES DO PLANO — leads ativos e números de WhatsApp
+// ═══════════════════════════════════════════════════════════════════
+// Leads: o plano vale "até 10 mil leads ativos" (lead apagado deixa de contar). Trava só
+// o CADASTRO deliberado (manual, importação, planilha, n8n) — mensagem de lead novo que
+// chega pelo WhatsApp NUNCA é perdida. Números: o teste grátis permite 1; pago, ilimitado.
+// A conta fornecedora (OWNER_LEGADO) não tem limite.
+const _LEADS_LIMITE_PADRAO = 10000;
+function _limiteLeads(owner) {
+  if (!owner || String(owner).toLowerCase() === OWNER_LEGADO) return null;
+  const p = _planoBruto(owner) || {};
+  if (p.limite_leads === 0) return null; // 0 = sem limite (você decide no painel)
+  return Number(p.limite_leads) > 0 ? Number(p.limite_leads) : _LEADS_LIMITE_PADRAO;
+}
+async function _leadsUsados(owner) {
+  if (!supabase || !owner) return 0;
+  return _comCache('nleads|' + owner, String(_tabVer.contacts), 5 * 60000, async () => {
+    const r = await supabase.from('contacts').select('phone', { count: 'exact', head: true }).eq('owner', owner);
+    if (r.error) throw new Error(r.error.message);
+    return Number(r.count) || 0;
+  });
+}
+async function _leadsInfo(owner) {
+  const limite = _limiteLeads(owner);
+  let usados = 0; try { usados = await _leadsUsados(owner); } catch (_) {}
+  const restante = limite == null ? null : Math.max(0, limite - usados);
+  return { usados, limite, restante, cheio: limite != null && usados >= limite, perto: limite != null && usados >= limite * 0.9 };
+}
+const _fmtN = n => Number(n || 0).toLocaleString('pt-BR');
+function _leadsMsg(info, quantos) {
+  return (quantos > 1 ? 'Não cabem ' + _fmtN(quantos) + ' leads novos: ' : '') + 'seu plano permite até ' + _fmtN(info.limite) + ' leads ativos e você já tem ' + _fmtN(info.usados)
+    + (info.restante > 0 ? ' (cabem mais ' + _fmtN(info.restante) + ')' : '') + '. Apague leads antigos (eles ficam 30 dias na lixeira) para cadastrar novos.';
+}
+// Barra o cadastro de "quantos" leads NOVOS. Devolve true se barrou.
+async function _leadsBarra(req, res, quantos) {
+  const info = await _leadsInfo(req.owner);
+  if (info.limite == null || (quantos || 1) <= info.restante) return false;
+  res.status(402).json({ error: _leadsMsg(info, quantos || 1), limite_leads: true, leads: info });
+  return true;
+}
+function _limiteNumeros(owner) {
+  if (!owner || String(owner).toLowerCase() === OWNER_LEGADO) return null;
+  const p = _planoBruto(owner) || {};
+  return Number(p.limite_numeros) > 0 ? Number(p.limite_numeros) : null;
+}
+// Barra a conexão de um número NOVO quando o plano já está no limite. Devolve true se barrou.
+async function _numerosBarra(req, res) {
+  const lim = _limiteNumeros(req.owner);
+  if (lim == null || !supabase) return false;
+  let n = 0;
+  try { const r = await supabase.from('accounts').select('id', { count: 'exact', head: true }).eq('owner', req.owner); n = Number(r.count) || 0; } catch (_) { return false; }
+  if (n < lim) return false;
+  const i = _planoInfo(req.owner);
+  res.status(402).json({ error: 'Seu plano' + (i.teste ? ' de teste' : '') + ' permite ' + lim + ' número(s) de WhatsApp. ' + (i.teste ? 'Assine para conectar mais números.' : 'Fale com quem fornece o FILAZ para liberar mais.'), limite_numeros: true });
+  return true;
+}
 app.put('/billing', async (req, res) => {
   if (!_ehDono(req)) {
     if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
@@ -10245,6 +10326,7 @@ app.put('/billing', async (req, res) => {
     suspenso: b.suspenso !== undefined ? !!b.suspenso : !!atual.suspenso,
     limite_numeros: b.limite_numeros !== undefined ? (parseInt(b.limite_numeros, 10) || null) : (atual.limite_numeros || null),
     limite_msgs_mes: b.limite_msgs_mes !== undefined ? (parseInt(b.limite_msgs_mes, 10) || null) : (atual.limite_msgs_mes || null),
+    limite_leads: b.limite_leads !== undefined ? (b.limite_leads === 0 || b.limite_leads === '0' ? 0 : (parseInt(b.limite_leads, 10) || null)) : (atual.limite_leads == null ? null : atual.limite_leads),
     contato: b.contato !== undefined ? String(b.contato || '').slice(0, 120) : (atual.contato || null),
     obs: b.obs !== undefined ? String(b.obs || '').slice(0, 300) : (atual.obs || null),
     link_pagamento: b.link_pagamento !== undefined ? (/^https?:\/\//i.test(String(b.link_pagamento || '')) ? String(b.link_pagamento).slice(0, 400) : null) : (atual.link_pagamento || null),
@@ -12386,6 +12468,7 @@ app.post('/evolution/save-account', async (req, res) => {
   const { data: exist } = await supabase.from('accounts').select('name, owner').eq('phone_number_id', instance).maybeSingle();
   if (exist && exist.owner && String(exist.owner).toLowerCase() !== String(req.owner).toLowerCase())
     return res.status(403).json({ error: 'Este número pertence a outra conta.' });
+  if (!exist && await _numerosBarra(req, res)) return; // 📏 limite de números do plano (reconectar o mesmo não conta)
   const name = exist?.name || (phone ? `WhatsApp ${phone}` : `WhatsApp QR (${instance})`);
   const { data, error } = await supabase.from('accounts')
     .upsert({ name, type: 'evolution', evolution_instance: instance, phone_display: phone || null, phone_number_id: instance, token: '', owner: req.owner || null }, { onConflict: 'phone_number_id' })
