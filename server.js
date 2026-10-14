@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 362;
+const SERVER_VER = 363;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5278,7 +5278,8 @@ app.post("/notes", async (req, res) => {
   const { data, error } = await supabase.from("messages").insert({
     phone: String(phone), content: txt || (mediaMime && mediaMime.startsWith('image/') ? '[Foto]' : '[Arquivo]'),
     type: 'note', direction: 'outbound',
-    timestamp: new Date().toISOString(), account_id: account_id || null,
+    // foto das Anotações não pertence a número nenhum (o número dela confundia o bot)
+    timestamp: new Date().toISOString(), account_id: (String(txt || '').trim() === '[Foto das anotações]') ? null : (account_id || null),
     owner: req.owner || null, status: null,
     media_id: mediaId, media_mime_type: mediaMime,
   }).select().single();
@@ -6777,8 +6778,13 @@ async function _acctPadraoDoLead(phone, owner) {
   if (!supabase) return null;
   const OW = owner || ' ';
   try {
+    // ⚠️ só MENSAGEM de verdade (que saiu ou chegou por um número) decide o número.
+    // Nota interna e FOTO DAS ANOTAÇÕES ficavam guardadas com o número que estava no
+    // "Enviar de" na hora — e o bot via a foto como "última mensagem" e mandava pelo
+    // número errado (Leonardo: 89 em vez de 101; Barbara, Cevola e Will também).
     const { data: ult } = await supabase.from('messages').select('account_id')
       .eq('phone', phone).eq('owner', OW).not('account_id', 'is', null)
+      .or('type.is.null,type.neq.note')
       .order('timestamp', { ascending: false }).limit(1).maybeSingle();
     if (ult?.account_id) return ult.account_id;
   } catch (_) {}
