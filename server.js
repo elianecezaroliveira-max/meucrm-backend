@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 363;
+const SERVER_VER = 364;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7495,10 +7495,12 @@ async function processNode(run, depth=0) {
         try {
           _cronoProprio.delete(String(runId));
           if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
-          // Atômico: só retoma se AINDA estiver pausada (evita corrida com o ciclo de 30s)
+          // Atômico: só retoma se AINDA estiver pausada E ninguém pegou a espera. O ciclo de
+          // 30s "pega" zerando o pause_until (e mantém 'paused'): sem conferir o pause_until,
+          // os dois seguiam e o passo seguinte saía 2x (Pedro recebeu a foto das Anotações duas vezes).
           const { data: took } = await supabase.from('bot_runs')
             .update({ status:'running', pause_until:null, updated_at:new Date().toISOString() })
-            .eq('id', runId).eq('status', 'paused').select('id');
+            .eq('id', runId).eq('status', 'paused').not('pause_until', 'is', null).select('id');
           if (!took || !took.length) return;
           const nxt = _nxtPre || await getNextNodeId(nodeId, null); // já descoberto durante a espera
           if (nxt) {
@@ -7955,6 +7957,9 @@ setInterval(async () => {
       continue;
     }
     if (_cronoMarcado[run.id]) { clearTimeout(_cronoMarcado[run.id]); delete _cronoMarcado[run.id]; }
+    // Esta espera já tem cronômetro próprio aqui: ele retoma no segundo exato. O ciclo só
+    // socorre se ele se atrasou mais de 1 minuto (antes os dois retomavam juntos → passo 2x).
+    if (_cronoProprio.has(String(run.id)) && _falta > -60000) continue;
     await _retomaUma(run);
   }
   } catch (e) { console.error('retomada de bots:', e.message); }
@@ -12768,4 +12773,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
