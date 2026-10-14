@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 364;
+const SERVER_VER = 365;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1301,6 +1301,9 @@ app.post("/webhook", async (req, res) => {
           if (message.context && (message.context.forwarded || message.context.frequently_forwarded) && message.id)
             await supabase.from('messages').update({ forwarded: true }).eq('wamid', message.id);
         } catch (_) {}
+        // 💬 respondeu citando uma mensagem (inclusive o botão de um modelo)
+        if (!msgErr && message.context && message.context.id && message.id)
+          await _guardaCitacaoRecebida(message.id, from, ownerEmail, message.context.id, null, null);
 
         // (a notificação push já saiu lá em cima, antes das gravações)
         // Processa reply de bot ativo (texto OU clique em botão/lista)
@@ -2183,6 +2186,41 @@ async function _isSelfSend(to, account_id) {
 // mas o WhatsApp precisa do id DELE (wamid) para desenhar a citação no celular do
 // cliente. Aqui trocamos um pelo outro. Se a mensagem citada for antiga demais e
 // não tiver wamid, o envio segue normal — só sem a citação (nunca falha por isso).
+// 💬 O LEAD respondeu CITANDO uma mensagem (arrastou para o lado no WhatsApp): guarda a citação
+// na mensagem recebida para a bolha mostrar o quadrinho "Você / O que achou da proposta?", igual
+// ao WhatsApp. Procura a mensagem citada pelo wamid; se não achar (mensagem antiga, de fora do
+// FILAZ), usa o texto que veio junto (QR). Nunca quebra o recebimento.
+async function _guardaCitacaoRecebida(wamidNovo, phone, owner, wamidCitado, textoVeio, citadaEhMinha) {
+  try {
+    if (!supabase || !wamidNovo || !wamidCitado) return;
+    let q = supabase.from('messages').select('id, content, direction, type').eq('wamid', String(wamidCitado));
+    q = owner ? q.eq('owner', owner) : q;
+    const { data: cit } = await q.limit(1).maybeSingle();
+    let quoted_id = null, quoted_content = null, quoted_direction = null;
+    if (cit) { quoted_id = cit.id; quoted_content = String(cit.content || '').slice(0, 500); quoted_direction = cit.direction === 'outbound' ? 'outbound' : 'inbound'; }
+    else if (textoVeio) { quoted_content = String(textoVeio).slice(0, 500); quoted_direction = citadaEhMinha == null ? 'outbound' : (citadaEhMinha ? 'outbound' : 'inbound'); }
+    if (!quoted_content) return;
+    await supabase.from('messages').update({ quoted_id, quoted_content, quoted_direction }).eq('wamid', String(wamidNovo)).in('phone', phoneVariants(phone));
+    try { _marcaSujo('messages', [phone]); } catch (_) {}
+  } catch (e) { console.error('citação recebida:', e.message); }
+}
+// texto da mensagem citada que vem junto no QR (quotedMessage do Baileys)
+function _textoCitadoQR(qm) {
+  try {
+    if (!qm) return '';
+    if (qm.conversation) return qm.conversation;
+    if (qm.extendedTextMessage && qm.extendedTextMessage.text) return qm.extendedTextMessage.text;
+    if (qm.imageMessage) return qm.imageMessage.caption ? '[Imagem: ' + qm.imageMessage.caption + ']' : '[Imagem]';
+    if (qm.videoMessage) return qm.videoMessage.caption ? '[Vídeo: ' + qm.videoMessage.caption + ']' : '[Vídeo]';
+    if (qm.audioMessage) return '[Áudio]';
+    if (qm.documentMessage) return '[Documento: ' + (qm.documentMessage.fileName || 'arquivo') + ']';
+    if (qm.stickerMessage) return '[Figurinha]';
+    const tpl = qm.templateMessage && (qm.templateMessage.hydratedTemplate || qm.templateMessage.hydratedFourRowTemplate);
+    if (tpl && tpl.hydratedContentText) return tpl.hydratedContentText;
+    if (qm.buttonsMessage && qm.buttonsMessage.contentText) return qm.buttonsMessage.contentText;
+  } catch (_) {}
+  return '';
+}
 async function _citacaoWamid(quotedId, owner, phone) {
   try {
     if (!supabase || !quotedId) return null;
@@ -12734,6 +12772,11 @@ app.post('/evolution-webhook', async (req, res) => {
           const _ctxI = (Object.values(msg).find(v => v && v.contextInfo) || {}).contextInfo;
           if (_ctxI && (_ctxI.isForwarded || _ctxI.forwardingScore) && wamid)
             await supabase.from('messages').update({ forwarded: true }).eq('wamid', wamid).eq('phone', phone);
+          // 💬 respondeu citando uma mensagem (o lead, ou você pelo celular)
+          if (!mErr && _ctxI && _ctxI.stanzaId && wamid) {
+            const _eu = (() => { try { const me = String((_waSocks[instanceName] && _waSocks[instanceName].user && _waSocks[instanceName].user.id) || '').split(':')[0].split('@')[0]; const pt = String(_ctxI.participant || '').split(':')[0].split('@')[0]; return me && pt ? me === pt : (pt ? false : null); } catch (_) { return null; } })();
+            await _guardaCitacaoRecebida(wamid, phone, ownerEmail, _ctxI.stanzaId, _textoCitadoQR(_ctxI.quotedMessage), _eu);
+          }
         } catch (_) {}
 
         // Notificação push só para mensagens RECEBIDAS (e não silenciadas 🔇)
