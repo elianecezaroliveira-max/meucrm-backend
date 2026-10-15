@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 365;
+const SERVER_VER = 366;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2327,6 +2327,7 @@ app.post("/send", async (req, res) => {
   if (typeof message === 'string' && message.length > 4096) return res.status(400).json({ error: 'Mensagem com ' + message.length + ' caracteres — o WhatsApp aceita até 4.096. Divida em duas mensagens.' });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
   if (await _isSelfSend(to, account_id)) return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta — envio para si mesmo não é permitido.' });
+  if (await _estaBloqueado(to, req.owner)) return res.status(409).json({ error: 'Você bloqueou este contato. Desbloqueie para enviar mensagem.', bloqueado: true });
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
 
   let phoneNumberId, token, evolutionInstance = null, accountType = 'cloudapi';
@@ -2697,6 +2698,7 @@ app.post("/send-media", async (req, res) => {
   const qId = req.body.quoted_id || null;
   const qTxt = req.body.quoted_content || null;
   const qDir = req.body.quoted_direction || null;
+  if (to && await _estaBloqueado(to, req.owner)) return res.status(409).json({ error: 'Você bloqueou este contato. Desbloqueie para enviar.', bloqueado: true });
   if (!to || !fileBase64 || !fileName || !mimeType)
     return res.status(400).json({ error: "Informe to, fileBase64, fileName e mimeType" });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
@@ -6000,7 +6002,8 @@ app.get("/contacts", async (req, res) => {
   };
   const chave = 'contacts|' + (req.owner || ' ') + '|' + (account_id || '') + '|' + (with_messages ? 1 : 0);
   const buscaTudo = async (extra) => {
-    let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted", extra);
+    let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted, archived, blocked", extra);
+    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted", extra)); } // fallback sem archived/blocked
     if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned", extra)); } // fallback sem muted
     if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status", extra)); } // fallback sem pinned
     if (error) { ({ data, error } = await build(COLS_BASE + ", created_at", extra)); } // fallback sem last_message_status
@@ -6604,10 +6607,80 @@ app.put('/contacts/:phone/unread', async (req, res) => {
 // Conversa silenciada? (consulta protegida — funciona mesmo sem a coluna no banco)
 async function _isContactMuted(phone, owner) {
   try {
-    const { data } = await supabase.from('contacts').select('muted').eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+    // (chamada a cada mensagem RECEBIDA: aproveita a mesma leitura para desarquivar a conversa —
+    //  mensagem nova do lead tira a conversa de "Arquivadas", igual ao WhatsApp)
+    let { data, error } = await supabase.from('contacts').select('muted, archived').eq('phone', phone).eq('owner', owner || ' ').maybeSingle();
+    if (error) ({ data } = await supabase.from('contacts').select('muted').eq('phone', phone).eq('owner', owner || ' ').maybeSingle());
+    if (data && data.archived) { try { await supabase.from('contacts').update({ archived: false }).eq('phone', phone).eq('owner', owner || ' '); } catch (_) {} }
     return !!(data && data.muted);
   } catch (_) { return false; }
 }
+// ═══════════════ 🗂️ ARQUIVAR CONVERSA ═══════════════
+app.put('/contacts/:phone/archive', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { error } = await supabase.from('contacts').update({ archived: !!(req.body && req.body.archived) })
+    .eq('phone', _decSeguro(req.params.phone)).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: /archived/.test(error.message) ? 'Falta um passo no banco: rode em Configurações ▸ Diagnóstico o SQL de "arquivar conversa".' : error.message });
+  res.json({ success: true });
+});
+// ═══════════════ ⛔ BLOQUEAR CONTATO ═══════════════
+// QR Code: bloqueia no próprio WhatsApp (o lead não consegue mais mandar mensagem nem ligar).
+// API oficial: usa o bloqueio da Meta (só vale para quem falou com você nas últimas 24 h).
+// O FILAZ guarda a marca e não deixa enviar para quem está bloqueado (nem por bot).
+const _bloqueados = new Map(); // dono → Set de telefones (carregado na primeira consulta)
+async function _bloqueadosDe(owner) {
+  const k = String(owner || ' ');
+  if (_bloqueados.has(k)) return _bloqueados.get(k);
+  const set = new Set();
+  try { const { data, error } = await supabase.from('contacts').select('phone').eq('owner', k).eq('blocked', true).limit(5000); if (!error) (data || []).forEach(c => set.add(String(c.phone))); } catch (_) {}
+  _bloqueados.set(k, set);
+  return set;
+}
+async function _estaBloqueado(phone, owner) {
+  if (!supabase || !phone) return false;
+  const set = await _bloqueadosDe(owner);
+  try { return phoneVariants(String(phone)).some(v => set.has(String(v))); } catch (_) { return set.has(String(phone)); }
+}
+app.put('/contacts/:phone/block', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const phone = _decSeguro(req.params.phone).replace(/\D/g, '');
+  const bloquear = !!(req.body && req.body.blocked);
+  const { data: ct } = await supabase.from('contacts').select('phone, account_id').eq('phone', phone).eq('owner', req.owner || ' ').maybeSingle();
+  if (!ct) return res.status(404).json({ error: 'Contato não encontrado' });
+  const acctId = (req.body && req.body.account_id) || ct.account_id;
+  const { data: acct } = acctId ? await supabase.from('accounts').select('id, evolution_instance, phone_number_id, token').eq('id', acctId).eq('owner', req.owner || ' ').maybeSingle() : { data: null };
+  let noWhatsApp = false, aviso = null;
+  try {
+    if (acct && acct.evolution_instance) {
+      const sock = _waSocks[acct.evolution_instance];
+      if (!sock || _waState[acct.evolution_instance] !== 'open') throw new Error('O número QR desta conversa está desconectado — conecte e tente de novo.');
+      const jid = await waResolveJid(sock, phone);
+      await sock.updateBlockStatus(jid, bloquear ? 'block' : 'unblock');
+      noWhatsApp = true;
+    } else if (acct && acct.phone_number_id && acct.token) {
+      const url = `https://graph.facebook.com/v23.0/${acct.phone_number_id}/block_users`;
+      const corpo = { messaging_product: 'whatsapp', block_users: [{ user: phone }] };
+      const h = { headers: { Authorization: 'Bearer ' + acct.token, 'Content-Type': 'application/json' } };
+      try {
+        if (bloquear) await axios.post(url, corpo, h); else await axios.delete(url, Object.assign({ data: corpo }, h));
+        noWhatsApp = true;
+      } catch (e) {
+        const m = String(e.response?.data?.error?.message || e.message || '');
+        aviso = bloquear ? 'A Meta não deixou bloquear no WhatsApp (ela só permite bloquear quem te mandou mensagem nas últimas 24 h). No FILAZ ficou bloqueado: nada é enviado para ele.' : null;
+        console.error('Bloqueio na Meta:', m);
+      }
+    }
+  } catch (e) { return res.status(400).json({ error: e.message }); }
+  const { error } = await supabase.from('contacts').update({ blocked: bloquear }).eq('phone', phone).eq('owner', req.owner || ' ');
+  if (error) return res.status(500).json({ error: /blocked/.test(error.message) ? 'Falta um passo no banco: rode em Configurações ▸ Diagnóstico o SQL de "bloquear contato".' : error.message });
+  const set = await _bloqueadosDe(req.owner);
+  phoneVariants(phone).forEach(v => { if (bloquear) set.add(String(v)); else set.delete(String(v)); });
+  if (bloquear) { try { stopBotRunsForPhone(phone, req.owner); } catch (_) {} }
+  _audita(req, bloquear ? 'Contato bloqueado' : 'Contato desbloqueado', phone);
+  res.json({ success: true, no_whatsapp: noWhatsApp, aviso });
+});
 
 // 📌 Fixar/desafixar conversa no topo
 app.put('/contacts/:phone/pin', async (req, res) => {
@@ -6898,6 +6971,7 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner, midi
 
 async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, midiaPath) {
   let acct, usedAcctId;
+  if (await _estaBloqueado(phone, owner)) { await _recordBotFail(phone, text || '[Imagem]', 'Contato bloqueado — o bot não envia para ele.', nodeAccountId || accountId || null, owner, 'text'); return null; }
   if (nodeAccountId) {
     // Nó com número CONFIGURADO: obedece exatamente — sem troca automática
     acct = await botGetAcctStrict(nodeAccountId);
@@ -11340,6 +11414,9 @@ const _ESQUEMA = [
   { tabela: 'messages', coluna: 'edited', para: 'o selo "editada"', sql: 'alter table messages add column if not exists edited boolean default false;' },
   { tabela: 'messages', coluna: 'waveform', para: 'o desenho do áudio', sql: 'alter table messages add column if not exists waveform text;' },
   { tabela: 'messages', coluna: 'forwarded', para: 'a etiqueta "Encaminhada"', sql: 'alter table messages add column if not exists forwarded boolean default false;' },
+  { tabela: 'messages', coluna: 'apagada_em', para: 'mostrar quando o lead apagou uma mensagem', sql: 'alter table messages add column if not exists apagada_em timestamptz;' },
+  { tabela: 'contacts', coluna: 'archived', para: 'arquivar conversa', sql: 'alter table contacts add column if not exists archived boolean default false;' },
+  { tabela: 'contacts', coluna: 'blocked', para: 'bloquear contato', sql: 'alter table contacts add column if not exists blocked boolean default false;' },
   { tabela: 'tasks', coluna: 'created_at', para: 'a data de criação da tarefa', sql: 'alter table tasks add column if not exists created_at timestamptz default now();' },
   { tabela: 'tasks', coluna: 'tipo', para: 'o tipo da tarefa (Reunião, Acompanhar…)', sql: 'alter table tasks add column if not exists tipo text;' },
   { rpc: 'rr_next', para: 'o rodízio de números não repetir com dois leads ao mesmo tempo', sql: "create or replace function rr_next(p_key text) returns bigint language plpgsql as $$\ndeclare cur bigint;\nbegin\n  insert into settings(key, value, updated_at) values (p_key, '1', now())\n    on conflict (key) do update set value = (coalesce(nullif(settings.value, '')::bigint, 0) + 1)::text, updated_at = now()\n    returning (settings.value::bigint - 1) into cur;\n  return cur;\nend;\n$$;" },
@@ -12006,6 +12083,7 @@ async function waStart(instanceName) {
   });
 
   // Mensagens recebidas → reaproveita TODO o fluxo existente do /evolution-webhook
+  sock.ev.on('call', async (calls) => { for (const c of (calls || [])) { try { await _waLigacaoEvento(sock, instanceName, c); } catch (e) { console.error('ligação:', e.message); } } });
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify' && type !== 'append') return;
     for (const m of messages || []) {
@@ -12030,6 +12108,12 @@ async function waStart(instanceName) {
       if (_pm && _pm.editedMessage && _pm.key?.id) {
         const novoTxt = _qrTextoEditado(_pm.editedMessage);
         if (novoTxt) await _qrAplicaEdicao(_pm.key.id, novoTxt);
+        continue;
+      }
+      // 🚫 "Apagar para todos" (pelo lead, ou por você no celular): o FILAZ MANTÉM o texto e marca
+      // a hora em que foi apagada — a bolha mostra "Apagada pelo lead" (você não perde a prova)
+      if (_pm && (_pm.type === 0 || _pm.type === 'REVOKE') && _pm.key && _pm.key.id) {
+        try { await _qrMarcaApagada(instanceName, _pm.key.id); } catch (e) { console.error('mensagem apagada (QR):', e.message); }
         continue;
       }
       // Outras mensagens de protocolo (controle interno do WhatsApp) não viram bolha
@@ -12164,6 +12248,64 @@ async function waStart(instanceName) {
   return sock;
 }
 
+// 🚫 Marca a mensagem como apagada (sem apagar o texto). Se era a última da conversa, a prévia
+// da lista vira "🚫 Mensagem apagada" (como no WhatsApp).
+async function _qrMarcaApagada(instanceName, wamid) {
+  if (!supabase || !wamid) return;
+  let owner = null;
+  try { const { data: acc } = await supabase.from('accounts').select('owner').eq('evolution_instance', instanceName).maybeSingle(); owner = acc && acc.owner; } catch (_) {}
+  let q = supabase.from('messages').select('id, phone, owner, timestamp, direction').eq('wamid', String(wamid));
+  if (owner) q = q.eq('owner', owner);
+  const { data: m } = await q.limit(1).maybeSingle();
+  if (!m) return;
+  const agora = new Date().toISOString();
+  const { error } = await supabase.from('messages').update({ apagada_em: agora }).eq('id', m.id);
+  if (error) { console.error('apagada_em:', error.message); return; }
+  try {
+    const { data: c } = await supabase.from('contacts').select('last_message_at').eq('phone', m.phone).eq('owner', m.owner || ' ').maybeSingle();
+    if (c && c.last_message_at && Math.abs(Date.parse(c.last_message_at) - Date.parse(m.timestamp)) < 5000)
+      await supabase.from('contacts').update({ last_message_preview: m.direction === 'outbound' ? '🚫 Você apagou esta mensagem' : '🚫 Mensagem apagada' }).eq('phone', m.phone).eq('owner', m.owner || ' ');
+  } catch (_) {}
+  try { _marcaSujo('messages', [m.phone]); } catch (_) {}
+  console.log('🚫 Mensagem apagada no WhatsApp:', wamid);
+}
+// 📞 LIGAÇÕES (QR): o WhatsApp avisa a chamada (offer → accept/reject/timeout/terminate). Quando
+// termina, vira uma bolha "📞 Ligação de voz perdida" (ou atendida, com a duração) na conversa,
+// conta como não lida e manda aviso no celular — igual ao WhatsApp.
+const _waLigacoes = new Map(); // id da chamada → { aceitaEm, feita }
+async function _waLigacaoEvento(sock, instanceName, c) {
+  if (!c || !c.id || c.isGroup) return;
+  let st = _waLigacoes.get(c.id);
+  if (!st) { st = { t0: Date.now(), aceitaEm: null, feita: false, from: c.from, video: !!c.isVideo }; _waLigacoes.set(c.id, st); if (_waLigacoes.size > 300) { const k = _waLigacoes.keys().next().value; _waLigacoes.delete(k); } }
+  if (c.from) st.from = c.from;
+  if (c.isVideo) st.video = true;
+  const status = String(c.status || '');
+  if (status === 'accept') { st.aceitaEm = Date.now(); return; }
+  if (!['timeout', 'reject', 'terminate'].includes(status) || st.feita) return;
+  st.feita = true;
+  const tipo = st.video ? 'vídeo' : 'voz';
+  let texto;
+  if (st.aceitaEm) {
+    const seg = Math.max(1, Math.round((Date.now() - st.aceitaEm) / 1000));
+    texto = `📞 Ligação de ${tipo} · ${Math.floor(seg / 60)}:${String(seg % 60).padStart(2, '0')}`;
+  } else texto = `📞 Ligação de ${tipo} perdida`;
+  // número real (a chamada pode vir pelo id oculto @lid)
+  const de = String(st.from || '');
+  let realPn = null;
+  if (de.endsWith('@lid')) { try { realPn = await sock.signalRepository?.lidMapping?.getPNForLID?.(de) || null; } catch (_) {} }
+  try {
+    await axios.post(`http://127.0.0.1:${PORT}/evolution-webhook`, {
+      event: 'messages.upsert', instance: instanceName,
+      data: {
+        key: { id: 'LIG-' + c.id, remoteJid: de, fromMe: false },
+        senderPn: realPn, lidJid: de.endsWith('@lid') ? de : null, pushName: '',
+        messageTimestamp: Math.floor((c.date ? new Date(c.date).getTime() : Date.now()) / 1000),
+        message: { conversation: texto },
+        _ligacao: { perdida: !st.aceitaEm, video: st.video, texto },
+      },
+    }, { timeout: 10000 });
+  } catch (e) { console.error('ligação → webhook interno:', e.message); }
+}
 // Descobre o "endereço" (JID) REAL do número no WhatsApp — resolve o nono dígito.
 // Enviar para a variante errada não dá erro: a mensagem simplesmente não chega.
 async function waResolveJid(sock, to) {
@@ -12668,6 +12810,7 @@ app.post('/evolution-webhook', async (req, res) => {
         type = 'text';
       }
 
+      if (data && data._ligacao && data._ligacao.texto) { content = String(data._ligacao.texto); type = 'call'; } // 📞 ligação (não é texto: bot e IA não respondem)
       if (content === '[Mensagem enviada]' || content === '[Mensagem recebida]') {
         console.log('ℹ️ Mensagem de tipo não reconhecido (QR):', _reais.join(','), fromMe ? 'minha' : 'do lead', 'para', phone);
         content = (fromMe ? '[Mensagem enviada pelo celular' : '[Mensagem recebida') + ' de um tipo que o FILAZ ainda não mostra (' + _reais[0] + ') — veja no aplicativo do WhatsApp]';
@@ -12816,4 +12959,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
