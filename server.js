@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 366;
+const SERVER_VER = 367;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -2316,6 +2316,33 @@ function _respostaDeEnvioFalhou(res, err, rotulo) {
   if (meta && typeof meta === 'object') return res.status(422).json({ error: _metaMotivo(meta), detail: err.response.data, meta_code: meta.code });
   res.status(500).json({ error: rotulo, detail: err.response && err.response.data });
 }
+// ═══════════ ✍️ ASSINATURA: "*Hillary Araujo*:" no começo da mensagem ═══════════
+// Opcional por conta (Configurações ▸ Equipe). Vale para o que a PESSOA escreve no chat (texto e
+// legenda de foto/arquivo) — nunca para bot, modelo da Meta, disparo ou resposta automática.
+// A mensagem fica gravada como saiu (com a assinatura), igual o lead vê no WhatsApp.
+function _assinaturaCfg(owner) { try { const v = JSON.parse(_cfg('assinatura', owner) || '{}') || {}; return { ligado: !!v.ligado, nomes: v.nomes || {} }; } catch (_) { return { ligado: false, nomes: {} }; } }
+function _nomeDoEmail(email) {
+  const e = String(email || '').split('@')[0].replace(/[._+-]+/g, ' ').replace(/\d+/g, ' ').trim();
+  return e.replace(/\s+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+function _assinaturaDe(req) {
+  try {
+    if (req.body && req.body.sem_assinatura) return '';
+    const cfg = _assinaturaCfg(req.owner);
+    if (!cfg.ligado) return '';
+    const quem = String(req.usuario || req.owner || '').toLowerCase();
+    const nome = String(cfg.nomes[quem] || _nomeDoEmail(quem) || '').replace(/[*\n]/g, '').trim().slice(0, 60);
+    return nome ? '*' + nome + '*:\n' : '';
+  } catch (_) { return ''; }
+}
+// tira a assinatura do começo (a IA não aprende "*Hillary*:" como parte da resposta)
+function _semAssinatura(t) { return String(t == null ? '' : t).replace(/^\*[^*\n]{1,60}\*:[ \t]*\n/, ''); }
+app.get('/assinatura', (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const cfg = _assinaturaCfg(req.owner);
+  const quem = String(req.usuario || req.owner || '').toLowerCase();
+  res.json({ ligado: cfg.ligado, nomes: cfg.nomes, meu_nome: cfg.nomes[quem] || _nomeDoEmail(quem), eu: quem });
+});
 app.post("/send", async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   if (_planoBarra(req, res)) return;
@@ -2323,6 +2350,7 @@ app.post("/send", async (req, res) => {
   if (_rep) { const r = _rep.promessa ? await _rep.promessa : _rep; return res.status(r.status).json({ ...(r.body || {}), repetido: true }); }
   let { to, message, account_id, quoted_id, quoted_content, quoted_direction } = req.body;
   if (!to || !message) return res.status(400).json({ error: "Informe 'to' e 'message'" });
+  { const _ass = _assinaturaDe(req); if (_ass && typeof message === 'string') message = _ass + message; } // ✍️ assinatura (se a conta ligou)
   // o texto NUNCA é editado (ela pediu): acima do limite do WhatsApp, recusa com o motivo
   if (typeof message === 'string' && message.length > 4096) return res.status(400).json({ error: 'Mensagem com ' + message.length + ' caracteres — o WhatsApp aceita até 4.096. Divida em duas mensagens.' });
   to = await resolveExistingPhone(to, req.owner); // unifica com/sem nono dígito
@@ -2693,7 +2721,8 @@ app.post("/send-media", async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   if (_planoBarra(req, res)) return;
   let { to, account_id, fileBase64, fileName, mimeType } = req.body;
-  const mCaption = String(req.body.caption || '').trim();
+  let mCaption = String(req.body.caption || '').trim();
+  if (mCaption) { const _ass = _assinaturaDe(req); if (_ass) mCaption = _ass + mCaption; } // ✍️ assinatura na legenda
   // Responder com FOTO: a citação vem junto, do mesmo jeito que na mensagem de texto
   const qId = req.body.quoted_id || null;
   const qTxt = req.body.quoted_content || null;
@@ -8636,7 +8665,7 @@ function _iaConversaComDatas(msgs, recentes) {
 }
 // Tira o que identifica o lead antes de guardar na memória
 function _iaAnonima(txt, nomeLead) {
-  let t = String(txt || '');
+  let t = _semAssinatura(String(txt || ''));
   const primeiro = String(nomeLead || '').trim().split(/\s+/)[0];
   if (primeiro && primeiro.length > 2) t = t.replace(new RegExp(primeiro.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '{nome}');
   t = t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '{email}');
@@ -8913,7 +8942,8 @@ async function _iaSugere(owner, phone, forcar) {
     .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(400);
   if (erroMsgs) return { mensagens: [], motivo: 'banco: ' + erroMsgs.message };
   // 📜 conversa INTEIRA: as 40 últimas vão por inteiro; o que veio antes vai resumido (com datas)
-  const todas = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 300).reverse();
+  const todas = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 300).reverse()
+    .map(m => (m.direction === 'outbound' && typeof m.content === 'string' && m.content.charAt(0) === '*') ? Object.assign({}, m, { content: _semAssinatura(m.content) }) : m); // ✍️ sem a assinatura
   const RECENTES = 40;
   const msgs = todas.slice(Math.max(0, todas.length - RECENTES));
   const antigas = todas.slice(0, Math.max(0, todas.length - RECENTES));
@@ -10169,6 +10199,7 @@ setTimeout(() => {
 const OWNER_LEGADO = 'elianecezaroliveira@gmail.com';
 const CHAVES_POR_CONTA = new Set([
   'tag_catalog', 'n8n_webhook_url',
+  'assinatura', // ✍️ assinar as mensagens com o nome de quem enviou ({ligado, nomes:{email:nome}})
   'faq_enabled', 'faq_mode', 'faq_accounts', 'faq_delay_seconds', 'faq_ai_model',
   'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer',
   'tmpl_alias', // apelidos dos modelos da API (nome só no CRM)
