@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 367;
+const SERVER_VER = 368;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -680,7 +680,79 @@ function metaErrorText(er) {
     else if (er.message) parts.push(er.message);
     txt = parts.filter(Boolean).join(' — ') || 'Falha no envio reportada pela Meta.';
   }
+  // O detalhe que a Meta manda junto (em inglês) às vezes diz o motivo de verdade
+  // ("locked due to payment", "policy violation"…): não some mais só porque já temos a tradução
+  const det = String((er.error_data && er.error_data.details) || '').trim();
+  if (det && META_ERROR_CODES[code] && !/^[A-Za-z ]{0,30}$/.test(det)) txt += ' Detalhe da Meta: "' + det.slice(0, 220) + '".';
+  const mot = _motivoPelasPalavras(det);
+  if (mot && META_ERROR_CODES[code]) txt += ' Motivo apontado: ' + mot + '.';
   if (code) txt += ` (código ${code})`;
+  return txt;
+}
+// 🩺 "Porque não fala logo se é violação ou pagamento?" — a Meta não diz no erro do envio, mas
+// diz quando a gente PERGUNTA: GET /{número}?fields=status,health_status devolve o estado do
+// número (CONNECTED, DISCONNECTED, BANNED, RESTRICTED…) e, para cada camada (número, conta do
+// WhatsApp, empresa, app), o que está travando e como resolver. Só é consultado quando um envio
+// falha por erro DE CONTA (nunca em rota de leitura) e fica guardado por 3 min por número.
+const _META_ERROS_DE_CONTA = new Set([131031, 131042, 133010, 131049, 130472, 130429, 131056]);
+function _motivoPelasPalavras(t) {
+  const x = String(t || '');
+  if (!x) return '';
+  if (/payment|billing|credit line|invoice|fund|pay /i.test(x)) return '💳 PAGAMENTO pendente/recusado';
+  if (/polic|violat|integrity|\bban|suspend|disabl|restrict/i.test(x)) return '🚫 VIOLAÇÃO DE POLÍTICA / restrição da Meta';
+  if (/not registered|deregister|disconnect|certificate|two.?step|pin/i.test(x)) return '🔌 NÚMERO DESCONECTADO / não registrado';
+  if (/verif|review/i.test(x)) return '📋 VERIFICAÇÃO da empresa pendente ou em análise';
+  if (/limit|tier|quality|rate/i.test(x)) return '📉 QUALIDADE do número / limite de envio';
+  return '';
+}
+const _ST_NUMERO = { CONNECTED: '', DISCONNECTED: 'número DESCONECTADO da Meta', BANNED: 'número BANIDO pela Meta', RESTRICTED: 'número RESTRINGIDO pela Meta',
+  FLAGGED: 'número SINALIZADO (qualidade baixa)', RATE_LIMITED: 'número com o LIMITE DE ENVIO atingido', PENDING: 'número PENDENTE na Meta', UNVERIFIED: 'número NÃO VERIFICADO',
+  DELETED: 'número EXCLUÍDO na Meta', MIGRATED: 'número MIGRADO para outra conta', UNKNOWN: '' };
+const _ENTIDADE = { PHONE_NUMBER: 'o número', WABA: 'a conta do WhatsApp Business (WABA)', BUSINESS: 'a empresa (Gerenciador de Negócios)', APP: 'o aplicativo da Meta' };
+const _diagCache = new Map();
+async function _diagnosticoDaConta(phoneNumberId) {
+  const pn = String(phoneNumberId || '').trim();
+  if (!pn || !supabase) return '';
+  const c = _diagCache.get(pn); if (c && Date.now() - c.t < 180000) return c.txt;
+  let txt = '';
+  try {
+    const { data: acc } = await supabase.from('accounts').select('token').eq('phone_number_id', pn).not('token', 'is', null).limit(1).maybeSingle();
+    if (!acc || !acc.token) return '';
+    const r = await axios.get(`https://graph.facebook.com/v23.0/${pn}`, { params: { fields: 'status,health_status,quality_rating,messaging_limit_tier', access_token: acc.token }, timeout: 8000 });
+    const d = (r && r.data) || {};
+    const partes = [];
+    const st = String(d.status || '').toUpperCase();
+    if (_ST_NUMERO[st]) partes.push(_ST_NUMERO[st]);
+    const hs = d.health_status || {};
+    const pode = String(hs.can_send_message || '').toUpperCase();
+    if (pode === 'BLOCKED') partes.push('a Meta diz que este número NÃO PODE enviar mensagens agora');
+    else if (pode === 'LIMITED') partes.push('a Meta diz que este número está com envio LIMITADO');
+    const motivos = new Set();
+    for (const e of (hs.entities || [])) {
+      const quem = _ENTIDADE[String(e.entity_type || '').toUpperCase()] || String(e.entity_type || 'conta');
+      for (const er of (e.errors || [])) {
+        const desc = String(er.error_description || '').trim(), sol = String(er.possible_solution || '').trim();
+        const mot = _motivoPelasPalavras(desc + ' ' + sol);
+        if (mot) motivos.add(mot);
+        partes.push(`${quem}: ${desc || ('erro ' + er.error_code)}${sol ? ' → ' + sol : ''}`);
+      }
+      for (const inf of (e.additional_info || [])) { const i = String(inf || '').trim(); if (i) partes.push(`${quem}: ${i}`); }
+    }
+    if (motivos.size) partes.unshift('Motivo: ' + [...motivos].join(' + '));
+    if (!partes.length && (st === 'CONNECTED' || pode === 'AVAILABLE')) partes.push('o número aparece como conectado e liberado na Meta agora — pode ter sido um bloqueio temporário');
+    if (partes.length) txt = 'O que a Meta diz agora sobre este número: ' + partes.join('; ') + '.';
+  } catch (e) {
+    const er = e && e.response && e.response.data && e.response.data.error;
+    if (er && (er.code === 190 || er.code === 0)) txt = 'Não consegui perguntar à Meta: o token deste número está inválido ou vencido — cole o token de novo em Contas.';
+    else console.error('Diagnóstico da conta Meta:', (er && er.message) || e.message);
+  }
+  _diagCache.set(pn, { t: Date.now(), txt });
+  return txt;
+}
+// Texto do erro + o diagnóstico (quando o erro é de conta)
+async function metaErrorTextCompleto(er, phoneNumberId) {
+  let txt = metaErrorText(er);
+  try { if (er && _META_ERROS_DE_CONTA.has(Number(er.code))) { const d = await _diagnosticoDaConta(phoneNumberId); if (d) txt += '\n\n' + d; } } catch (_) {}
   return txt;
 }
 
@@ -1080,7 +1152,7 @@ app.post("/webhook", async (req, res) => {
           if (wamid && ['sent','delivered','read','failed'].includes(status)) {
             const upd = { status };
             if (status === 'failed') {
-              upd.error_info = metaErrorText(st.errors?.[0]);
+              upd.error_info = await metaErrorTextCompleto(st.errors?.[0], value.metadata?.phone_number_id); // 🩺 com o diagnóstico da conta
               console.error('Entrega falhou:', wamid, upd.error_info);
             }
             _cachePendingStatus(wamid, upd); // guarda caso a msg ainda não esteja salva
@@ -2301,7 +2373,7 @@ function _metaMotivo(meta) {
     131049: 'A Meta segurou esta mensagem "para proteger o engajamento" (limite da Meta para este número)',
     131056: 'Muitas mensagens para este número em pouco tempo — aguarde alguns minutos',
     130429: 'Limite de envios da conta atingido na Meta — aguarde',
-    131031: 'A conta da Meta está com restrição/pendência (verifique no Gerenciador do WhatsApp)',
+    131031: 'A conta do WhatsApp Business está BLOQUEADA pela Meta (pagamento, violação de política ou número desconectado)',
     131042: 'Pendência de pagamento na conta da Meta',
     131030: 'Este número não está na lista de teste da Meta (conta ainda em modo de teste)',
     131008: 'A Meta não aceitou o formato da mensagem', 131009: 'A Meta não aceitou o formato da mensagem',
@@ -2310,10 +2382,15 @@ function _metaMotivo(meta) {
   };
   return 'A Meta recusou: ' + (M[c] || det || 'erro ' + c) + (M[c] && det ? ' (' + String(det).slice(0, 160) + ')' : '');
 }
-function _respostaDeEnvioFalhou(res, err, rotulo) {
+async function _respostaDeEnvioFalhou(res, err, rotulo) {
   const meta = err && err.response && err.response.data && err.response.data.error;
   console.error(rotulo + ':', (err.response && err.response.data) || err.message);
-  if (meta && typeof meta === 'object') return res.status(422).json({ error: _metaMotivo(meta), detail: err.response.data, meta_code: meta.code });
+  if (meta && typeof meta === 'object') {
+    let motivo = _metaMotivo(meta);
+    // 🩺 Erro de conta: pergunta à Meta o que está travando (pagamento, política, número desconectado…)
+    try { if (_META_ERROS_DE_CONTA.has(Number(meta.code))) { const pn = (String((err.config && err.config.url) || '').match(/\/v\d+\.\d+\/([^/?]+)\/messages/) || [])[1]; const d = await _diagnosticoDaConta(pn); if (d) motivo += '\n\n' + d; } } catch (_) {}
+    return res.status(422).json({ error: motivo, detail: err.response.data, meta_code: meta.code });
+  }
   res.status(500).json({ error: rotulo, detail: err.response && err.response.data });
 }
 // ═══════════ ✍️ ASSINATURA: "*Hillary Araujo*:" no começo da mensagem ═══════════
