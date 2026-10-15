@@ -530,7 +530,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 368;
+const SERVER_VER = 369;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -10277,6 +10277,7 @@ const OWNER_LEGADO = 'elianecezaroliveira@gmail.com';
 const CHAVES_POR_CONTA = new Set([
   'tag_catalog', 'n8n_webhook_url',
   'assinatura', // ✍️ assinar as mensagens com o nome de quem enviou ({ligado, nomes:{email:nome}})
+  'ditado_correcoes', // 🎙️ correções do ditado por voz, por pessoa ({email:[{de,para}]})
   'faq_enabled', 'faq_mode', 'faq_accounts', 'faq_delay_seconds', 'faq_ai_model',
   'wrongperson_enabled', 'wrongperson_triggers', 'wrongperson_tag', 'wrongperson_answer',
   'tmpl_alias', // apelidos dos modelos da API (nome só no CRM)
