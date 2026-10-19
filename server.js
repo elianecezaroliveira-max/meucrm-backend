@@ -364,14 +364,40 @@ async function _jaGravada(wamid, owner) {
 // ── Multi-tenant: identifica o usuário logado (dono) a partir do token do Supabase ──
 const SUPABASE_ANON = process.env.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_xoU54iyT3KyxNR6i7fh3aw_1qpEKpua';
 const _tokenOwner = {}; // cache token -> { email, ts }
+// 🔑 Conferir o login no Supabase pode falhar por um instante (rede, limite de pedidos, 5xx).
+// Antes isso virava "sem login" e as rotas respondiam LISTA VAZIA com 200: ela via "Nenhuma
+// tarefa" por alguns segundos ao dar F5 (dezenas de pedidos com o token novo, todos ao mesmo
+// tempo, cada um perguntando ao Supabase). Agora: (1) um token é conferido UMA vez por vez — os
+// pedidos simultâneos esperam a mesma resposta; (2) falha passageira usa a resposta antiga do
+// cache, e sem cache responde 503 "tente de novo" (o app mantém "Carregando…" e repete) — nunca
+// lista vazia; (3) só token INVÁLIDO (401/403 do Supabase) é tratado como sem login.
+const _tokenPedindo = {};
+class _AuthIndisponivel extends Error { constructor(m) { super(m || 'login indisponível'); this.authIndisponivel = true; } }
 async function resolveOwner(req) {
   const a = req.headers.authorization || '';
   const tok = a.startsWith('Bearer ') ? a.slice(7) : null;
   if (!tok || !SUPABASE_URL) return null;
   const c = _tokenOwner[tok];
   if (c && Date.now() - c.ts < 300000) { req._usuario = c.bruto || c.email; return c.email; }
+  if (!_tokenPedindo[tok]) _tokenPedindo[tok] = _resolveOwnerNoSupabase(tok).finally(() => { delete _tokenPedindo[tok]; });
   try {
-    const r = await axios.get(`${SUPABASE_URL}/auth/v1/user`, { headers: { Authorization: 'Bearer ' + tok, apikey: SUPABASE_ANON } });
+    const r = await _tokenPedindo[tok];
+    req._usuario = r.bruto; return r.email;
+  } catch (e) {
+    if (c) { req._usuario = c.bruto || c.email; return c.email; } // cache velho vale mais que "sem login" numa falha passageira
+    throw e;
+  }
+}
+async function _resolveOwnerNoSupabase(tok) {
+  let r;
+  try {
+    r = await axios.get(`${SUPABASE_URL}/auth/v1/user`, { headers: { Authorization: 'Bearer ' + tok, apikey: SUPABASE_ANON }, timeout: 8000 });
+  } catch (e) {
+    const st = e && e.response && e.response.status;
+    if (st === 401 || st === 403) { _tokenOwner[tok] = { email: null, bruto: null, ts: Date.now() }; return { email: null, bruto: null }; } // token inválido/vencido de verdade
+    throw new _AuthIndisponivel((e && e.message) || 'falha');
+  }
+  {
     let email = (r.data?.email || '').toLowerCase() || null;
     const bruto = email; // quem REALMENTE está logado (pode ser alguém da equipe)
     // 🔒 CADA E-MAIL É UMA CONTA SEPARADA. Só entra na conta de outra pessoa quem
@@ -388,9 +414,8 @@ async function resolveOwner(req) {
       } catch (_) {}
       _tokenOwner[tok] = { email, bruto, ts: Date.now() };
     }
-    req._usuario = bruto;
-    return email;
-  } catch (e) { return null; }
+    return { email, bruto };
+  }
 }
 // 💸 cada pedido carrega o rótulo da rota (para o medidor somar por rota) e leva no
 // cabeçalho o ritmo que o app deve usar (3 s normal, 10 s economia, 30 s poupança)
@@ -399,7 +424,11 @@ app.use((req, res, next) => {
   _gastoCtx.run({ rota: _gastoRotaDe(req) }, () => next());
 });
 app.use(async (req, res, next) => {
-  try { req.owner = await resolveOwner(req); } catch (_) { req.owner = null; }
+  try { req.owner = await resolveOwner(req); }
+  catch (e) {
+    if (e && e.authIndisponivel) { res.setHeader('Retry-After', '2'); return res.status(503).json({ error: 'Não consegui conferir o login agora — tente de novo em instantes.', tente_de_novo: true }); }
+    req.owner = null;
+  }
   req.usuario = req._usuario || null; // quem da EQUIPE está usando o CRM agora
   // Integração externa: token de LONGA DURAÇÃO no cabeçalho X-Api-Token
   // identifica o dono (para n8n, Zapier, planilhas e outras ferramentas)
@@ -530,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 369;
+const SERVER_VER = 370;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
