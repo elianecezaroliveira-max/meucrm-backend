@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 374;
+const SERVER_VER = 375;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9008,7 +9008,7 @@ async function _iaCatalogo(owner) {
 function _iaItemTorto(s) {
   const t = String(s || '').trim();
   if (/^\{[\s\S]*\}$/.test(t)) { try { const o = JSON.parse(t); if (o && typeof o === 'object' && (o.rapida != null || o.bot != null)) return o; } catch (_) {} }
-  let m = t.match(/^\[?\s*r[aá]pida\s*:\s*\/?\s*([\w-]+)\s*\]?$/i); if (m) return { rapida: m[1] };
+  let m = t.match(/^\[?\s*r[aá]pida\s*:\s*\/?\s*([\p{L}\p{N}_-]+)\s*\]?$/iu); if (m) return { rapida: m[1] }; // (aceita acento: "/simulação", e sem espaço depois dos dois-pontos)
   m = t.match(/^\[?\s*bot\s*:\s*([^\]]+?)\s*\]?$/i); if (m) return { bot: m[1] };
   return null;
 }
@@ -9023,7 +9023,7 @@ function _iaExtraiItens(texto, rapidas, bots, soTexto) {
   const ini = t.indexOf('{'); const fim = t.lastIndexOf('}');
   if (ini >= 0 && fim > ini) { try { const o = JSON.parse(t.slice(ini, fim + 1)); if (o && Array.isArray(o.mensagens)) brutos = o.mensagens; else if (o && typeof o === 'object' && (o.rapida != null || o.bot != null)) brutos = [o]; } catch (_) {} }
   if (!brutos) return _iaExtraiMensagens(t).map(x => ({ tipo: 'texto', texto: x }));
-  const norm = x => String(x || '').trim().toLowerCase().replace(/^\//, '').replace(/[\s-]+/g, '_');
+  const norm = x => String(x || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/^\//, '').replace(/[\s-]+/g, '_'); // sem acento: "simulação" = "simulacao"
   const out = [];
   for (let b of brutos) {
     if (out.length >= 4) break;
