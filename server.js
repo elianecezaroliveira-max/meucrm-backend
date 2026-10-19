@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 377;
+const SERVER_VER = 378;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8585,7 +8585,7 @@ app.post('/faqs/ai-test', async (req, res) => {
 // app mostra num cartão acima do campo. NADA sai daqui para o lead: quem envia é
 // ela, com um toque. A memória fica em texto simples (settings ia_mem::dona::…)
 // para poder ser exportada e levada para qualquer outra IA.
-const IA_SUG_MODELOS = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b'];
+const IA_SUG_MODELOS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']; // (llama-3.3-70b saiu: o Groq responde 404 "does not exist")
 const _iaMemCache = {};   // dona → { t, estilo, fluxo, exemplos:[…], brutoExemplos }
 const _iaSugCache = {};   // dona|fone|últimaMsgDoLead → { t, mensagens }
 const _iaMemK = (owner, parte) => 'ia_mem::' + (owner || ' ') + '::' + parte;
@@ -8895,7 +8895,7 @@ const _iaErroGrande = (e) => { const st = e && e.response && e.response.status; 
 // Se um provedor está no limite (429) ou fora do ar, o próximo assume. A transcrição de áudio
 // (Whisper) e a IA do FAQ continuam no Groq.
 const IA_PROVEDORES = {
-  gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', chave: 'GEMINI_API_KEY', modelos: ['gemini-2.5-flash', 'gemini-2.0-flash'] },
+  gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', chave: 'GEMINI_API_KEY', modelos: ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'] }, // (19/10/2026: o Google respondeu 404 para 2.5/2.0 "não disponível para novos usuários — use gemini-3.8-flash")
   openai: { url: 'https://api.openai.com/v1/chat/completions', chave: 'OPENAI_API_KEY', modelos: ['gpt-4o-mini'] },
   groq:   { url: GROQ_URL, chave: 'GROQ_API_KEY', modelos: IA_SUG_MODELOS },
 };
