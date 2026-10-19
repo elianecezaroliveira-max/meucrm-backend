@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 375;
+const SERVER_VER = 376;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8992,14 +8992,48 @@ async function _iaCatalogo(owner) {
     const { data } = await supabase.from('settings').select('value').eq('key', 'quick_replies::' + (owner || ' ')).maybeSingle();
     const arr = data && data.value ? JSON.parse(data.value) : [];
     out.rapidas = (Array.isArray(arr) ? arr : []).filter(r => r && r.title && r.message).slice(0, 40)
-      .map(r => ({ atalho: String(r.title).toLowerCase(), texto: String(r.message), previa: String(r.message).replace(/\s+/g, ' ').slice(0, 90), anexo: !!r.media_url }));
+      .map(r => ({ atalho: String(r.title).toLowerCase(), texto: String(r.message), previa: String(r.message).replace(/\s+/g, ' ').slice(0, 300), anexo: !!r.media_url })); // (a IA vê até 300 letras da rápida — era 90)
   } catch (_) {}
   try {
     const { data } = await supabase.from('bots').select('id, name, active').eq('owner', owner || ' ');
-    out.bots = (data || []).filter(b => b && b.active !== false && b.name).slice(0, 30).map(b => ({ id: String(b.id), nome: String(b.name) }));
+    out.bots = (data || []).filter(b => b && b.active !== false && b.name).slice(0, 30).map(b => ({ id: String(b.id), nome: String(b.name), resumo: '' }));
+    // 🤖 O QUE CADA BOT FAZ: a IA só sabia o nome. Agora recebe um resumo dos passos (segue as setas
+    // a partir do Início): as mensagens, "espera a resposta", "cronômetro", "muda a etapa"…
+    if (out.bots.length) {
+      const ids = out.bots.map(b => b.id);
+      const [{ data: nos }, { data: setas }] = await Promise.all([
+        supabase.from('bot_nodes').select('id, bot_id, type, config').in('bot_id', ids),
+        supabase.from('bot_edges').select('bot_id, from_node_id, to_node_id, label').in('bot_id', ids),
+      ]);
+      for (const b of out.bots) b.resumo = _iaResumoBot((nos || []).filter(n => String(n.bot_id) === b.id), (setas || []).filter(e => String(e.bot_id) === b.id));
+    }
   } catch (_) {}
   _iaCatCache[owner || ' '] = out;
   return out;
+}
+function _iaResumoBot(nos, setas) {
+  try {
+    const porId = {}; for (const n of nos) porId[String(n.id)] = n;
+    let atual = nos.find(n => n.type === 'start') || nos[0]; const vistos = new Set(); const passos = [];
+    const cfgDe = n => { try { return typeof n.config === 'string' ? JSON.parse(n.config) : (n.config || {}); } catch (_) { return {}; } };
+    while (atual && !vistos.has(String(atual.id)) && passos.length < 7) {
+      vistos.add(String(atual.id)); const c = cfgDe(atual), t = atual.type;
+      if (t === 'message') passos.push('manda "' + String(c.text || (c.media_url ? '(foto/arquivo)' : '')).replace(/\s+/g, ' ').slice(0, 110) + '"' + (c.media_url && c.text ? ' (com foto/arquivo)' : ''));
+      else if (t === 'wait_reply') passos.push('espera a resposta do lead' + (c.timeout_hours ? ' (até ' + c.timeout_hours + 'h)' : ''));
+      else if (t === 'pause') passos.push('cronômetro' + (c.minutes ? ' de ' + c.minutes + ' min' : c.hours ? ' de ' + c.hours + 'h' : ''));
+      else if (t === 'move_stage') passos.push('muda a etapa do lead');
+      else if (t === 'tags') passos.push('põe etiqueta');
+      else if (t === 'task') passos.push('cria tarefa' + (c.title ? ' "' + String(c.title).slice(0, 40) + '"' : ''));
+      else if (t === 'complete_task') passos.push('conclui tarefa');
+      else if (t === 'round_robin') passos.push('rodízio de número');
+      else if (t === 'condition') passos.push('condição');
+      else if (t === 'wait_until' || t === 'business_hours') passos.push('espera o horário');
+      else if (t === 'end') break;
+      const saidas = setas.filter(e => String(e.from_node_id) === String(atual.id));
+      atual = saidas.length ? porId[String(saidas[0].to_node_id)] : null;
+    }
+    return passos.join(' → ').slice(0, 600);
+  } catch (_) { return ''; }
 }
 // Itens da sugestão: texto, {rapida:"/atalho"} ou {bot:"Nome"} — só os que existem de verdade
 // A IA às vezes escreve o atalho de um jeito torto: {"rapida":"/tarde"} como TEXTO (string),
@@ -9152,7 +9186,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const catTxt = (!_SO_TEXTO ? '### RESPOSTAS PRONTAS E BOTS DELA — cada um SÓ no momento certo (cadastrado por ela ou aprendido dos usos dela)\n'
       + rapidasCom.map(r => 'Rápida {"rapida":"/' + r.atalho + '"} — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '') + ' → ' + _momento(String(quando.rapidas[r.atalho] || '').trim(), usos.rapidas[r.atalho])).join('\n')
       + (rapidasCom.length && botsCom.length ? '\n' : '')
-      + botsCom.map(b => 'Bot {"bot":"' + b.nome + '"} → ' + _momento(String(quando.bots[b.id] || '').trim(), usos.bots[b.id])).join('\n')
+      + botsCom.map(b => 'Bot {"bot":"' + b.nome + '"}' + (b.resumo ? ' — o que faz: ' + b.resumo : '') + ' → ' + _momento(String(quando.bots[b.id] || '').trim(), usos.bots[b.id])).join('\n')
       + '\nRegra: se a conversa está EXATAMENTE nesse momento, devolva o item ({"rapida":"/x"} ou {"bot":"Nome"}) no lugar de escrever o texto dele. Fora desse momento, não use nem o item nem o texto dele — escreva a resposta personalizada.\n\n' : '');
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
@@ -9516,7 +9550,9 @@ async function _iaGuardaExemplo(owner, b) {
     // o cartão ✨ guarda também o que foi SUGERIDO; a varredura não sobrescreve isso
     if (b.auto && antigo && (antigo.origem === 'aceita' || antigo.origem === 'editada')) return { ok: true, guardado: false, motivo: 'o cartão já aprendeu esta fala', total: mem.exemplos.length };
     let lista = mem.exemplos.filter(e => !(e.chave && e.chave === chave)); // a versão anterior desta mesma fala sai
-    if (lista.some(iguais)) return { ok: true, guardado: false, motivo: 'repetido', total: mem.exemplos.length };
+    // 🎓 no treino, ensinar de novo o mesmo par (com outro motivo) SUBSTITUI o antigo — nunca "repetido"
+    if (treino) lista = lista.filter(e => !iguais(e));
+    else if (lista.some(iguais)) return { ok: true, guardado: false, motivo: 'repetido', total: mem.exemplos.length };
     lista = lista.concat([ex]);
     const cabe = lista.length > 3000 ? lista.slice(lista.length - 3000) : lista; // teto: as mais recentes ficam
     await _iaMemoriaGrava(owner, 'exemplos', cabe.map(o => JSON.stringify(o)).join('\n'));
