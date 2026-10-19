@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 370;
+const SERVER_VER = 371;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8990,6 +8990,10 @@ function _iaItemTorto(s) {
   return null;
 }
 function _iaPareceCru(s) { return /^\s*\{[\s\S]*"(rapida|bot|mensagens)"[\s\S]*\}\s*$/i.test(String(s || '')); }
+// Campos "assunto"/"porque" do JSON que a IA devolve (sem derrubar nada se vier torto)
+function _iaCamposJson(texto) {
+  try { const t = String(texto || ''); const i = t.indexOf('{'), f = t.lastIndexOf('}'); if (i < 0 || f <= i) return {}; const o = JSON.parse(t.slice(i, f + 1)); return { assunto: String(o.assunto || '').slice(0, 80), porque: String(o.porque || '').slice(0, 600) }; } catch (_) { return {}; }
+}
 function _iaExtraiItens(texto, rapidas, bots, soTexto) {
   const t = String(texto || '');
   let brutos = null;
@@ -9125,7 +9129,7 @@ async function _iaSugere(owner, phone, forcar) {
     + bancosTxt
     + '### REGRAS DE SAÍDA\n'
     + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
-    + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."]}: "assunto" em 2–5 palavras, e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + '- Responda SOMENTE com JSON no formato {"assunto":"...","porque":"...","mensagens":["...","..."]}: "assunto" em 2–5 palavras; "porque" em 1 ou 2 frases curtas, em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
     + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
@@ -9195,8 +9199,21 @@ async function _iaSugere(owner, phone, forcar) {
   const itensSemRep = itensOk.filter(it => !_repetida(it) && !_ecoDoLead(it));
   const itens = itensSemRep.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
+  // 🔍 "Quero entender o porquê da sugestão": o que a IA viu e em que se baseou, para a tela mostrar
+  const _cj = _iaCamposJson(texto);
+  const _ex = e => ({ em: String(e.em || '').split('-').reverse().join('/'), origem: e.origem || '', contexto: [].concat(e.contexto || []).slice(-1).map(x => String(x).slice(0, 140)), lead: [].concat(e.lead || []).map(x => String(x).slice(0, 140)).slice(0, 3), resposta: [].concat(e.resposta || []).map(x => String(x).slice(0, 160)).slice(0, 3) });
+  const explicacao = {
+    assunto: _cj.assunto || '', porque: _cj.porque || '',
+    fala_do_lead: String(textoLead || '').slice(0, 300) || (doLead.length ? '(sem texto: ' + doLead.map(m => m.type || 'mídia').join(', ') + ')' : ''),
+    contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 3), msgs.length - doLead.length).map(_iaLinha).map(x => x.slice(0, 160)),
+    exemplos: exemplos.slice(0, 4).map(_ex), so_estilo: exEstilo.length, correcoes: correcoes.slice(0, 2).map(_ex),
+    novidades: novidades.slice(-3).map(n => String(n.texto || '').slice(0, 140)),
+    momentos: itensSemRep.filter(it => it.tipo !== 'texto').map(it => ({ tipo: it.tipo, nome: it.tipo === 'rapida' ? '/' + it.atalho : it.nome, momento: it.tipo === 'rapida' ? _momento(String(quando.rapidas[it.atalho] || '').trim(), usos.rapidas[it.atalho]) : _momento(String(quando.bots[it.id] || '').trim(), usos.bots[it.id]) })),
+    fase: { etapa: etapa || '', dias_uteis_desde_minha: _ultMinha ? _iaDiasUteis(_ultMinha.timestamp) : null, dias_uteis_desde_inicio: _pri ? _iaDiasUteis(_pri.timestamp) : null, resumo_antigo: !!resumoAntigo, mensagens_lidas: msgs.length + antigas.length },
+    modelo: model,
+  };
   const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
-    transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)) }; // o app mostra o que o lead disse no áudio
+    transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)), explicacao }; // o app mostra o que o lead disse no áudio
   if (itens.length) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
   return r;
 }
