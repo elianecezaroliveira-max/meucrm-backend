@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 371;
+const SERVER_VER = 372;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9041,7 +9041,7 @@ function _iaBancoDaConversa(msgs) {
 }
 // Monta e pede a sugestão. Devolve { mensagens, itens, model } — nunca envia nada.
 async function _iaSugere(owner, phone, forcar) {
-  if (_iaEhTeste(phone, owner)) return { mensagens: [], itens: [], motivo: 'conversa de teste' };
+  if (_iaEhTeste(phone, owner)) return { mensagens: [], itens: [], motivo: 'número de teste — a IA não sugere nem aprende aqui', definitivo: true };
   const mem = await _iaMemoria(owner);
   // (sem .neq('type','note') no banco: no Postgres, "type <> 'note'" DEIXA DE FORA as
   //  linhas com type nulo — que são as mensagens de texto comuns — e a conversa vinha vazia)
@@ -9214,6 +9214,12 @@ async function _iaSugere(owner, phone, forcar) {
   };
   const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
     transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)), explicacao }; // o app mostra o que o lead disse no áudio
+  // 🔍 Sem sugestão? Ela quer saber O MOTIVO em cada caso (e o app não fica tentando de novo à toa)
+  if (!itens.length) {
+    r.definitivo = true;
+    r.motivo = brutosIt.length ? 'a IA só sugeriu texto que você já tinha mandado nesta conversa, eco da fala do lead ou resposta pronta fora do momento cadastrado'
+             : 'a IA achou que não havia o que responder a esta fala (só agradecimento, encerramento, figurinha…)';
+  }
   if (itens.length) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
   return r;
 }
