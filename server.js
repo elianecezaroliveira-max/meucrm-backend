@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 372;
+const SERVER_VER = 374;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8675,7 +8675,7 @@ function _iaExemplosPorAssunto(exemplos, textoLead, n, ctxAtual) {
     let comumCtx2 = 0; alvoCtx.forEach(t => { if (ctx.has(t)) comumCtx2++; });
     const simLead = comum / Math.max(1, Math.min(alvo.size || 1, lt.size || 1));
     const simCtx = alvoCtx.size ? comumCtx2 / Math.max(1, Math.min(alvoCtx.size, ctx.size || 1)) : 0;
-    return { e, comum, comumCtx2, sc: simLead + (curta ? 1.0 : 0.5) * simCtx + comumCtx * 0.05 + i * 1e-6 };
+    return { e, comum, comumCtx2, sc: simLead + (curta ? 1.0 : 0.5) * simCtx + comumCtx * 0.05 + (e.origem === 'treino' ? 0.05 : 0) + i * 1e-6 }; // 🎓 ensinado desempata a favor
   });
   pont.sort((a, b) => b.sc - a.sc);
   // parecido = mesmo assunto na fala do lead; com fala curta, vale também o mesmo contexto
@@ -8813,7 +8813,7 @@ async function _iaNovidadeJunta(owner, textos, em) {
 // mudou, sistema instável, regra nova). Uma chamada por varredura, só quando houve resposta nova.
 let _iaNovUltima = 0;
 async function _iaExtraiNovidades(owner, textos) {
-  if (!textos.length || !process.env.GROQ_API_KEY) return 0;
+  if (!textos.length || !_iaTemChave()) return 0;
   if (Date.now() - _iaNovUltima < 10 * 60000) { _iaNovFila.push(...textos); return 0; } // junta e manda a cada 10 min
   const lote = _iaNovFila.splice(0).concat(textos).slice(-40);
   _iaNovUltima = Date.now();
@@ -8842,7 +8842,7 @@ async function _iaResumoAntigo(owner, phone, antigas) {
   let c = _iaResumoCache.get(ck);
   if (!c) { try { const { data } = await supabase.from('settings').select('value').eq('key', _iaResumoK(owner, phone)).maybeSingle(); c = data && data.value ? JSON.parse(data.value) : null; } catch (_) { c = null; } }
   if (c && c.ate === ate && c.texto) { _iaResumoCache.set(ck, c); return c.texto; }
-  if (!process.env.GROQ_API_KEY) return '';
+  if (!_iaTemChave()) return '';
   const sys = 'Você resume a parte antiga de uma conversa de WhatsApp entre uma correspondente bancária ("Eu") e um cliente ("Lead"), para que outra IA continue o atendimento sabendo TUDO o que já aconteceu. Escreva em português, no máximo 14 linhas, cada linha começando pela data [dd/mm]: fase da operação, valores/parcelas/bancos/contratos citados (copie os números exatos), documentos e dados que o lead já mandou, o que ela já enviou/prometeu, prazos dados e pendências. Sem opinião, sem cortesia. Responda só o resumo.';
   const usr = _iaConversaComDatas(antigas, 0).slice(0, 24000);
   try {
@@ -8858,7 +8858,7 @@ async function _iaResumoAntigo(owner, phone, antigas) {
 }
 // Correções dela: o que a IA sugeriu errado → o que ela mandou (as mais parecidas com a fala atual)
 function _iaCorrecoesParecidas(exemplos, textoLead, n, ctxAtual) {
-  const ed = exemplos.filter(e => e.origem === 'editada' && [].concat(e.sugerido || []).length && JSON.stringify(e.sugerido) !== JSON.stringify(e.resposta));
+  const ed = exemplos.filter(e => (e.origem === 'editada' || e.origem === 'treino') && [].concat(e.sugerido || []).length && JSON.stringify(e.sugerido) !== JSON.stringify(e.resposta));
   return _iaExemplosPorAssunto(ed, textoLead, n, ctxAtual).parecidos; // só correções do MESMO assunto/contexto
 }
 // Placar: de tudo que a IA sugeriu, quanto ela aproveitou (aceitou ou editou) — por período
@@ -8887,17 +8887,39 @@ function _iaEncurta(usr, nivel) {
   return t;
 }
 const _iaErroGrande = (e) => { const st = e && e.response && e.response.status; const em = String((e && e.response && e.response.data && e.response.data.error && e.response.data.error.message) || (e && e.message) || ''); return st === 413 || /request too large|reduce your message size|tokens per minute \(TPM\)/i.test(em); };
-async function _iaChamaGroq(sys, usr, owner, _nivel) {
+// 🔌 PROVEDORES DA IA (sugestão, treino, resumo, novidades). "A do Groq acaba muito rápido": o plano
+// grátis do Groq dá 8 mil tokens por minuto — cada sugestão leva a conversa inteira. Agora o servidor
+// aceita mais de um provedor (todos falam o mesmo formato "chat/completions"): basta a CHAVE nas
+// variáveis do Railway. Ordem padrão: Gemini (GEMINI_API_KEY, grátis com limite bem maior) →
+// OpenAI (OPENAI_API_KEY, pago) → Groq (GROQ_API_KEY). IA_ORDEM="groq,gemini" troca a ordem.
+// Se um provedor está no limite (429) ou fora do ar, o próximo assume. A transcrição de áudio
+// (Whisper) e a IA do FAQ continuam no Groq.
+const IA_PROVEDORES = {
+  gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', chave: 'GEMINI_API_KEY', modelos: ['gemini-2.5-flash', 'gemini-2.0-flash'] },
+  openai: { url: 'https://api.openai.com/v1/chat/completions', chave: 'OPENAI_API_KEY', modelos: ['gpt-4o-mini'] },
+  groq:   { url: GROQ_URL, chave: 'GROQ_API_KEY', modelos: IA_SUG_MODELOS },
+};
+function _iaProvedores(owner) {
+  const ordem = String(process.env.IA_ORDEM || 'gemini,openai,groq').split(',').map(x => x.trim().toLowerCase()).filter(x => IA_PROVEDORES[x]);
+  for (const k of Object.keys(IA_PROVEDORES)) if (!ordem.includes(k)) ordem.push(k);
   const pref = _cfg('ia_sug_model', owner);
-  const modelos = (pref ? [pref] : []).concat(IA_SUG_MODELOS.filter(m => m !== pref));
+  return ordem.filter(k => process.env[IA_PROVEDORES[k].chave]).map(k => {
+    const p = IA_PROVEDORES[k]; const ms = (pref && p.modelos.includes(pref)) ? [pref].concat(p.modelos.filter(m => m !== pref)) : (process.env['IA_MODELO_' + k.toUpperCase()] ? [process.env['IA_MODELO_' + k.toUpperCase()]].concat(p.modelos) : p.modelos);
+    return { nome: k, url: p.url, key: process.env[p.chave], modelos: ms };
+  });
+}
+const _iaTemChave = () => _iaProvedores().length > 0;
+async function _iaChamaGroq(sys, usr, owner, _nivel) {
+  const provs = _iaProvedores(owner);
+  if (!provs.length) throw new Error('sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)');
   let ultimoErro = null;
-  for (const model of modelos) {
+  for (const prov of provs) for (const model of prov.modelos) {
     const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 1500 };
     if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
     try {
-      const r = await axios.post(GROQ_URL, body, { headers: { Authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'Content-Type': 'application/json' }, timeout: 25000 });
+      const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.key, 'Content-Type': 'application/json' }, timeout: 25000 });
       const msg = (r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message) || {};
-      return { texto: String(msg.content || ''), model, encurtado: _nivel || 0 };
+      return { texto: String(msg.content || ''), model: prov.nome + ':' + model, encurtado: _nivel || 0 };
     } catch (e) {
       ultimoErro = e;
       const st = e.response && e.response.status;
@@ -8905,6 +8927,7 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
       // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
       // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
       if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e)) continue;
+      if (st === 401 || st === 403) { console.error('IA ' + prov.nome + ': chave recusada — ' + em.slice(0, 120)); break; } // chave inválida: pula para o próximo provedor
       throw e;
     }
   }
@@ -9040,16 +9063,24 @@ function _iaBancoDaConversa(msgs) {
   return achados;
 }
 // Monta e pede a sugestão. Devolve { mensagens, itens, model } — nunca envia nada.
-async function _iaSugere(owner, phone, forcar) {
-  if (_iaEhTeste(phone, owner)) return { mensagens: [], itens: [], motivo: 'número de teste — a IA não sugere nem aprende aqui', definitivo: true };
+// 🎓 opts.conversa: TREINO — conversa de mentira (IA ▸ Treinar); não lê o banco, não usa cache, não é "número de teste"
+async function _iaSugere(owner, phone, forcar, opts) {
+  const treino = !!(opts && Array.isArray(opts.conversa));
+  if (!treino && _iaEhTeste(phone, owner)) return { mensagens: [], itens: [], motivo: 'número de teste — a IA não sugere nem aprende aqui', definitivo: true };
   const mem = await _iaMemoria(owner);
   // (sem .neq('type','note') no banco: no Postgres, "type <> 'note'" DEIXA DE FORA as
   //  linhas com type nulo — que são as mensagens de texto comuns — e a conversa vinha vazia)
   // (select('*'), igual à rota da conversa: pedir a coluna "transcript" pelo nome derrubava
   //  a consulta inteira em quem ainda não rodou o SQL da transcrição — e vinha "sem conversa")
-  const { data: brutas, error: erroMsgs } = await supabase.from('messages').select('*')
-    .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
-    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(400);
+  let brutas = null, erroMsgs = null;
+  if (treino) {
+    const n = opts.conversa.length;
+    brutas = opts.conversa.map((m, i) => ({ id: 'treino' + i, direction: m.quem === 'eu' ? 'outbound' : 'inbound', type: 'text', content: String(m.texto || '').slice(0, 1500), timestamp: new Date(Date.now() - (n - i) * 60000).toISOString() })).reverse();
+  } else {
+    ({ data: brutas, error: erroMsgs } = await supabase.from('messages').select('*')
+      .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
+      .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(400));
+  }
   if (erroMsgs) return { mensagens: [], motivo: 'banco: ' + erroMsgs.message };
   // 📜 conversa INTEIRA: as 40 últimas vão por inteiro; o que veio antes vai resumido (com datas)
   const todas = (brutas || []).filter(m => m && m.type !== 'note').slice(0, 300).reverse()
@@ -9061,11 +9092,12 @@ async function _iaSugere(owner, phone, forcar) {
   const ult = msgs[msgs.length - 1];
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
   const c = _iaSugCache[chave];
-  if (c && !forcar && Date.now() - c.t < 10 * 60000) return c.r;
-  const resumoAntigo = antigas.length ? await _iaResumoAntigo(owner, phone, antigas) : '';
+  if (c && !forcar && !treino && Date.now() - c.t < 10 * 60000) return c.r;
+  const resumoAntigo = (antigas.length && !treino) ? await _iaResumoAntigo(owner, phone, antigas) : '';
   const novidades = await _iaNovidades(owner);
   let lead = null;
-  try { const { data } = await supabase.from('contacts').select('name, stage_id, tags, notes').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); lead = (data || [])[0] || null; } catch (_) {}
+  if (treino) lead = { name: String(opts.nome || 'Cliente').slice(0, 40), stage_id: null, tags: [], notes: String(opts.notas || '').slice(0, 400) };
+  else try { const { data } = await supabase.from('contacts').select('name, stage_id, tags, notes').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); lead = (data || [])[0] || null; } catch (_) {}
   let etapa = '';
   try { if (lead && lead.stage_id) { const { data } = await supabase.from('pipeline_stages').select('name').eq('id', lead.stage_id).limit(1); etapa = ((data || [])[0] || {}).name || ''; } } catch (_) {}
   // o que o lead disse por último (a sequência de mensagens dele desde a minha última)
@@ -9142,9 +9174,10 @@ async function _iaSugere(owner, phone, forcar) {
     + '- Nunca peça de novo algo que o lead já mandou, nem repita uma etapa já concluída, nem antecipe uma etapa que ainda não chegou. Se o prazo que ela deu já venceu, a resposta tem de reconhecer isso.\n'
     + '- Fale do tempo pelo que está na conversa (ex.: "desde terça", "faz 3 dias úteis"), nunca invente data, prazo novo ou fase que não apareça na conversa nem no manual.\n'
     + '- Hoje é ' + _iaHoje() + '. Não escreva nada além do JSON.';
+  // 🎓 exemplo ENSINADO no treino traz o porquê dela — a IA generaliza a regra, não só o texto
   const exTxt = exemplos.map((e, i) => {
     const ctx = [].concat(e.contexto || []).slice(-3).map(x => String(x).slice(0, 220)).join('\n');
-    return '--- Exemplo ' + (i + 1) + ' ---\n' + (ctx ? ctx + '\n' : '') + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n');
+    return '--- Exemplo ' + (i + 1) + (e.origem === 'treino' ? ' (ENSINADO por ela, com o motivo)' : '') + ' ---\n' + (ctx ? ctx + '\n' : '') + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n') + (e.motivo ? '\nPor quê (ela explicou): ' + String(e.motivo).slice(0, 300) : '');
   }).join('\n');
   // Quanto tempo esta operação já leva — a IA precisa disso para saber a FASE do cliente
   const _pri = msgs[0], _ultLead = [...msgs].reverse().find(m => m.direction === 'inbound'), _ultMinha = [...msgs].reverse().find(m => m.direction === 'outbound');
@@ -9153,7 +9186,7 @@ async function _iaSugere(owner, phone, forcar) {
     + (_pri ? 'Primeira mensagem desta conversa: ' + _iaDataHora(_pri.timestamp) + ' (há ' + _iaDiasCorridos(_pri.timestamp) + ' dia(s), ' + _iaDiasUteis(_pri.timestamp) + ' útil(eis))\n' : '')
     + (_ultMinha ? 'Última mensagem DELA: ' + _iaDataHora(_ultMinha.timestamp) + ' (há ' + _iaDiasCorridos(_ultMinha.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultMinha.timestamp) + ' útil(eis))\n' : '')
     + (_ultLead ? 'Última mensagem do LEAD: ' + _iaDataHora(_ultLead.timestamp) + ' (há ' + _iaDiasCorridos(_ultLead.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultLead.timestamp) + ' útil(eis))\n' : '');
-  const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300)).join('\n---\n');
+  const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300) + (e.motivo ? '\nPor quê (ela explicou): ' + String(e.motivo).slice(0, 300) : '')).join('\n---\n');
   const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n')).join('\n');
   const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
     + (exEstiloTxt ? '### EXEMPLOS SÓ DE ESTILO (assunto DIFERENTE do atual — copie o jeito de escrever, nunca o conteúdo)\n' + exEstiloTxt + '\n\n' : '')
@@ -9201,7 +9234,7 @@ async function _iaSugere(owner, phone, forcar) {
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
   // 🔍 "Quero entender o porquê da sugestão": o que a IA viu e em que se baseou, para a tela mostrar
   const _cj = _iaCamposJson(texto);
-  const _ex = e => ({ em: String(e.em || '').split('-').reverse().join('/'), origem: e.origem || '', contexto: [].concat(e.contexto || []).slice(-1).map(x => String(x).slice(0, 140)), lead: [].concat(e.lead || []).map(x => String(x).slice(0, 140)).slice(0, 3), resposta: [].concat(e.resposta || []).map(x => String(x).slice(0, 160)).slice(0, 3) });
+  const _ex = e => ({ em: String(e.em || '').split('-').reverse().join('/'), origem: e.origem || '', motivo: e.motivo ? String(e.motivo).slice(0, 300) : '', contexto: [].concat(e.contexto || []).slice(-1).map(x => String(x).slice(0, 140)), lead: [].concat(e.lead || []).map(x => String(x).slice(0, 140)).slice(0, 3), resposta: [].concat(e.resposta || []).map(x => String(x).slice(0, 160)).slice(0, 3) });
   const explicacao = {
     assunto: _cj.assunto || '', porque: _cj.porque || '',
     fala_do_lead: String(textoLead || '').slice(0, 300) || (doLead.length ? '(sem texto: ' + doLead.map(m => m.type || 'mídia').join(', ') + ')' : ''),
@@ -9220,7 +9253,7 @@ async function _iaSugere(owner, phone, forcar) {
     r.motivo = brutosIt.length ? 'a IA só sugeriu texto que você já tinha mandado nesta conversa, eco da fala do lead ou resposta pronta fora do momento cadastrado'
              : 'a IA achou que não havia o que responder a esta fala (só agradecimento, encerramento, figurinha…)';
   }
-  if (itens.length) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
+  if (itens.length && !treino) _iaSugCache[chave] = { t: Date.now(), r }; // resposta vazia não fica guardada: o ↻ dela pede de novo
   return r;
 }
 
@@ -9282,7 +9315,7 @@ app.get('/ia/status', async (req, res) => {
   try {
     const m = await _iaMemoria(req.owner);
     const nov = await _iaNovidades(req.owner);
-    res.json({ ligada: await _iaSugLigada(req.owner), chave: !!process.env.GROQ_API_KEY, model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
+    res.json({ ligada: await _iaSugLigada(req.owner), chave: _iaTemChave(), provedores: _iaProvedores(req.owner).map(p => p.nome), model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
       memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length, novidades: nov.length },
       placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) }, bancos: _iaBancosAtuais(req.owner), fones_ignorados: String(_cfg('ia_fones_teste', req.owner) || '') });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -9388,12 +9421,37 @@ app.post('/ia/sugerir', async (req, res) => {
   if (!_soContaIA(req, res)) return;
   if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
-  if (!process.env.GROQ_API_KEY) return res.json({ mensagens: [], motivo: 'sem chave GROQ_API_KEY no servidor' });
+  if (!_iaTemChave()) return res.json({ mensagens: [], motivo: 'sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)' });
   const phone = String((req.body && req.body.phone) || '').replace(/\D/g, '');
   if (!phone) return res.status(400).json({ error: 'phone' });
   if (!(await _iaSugLigada(req.owner))) return res.json({ mensagens: [], motivo: 'desligada' });
   try { res.json(await _iaSugere(req.owner, phone, !!(req.body && req.body.forcar))); }
   catch (e) { res.json({ mensagens: [], motivo: (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message }); }
+});
+// 🎓 TREINO (IA ▸ Treinar): conversa de mentira com "Cliente 1/2/3". Ela escreve como o cliente, a IA
+// responde como responderia de verdade, ela corrige e diz o porquê — o par vira exemplo ENSINADO
+// (origem 'treino', com motivo). Nada vai para o WhatsApp e nada passa pelo banco de mensagens.
+app.post('/ia/treino/sugerir', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  if (!_iaTemChave()) return res.json({ mensagens: [], motivo: 'sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)' });
+  const b = req.body || {};
+  const conversa = [].concat(b.conversa || []).filter(m => m && typeof m.texto === 'string' && m.texto.trim()).slice(-60).map(m => ({ quem: m.quem === 'eu' ? 'eu' : 'lead', texto: String(m.texto).trim() }));
+  if (!conversa.length) return res.status(400).json({ error: 'conversa' });
+  const cli = String(b.cliente || 'c1').replace(/[^a-z0-9]/gi, '').slice(0, 10) || 'c1';
+  try { res.json(await _iaSugere(req.owner, 'treino-' + cli, true, { conversa, nome: String(b.nome || ('Cliente ' + cli.replace(/^c/, ''))), notas: b.notas })); }
+  catch (e) { res.json({ mensagens: [], motivo: (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message }); }
+});
+app.post('/ia/treino/ensinar', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const b = req.body || {};
+  try {
+    const r = await _iaGuardaExemplo(req.owner, { treino: true, enviado: b.resposta, sugerido: b.sugerido, lead: b.lead, contexto: b.contexto, motivo: b.motivo, chave: 'treino|' + String(b.cliente || 'c1') + '|' + [].concat(b.lead || []).join('|') });
+    if (r.erro) return res.status(400).json({ error: r.erro });
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // POST /ia/aprender { phone, chave, sugerido:[…], enviado:[…], usou, lead:[…], contexto:[…] }
 // Guarda o par "sugerido → enviado" como exemplo (anonimizado). Cada envio com o
@@ -9417,18 +9475,20 @@ const _iaMemNaFila = (fn) => { const p = _iaMemFila.then(fn, fn); _iaMemFila = p
 // Guarda UM exemplo "o lead disse → ela respondeu" (miolo da rota, usado também pela varredura).
 // b: { phone, enviado:[…], sugerido?, lead?, contexto?, chave?, usou?, auto? }
 async function _iaGuardaExemplo(owner, b) {
-  const phone = String(b.phone || '').replace(/\D/g, '');
+  const treino = !!b.treino; // 🎓 vindo da tela Treinar: sem telefone, com o motivo dela
+  const phone = treino ? 'treino' : String(b.phone || '').replace(/\D/g, '');
   let enviadas = [].concat(b.enviado || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 8);
   if (!phone || !enviadas.length) return { erro: 'phone/enviado' };
   // texto pronto (rápida/bot) não ensina: a IA passava a sugerir "Qualquer dúvida me aciona…" fora de hora
   try { const fx = await _iaTextosAutomaticos(owner); enviadas = enviadas.filter(t => /^\[(rapida|bot):/.test(t) || !_iaEhAutomatica(t, fx)); } catch (_) {}
   if (!enviadas.length) return { ok: true, guardado: false, motivo: 'só texto pronto (rápida/bot) — não ensina' };
-  if (_iaEhTeste(phone, owner)) return { ok: true, guardado: false, motivo: 'conversa de teste' }; // nada de teste entra na memória
+  if (!treino && _iaEhTeste(phone, owner)) return { ok: true, guardado: false, motivo: 'conversa de teste' }; // nada de teste entra na memória
   const sugerido = [].concat(b.sugerido || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
   let nome = '';
-  try { const { data } = await supabase.from('contacts').select('name').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); nome = String(((data || [])[0] || {}).name || ''); } catch (_) {}
+  if (!treino) try { const { data } = await supabase.from('contacts').select('name').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); nome = String(((data || [])[0] || {}).name || ''); } catch (_) {}
   let leadLinhas = [].concat(b.lead || []).map(x => String(x || '').replace(/^Lead: /, '').trim()).filter(Boolean).slice(0, 8);
   let ctxLinhas = [].concat(b.contexto || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 6);
+  if (treino && !leadLinhas.length) return { erro: 'lead' };
   if (!leadLinhas.length) { // app antigo / varredura: lê do banco a última fala do lead
     const { data: brutas } = await supabase.from('messages').select('*').in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
       .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(20);
@@ -9444,8 +9504,9 @@ async function _iaGuardaExemplo(owner, b) {
   // a chave identifica a fala do lead só para SUBSTITUIR o exemplo; guardada como resumo (sem o telefone)
   const chave = require('crypto').createHash('sha1').update(String(b.chave || (phone + '|' + leadLinhas.join('|')))).digest('hex').slice(0, 12);
   const ex = {
-    conversa: b.auto ? 'aprendido-sozinho' : 'aprendido', chave, contexto: ctxLinhas.map(an), lead: leadLinhas.map(an), resposta: enviadas.map(an),
-    origem: enviadas.every(t => sugerido.includes(t)) && sugerido.length ? 'aceita' : (b.usou ? 'editada' : 'propria'),
+    conversa: treino ? 'treino' : b.auto ? 'aprendido-sozinho' : 'aprendido', chave, contexto: ctxLinhas.map(an), lead: leadLinhas.map(an), resposta: enviadas.map(an),
+    origem: treino ? 'treino' : enviadas.every(t => sugerido.includes(t)) && sugerido.length ? 'aceita' : (b.usou ? 'editada' : 'propria'),
+    ...(treino && String(b.motivo || '').trim() ? { motivo: String(b.motivo).trim().slice(0, 300) } : {}),
     sugerido: sugerido.map(an), em: new Date().toISOString().slice(0, 10)
   };
   return await _iaMemNaFila(async () => {
