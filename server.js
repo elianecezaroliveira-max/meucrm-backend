@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 376;
+const SERVER_VER = 377;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8912,7 +8912,7 @@ const _iaTemChave = () => _iaProvedores().length > 0;
 async function _iaChamaGroq(sys, usr, owner, _nivel) {
   const provs = _iaProvedores(owner);
   if (!provs.length) throw new Error('sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)');
-  let ultimoErro = null;
+  let ultimoErro = null; const falhas = []; // 🔎 cada provedor/modelo que falhou e por quê (vai no log e no aviso)
   for (const prov of provs) for (const model of prov.modelos) {
     const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 1500 };
     if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
@@ -8923,7 +8923,9 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
     } catch (e) {
       ultimoErro = e;
       const st = e.response && e.response.status;
-      const em = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message || '');
+      const em = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || (e.response && e.response.data && JSON.stringify(e.response.data).slice(0, 200)) || e.message || '');
+      falhas.push(prov.nome + ':' + model + ' → ' + (st || e.code || 'erro') + ' ' + em.replace(/\s+/g, ' ').slice(0, 160));
+      console.error('IA ' + prov.nome + ' (' + model + ') falhou: ' + (st || e.code || '') + ' ' + em.slice(0, 200));
       // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
       // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
       if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e)) continue;
@@ -8937,6 +8939,7 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
     console.log('IA: pedido grande demais (' + usr.length + ' → ' + menor.length + ' caracteres), tentando de novo encurtado, nível ' + ((_nivel || 0) + 1));
     return _iaChamaGroq(sys, menor, owner, (_nivel || 0) + 1);
   }
+  if (ultimoErro && falhas.length > 1) { try { const e2 = new Error(String(ultimoErro.message || 'falha') + ' | tentativas: ' + falhas.join(' ; ')); e2.response = ultimoErro.response; throw e2; } catch (e3) { if (e3.message && /tentativas:/.test(e3.message)) throw e3; } }
   throw ultimoErro || new Error('sem modelo');
 }
 // Marcador de mídia copiado dos exemplos ("[image] [Imagem]", "[document] …"): não é texto
@@ -9460,7 +9463,7 @@ app.post('/ia/sugerir', async (req, res) => {
   if (!phone) return res.status(400).json({ error: 'phone' });
   if (!(await _iaSugLigada(req.owner))) return res.json({ mensagens: [], motivo: 'desligada' });
   try { res.json(await _iaSugere(req.owner, phone, !!(req.body && req.body.forcar))); }
-  catch (e) { res.json({ mensagens: [], motivo: (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message }); }
+  catch (e) { res.json({ mensagens: [], motivo: (e.message && /tentativas:/.test(e.message)) ? e.message : ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) }); }
 });
 // 🎓 TREINO (IA ▸ Treinar): conversa de mentira com "Cliente 1/2/3". Ela escreve como o cliente, a IA
 // responde como responderia de verdade, ela corrige e diz o porquê — o par vira exemplo ENSINADO
@@ -9474,7 +9477,7 @@ app.post('/ia/treino/sugerir', async (req, res) => {
   if (!conversa.length) return res.status(400).json({ error: 'conversa' });
   const cli = String(b.cliente || 'c1').replace(/[^a-z0-9]/gi, '').slice(0, 10) || 'c1';
   try { res.json(await _iaSugere(req.owner, 'treino-' + cli, true, { conversa, nome: String(b.nome || ('Cliente ' + cli.replace(/^c/, ''))), notas: b.notas })); }
-  catch (e) { res.json({ mensagens: [], motivo: (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message }); }
+  catch (e) { res.json({ mensagens: [], motivo: (e.message && /tentativas:/.test(e.message)) ? e.message : ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) }); }
 });
 app.post('/ia/treino/ensinar', async (req, res) => {
   if (!_soContaIA(req, res)) return;
