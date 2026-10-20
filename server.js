@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 387;
+const SERVER_VER = 388;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9104,7 +9104,10 @@ function _iaPareceCru(s) { return /^\s*\{[\s\S]*"(rapida|bot|mensagens)"[\s\S]*\
 // Exemplo ENSINADO (origem treino) cuja fala do lead bate com a atual: igual depois de tirar
 // acento/pontuação, ou ≥ 75% das palavras em comum. Fala curta ("ok", "sim") exige o mesmo contexto.
 function _iaRegraEnsinada(exemplos, textoLead, ctxAtual) {
-  const norm = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  // 📎 "[Documento: extrato_operacao_123.pdf]" e "[Documento: extrato.pdf]" são a MESMA coisa para a regra
+  // (o nome do arquivo muda a cada envio): o marcador vira só o tipo — documento / imagem / audio / video
+  const marc = t => String(t || '').replace(/\(?\[(documento|document)[^\]]*\]\)?/gi, ' documento ').replace(/\(?\[(imagem|image|foto)[^\]]*\]\)?/gi, ' imagem ').replace(/\(?\[(áudio|audio)[^\]]*\]\)?/gi, ' audio ').replace(/\(?\[(vídeo|video)[^\]]*\]\)?/gi, ' video ');
+  const norm = t => marc(t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
   const alvo = norm(textoLead); if (!alvo) return null;
   const toks = x => new Set(norm(x).split(' ').filter(w => w.length > 1));
   const jac = (a, b) => { if (!a.size || !b.size) return 0; let c = 0; a.forEach(t => { if (b.has(t)) c++; }); return c / Math.max(a.size, b.size); };
@@ -9310,6 +9313,12 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + (_pri ? 'Primeira mensagem desta conversa: ' + _iaDataHora(_pri.timestamp) + ' (há ' + _iaDiasCorridos(_pri.timestamp) + ' dia(s), ' + _iaDiasUteis(_pri.timestamp) + ' útil(eis))\n' : '')
     + (_ultMinha ? 'Última mensagem DELA: ' + _iaDataHora(_ultMinha.timestamp) + ' (há ' + _iaDiasCorridos(_ultMinha.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultMinha.timestamp) + ' útil(eis))\n' : '')
     + (_ultLead ? 'Última mensagem do LEAD: ' + _iaDataHora(_ultLead.timestamp) + ' (há ' + _iaDiasCorridos(_ultLead.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultLead.timestamp) + ' útil(eis))\n' : '');
+  // 📨 O que o lead mandou AGORA (todas as mensagens dele desde a minha última): a IA respondia só à
+  // primeira ("já mando o contrato" → "aguardo") e ignorava o arquivo que veio um minuto depois
+  const _temArquivo = doLead.some(m => /^(document|image|video)$/.test(String(m.type || '')) || (m.type === 'audio' && !m.transcript));
+  const agoraTxt = doLead.length ? '\n\n### O QUE O LEAD MANDOU AGORA (' + doLead.length + ' mensage' + (doLead.length === 1 ? 'm' : 'ns') + ' desde a minha última — responda a TUDO isto, não só à primeira)\n'
+    + doLead.map(m => '[' + _iaDataHora(m.timestamp) + '] ' + _iaLinha(m)).join('\n')
+    + (_temArquivo ? '\n⚠️ Ele mandou ARQUIVO/FOTO' + (doLead.length > 1 ? ' junto com o texto' : '') + ': a resposta precisa reconhecer o que chegou ("Recebi…") — nunca responder como se o arquivo não tivesse vindo (ex.: "aguardo seu retorno" depois que ele já enviou).' : '') : '';
   const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300) + (e.motivo ? '\nPor quê (ela explicou): ' + String(e.motivo).slice(0, 300) : '')).join('\n---\n');
   const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n')).join('\n');
   const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n(linhas "Eu: ⏳ depois: …" são passos que ela manda HORAS depois, não na resposta de agora)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
@@ -9319,6 +9328,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + tempoTxt
     + (resumoAntigo ? '\n\n### RESUMO DA PARTE ANTIGA DA CONVERSA (' + antigas.length + ' mensagens, de ' + _iaDataHora(antigas[0].timestamp) + ' a ' + _iaDataHora(antigas[antigas.length - 1].timestamp) + ')\n' + resumoAntigo : '')
     + '\n\n### ' + (resumoAntigo ? 'ÚLTIMAS ' + msgs.length + ' MENSAGENS, por inteiro' : 'CONVERSA INTEIRA, do começo') + ' (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs, msgs.length)
+    + agoraTxt
     + '\n\nAntes de escrever: diga o ASSUNTO da última fala do lead; se for da operação, olhe as DATAS acima e veja em que fase ele está; se for outro assunto (estorno, cobrança, dúvida, reclamação), responda a ele e deixe a operação de lado. NUNCA repita uma mensagem que ela já mandou nesta conversa (as linhas "Eu:" acima): o lead já leu; responda ao que ele disse AGORA. NUNCA devolva ao lead a própria fala dele (nem reescrita, nem com emoji): se ele perguntou "pode ser a conta do mês passado?", a resposta é SIM/NÃO com a orientação dela — não a mesma pergunta. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
   // 🎓 REGRA ENSINADA: se a fala do lead é a mesma (ou quase) de um exemplo que ELA ensinou no treino,
   // no mesmo contexto, a resposta é a dela — sem perguntar ao modelo (ela: "acabei de mostrar como se
