@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 379;
+const SERVER_VER = 380;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8915,9 +8915,9 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
   let ultimoErro = null; const falhas = []; // 🔎 cada provedor/modelo que falhou e por quê (vai no log e no aviso)
   for (const prov of provs) for (const model of prov.modelos) {
     const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 3000 }; // (3000: o Gemini "pensa" antes de responder e o JSON vinha cortado no meio do "porque")
-    if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
+    if (/gpt-oss|gemini/i.test(model)) body.reasoning_effort = 'low'; // Gemini "pensa" demais: estourava 25 s e vinha cortado
     try {
-      const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.key, 'Content-Type': 'application/json' }, timeout: 25000 });
+      const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.key, 'Content-Type': 'application/json' }, timeout: prov.nome === 'gemini' ? 55000 : 25000 });
       const msg = (r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message) || {};
       return { texto: String(msg.content || ''), model: prov.nome + ':' + model, encurtado: _nivel || 0 };
     } catch (e) {
@@ -8928,7 +8928,7 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
       console.error('IA ' + prov.nome + ' (' + model + ') falhou: ' + (st || e.code || '') + ' ' + em.slice(0, 200));
       // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
       // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
-      if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e)) continue;
+      if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e) || e.code === 'ECONNABORTED' || /timeout/i.test(em)) continue; // (demorou demais: tenta o próximo)
       if (st === 401 || st === 403) { console.error('IA ' + prov.nome + ': chave recusada — ' + em.slice(0, 120)); break; } // chave inválida: pula para o próximo provedor
       throw e;
     }
