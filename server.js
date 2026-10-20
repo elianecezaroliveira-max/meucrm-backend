@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 381;
+const SERVER_VER = 382;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9060,6 +9060,25 @@ function _iaItemTorto(s) {
   return null;
 }
 function _iaPareceCru(s) { return /^\s*\{[\s\S]*"(rapida|bot|mensagens)"[\s\S]*\}\s*$/i.test(String(s || '')); }
+// Exemplo ENSINADO (origem treino) cuja fala do lead bate com a atual: igual depois de tirar
+// acento/pontuação, ou ≥ 75% das palavras em comum. Fala curta ("ok", "sim") exige o mesmo contexto.
+function _iaRegraEnsinada(exemplos, textoLead, ctxAtual) {
+  const norm = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const alvo = norm(textoLead); if (!alvo) return null;
+  const toks = x => new Set(norm(x).split(' ').filter(w => w.length > 1));
+  const jac = (a, b) => { if (!a.size || !b.size) return 0; let c = 0; a.forEach(t => { if (b.has(t)) c++; }); return c / Math.max(a.size, b.size); };
+  const tA = toks(alvo), cA = toks(ctxAtual);
+  let melhor = null, melhorSc = 0;
+  for (const e of exemplos) {
+    if (!e || e.origem !== 'treino' || ![].concat(e.resposta || []).length) continue;
+    const leadEx = norm([].concat(e.lead || []).join(' '));
+    const igual = leadEx === alvo, sc = igual ? 1 : jac(tA, toks(leadEx));
+    if (!igual && sc < 0.75) continue;
+    if (tA.size <= 2) { const cE = toks([].concat(e.contexto || []).join(' ')); if (cA.size || cE.size) { if (jac(cA, cE) < 0.5) continue; } } // fala curta: só com o mesmo contexto
+    if (sc > melhorSc) { melhor = e; melhorSc = sc; }
+  }
+  return melhor;
+}
 // Campos "assunto"/"porque" do JSON que a IA devolve (sem derrubar nada se vier torto)
 function _iaCamposJson(texto) {
   try { const t = String(texto || ''); const i = t.indexOf('{'), f = t.lastIndexOf('}'); if (i < 0 || f <= i) return {}; const o = JSON.parse(t.slice(i, f + 1)); return { assunto: String(o.assunto || '').slice(0, 80), porque: String(o.porque || '').slice(0, 600) }; } catch (_) { return {}; }
@@ -9252,7 +9271,16 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + (resumoAntigo ? '\n\n### RESUMO DA PARTE ANTIGA DA CONVERSA (' + antigas.length + ' mensagens, de ' + _iaDataHora(antigas[0].timestamp) + ' a ' + _iaDataHora(antigas[antigas.length - 1].timestamp) + ')\n' + resumoAntigo : '')
     + '\n\n### ' + (resumoAntigo ? 'ÚLTIMAS ' + msgs.length + ' MENSAGENS, por inteiro' : 'CONVERSA INTEIRA, do começo') + ' (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs, msgs.length)
     + '\n\nAntes de escrever: diga o ASSUNTO da última fala do lead; se for da operação, olhe as DATAS acima e veja em que fase ele está; se for outro assunto (estorno, cobrança, dúvida, reclamação), responda a ele e deixe a operação de lado. NUNCA repita uma mensagem que ela já mandou nesta conversa (as linhas "Eu:" acima): o lead já leu; responda ao que ele disse AGORA. NUNCA devolva ao lead a própria fala dele (nem reescrita, nem com emoji): se ele perguntou "pode ser a conta do mês passado?", a resposta é SIM/NÃO com a orientação dela — não a mesma pergunta. Escreva agora a sugestão de resposta dela para a última mensagem do lead.';
-  const { texto, model } = await _iaChamaGroq(sys, usr, owner);
+  // 🎓 REGRA ENSINADA: se a fala do lead é a mesma (ou quase) de um exemplo que ELA ensinou no treino,
+  // no mesmo contexto, a resposta é a dela — sem perguntar ao modelo (ela: "acabei de mostrar como se
+  // faz e ele vem com resposta rápida em vez do bot que eu corrigi"). Rápido e previsível.
+  const regra = _iaRegraEnsinada(mem.exemplos, textoLead || '', ctxAtual);
+  let texto, model;
+  if (regra) {
+    const linhas = [].concat(regra.resposta || []).map(x => { const o = _iaItemTorto(x); return o ? o : String(x).replace(/\{nome\}/g, primeiro || '{nome}'); });
+    texto = JSON.stringify({ assunto: 'regra ensinada', porque: 'Regra que você ensinou no treino' + (regra.em ? ' em ' + String(regra.em).split('-').reverse().join('/') : '') + ': ' + (regra.motivo || 'mesma fala do lead, mesma resposta'), mensagens: linhas });
+    model = 'regra-ensinada';
+  } else ({ texto, model } = await _iaChamaGroq(sys, usr, owner));
   // 🎯 filtro dos itens: rápida/bot só com momento cadastrado; texto que é de rápida/bot vira o
   // item (se tem momento) ou cai fora (era isso que fazia a IA sugerir "Qualquer dúvida me aciona…" na hora errada)
   const brutosIt = _iaExtraiItens(texto, rapidas, bots, false);
