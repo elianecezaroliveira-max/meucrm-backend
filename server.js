@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 384;
+const SERVER_VER = 385;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9273,7 +9273,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + (_ultLead ? 'Última mensagem do LEAD: ' + _iaDataHora(_ultLead.timestamp) + ' (há ' + _iaDiasCorridos(_ultLead.timestamp) + ' dia(s), ' + _iaDiasUteis(_ultLead.timestamp) + ' útil(eis))\n' : '');
   const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300) + (e.motivo ? '\nPor quê (ela explicou): ' + String(e.motivo).slice(0, 300) : '')).join('\n---\n');
   const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n')).join('\n');
-  const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
+  const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n(linhas "Eu: ⏳ depois: …" são passos que ela manda HORAS depois, não na resposta de agora)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
     + (exEstiloTxt ? '### EXEMPLOS SÓ DE ESTILO (assunto DIFERENTE do atual — copie o jeito de escrever, nunca o conteúdo)\n' + exEstiloTxt + '\n\n' : '')
     + (corrTxt ? '### CORREÇÕES DELA (aprenda com o erro: não repita o que ela trocou)\n' + corrTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
@@ -9287,8 +9287,13 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const regra = _iaRegraEnsinada(mem.exemplos, textoLead || '', ctxAtual);
   let texto, model;
   if (regra) {
-    const linhas = [].concat(regra.resposta || []).map(x => { const o = _iaItemTorto(x); return o ? o : String(x).replace(/\{nome\}/g, primeiro || '{nome}'); });
-    texto = JSON.stringify({ assunto: 'regra ensinada', porque: 'Regra que você ensinou no treino' + (regra.em ? ' em ' + String(regra.em).split('-').reverse().join('/') : '') + ': ' + (regra.motivo || 'mesma fala do lead, mesma resposta'), mensagens: linhas });
+    // "⏳ depois:" = passo que ela manda HORAS depois (ela: "podem ser horas de diferença para enviar um
+    // bot e depois outro"): não entra na sugestão de agora, só aparece no porquê como próximo passo
+    const todas = [].concat(regra.resposta || []).map(x => String(x));
+    const iDep = todas.findIndex(x => /^⏳\s*depois:/i.test(x));
+    const agora = iDep < 0 ? todas : todas.slice(0, iDep), depois = iDep < 0 ? [] : todas.slice(iDep).map(x => x.replace(/^⏳\s*depois:\s*/i, ''));
+    const linhas = agora.map(x => { const o = _iaItemTorto(x); return o ? o : x.replace(/\{nome\}/g, primeiro || '{nome}'); });
+    texto = JSON.stringify({ assunto: 'regra ensinada', porque: 'Regra que você ensinou no treino' + (regra.em ? ' em ' + String(regra.em).split('-').reverse().join('/') : '') + ': ' + (regra.motivo || 'mesma fala do lead, mesma resposta') + (depois.length ? ' — Depois, quando for a hora: ' + depois.join(' · ') : ''), mensagens: linhas });
     model = 'regra-ensinada';
   } else ({ texto, model } = await _iaChamaGroq(sys, usr, owner));
   // 🎯 filtro dos itens: rápida/bot só com momento cadastrado; texto que é de rápida/bot vira o
