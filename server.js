@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 385;
+const SERVER_VER = 387;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8897,7 +8897,7 @@ const _iaErroGrande = (e) => { const st = e && e.response && e.response.status; 
 // Se um provedor está no limite (429) ou fora do ar, o próximo assume. A transcrição de áudio
 // (Whisper) e a IA do FAQ continuam no Groq.
 const IA_PROVEDORES = {
-  gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', chave: 'GEMINI_API_KEY', modelos: ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'] }, // (19/10/2026: o Google respondeu 404 para 2.5/2.0 "não disponível para novos usuários — use gemini-3.8-flash")
+  gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', chave: 'GEMINI_API_KEY', modelos: ['gemini-3.8-flash', 'gemini-3.5-flash'], corrida: true }, // (19/10/2026: o Google respondeu 404 para 2.5/2.0 "não disponível para novos usuários — use gemini-3.8-flash"; corrida: ver _iaCorrida)
   openai: { url: 'https://api.openai.com/v1/chat/completions', chave: 'OPENAI_API_KEY', modelos: ['gpt-4o-mini'] },
   groq:   { url: GROQ_URL, chave: 'GROQ_API_KEY', modelos: IA_SUG_MODELOS },
 };
@@ -8907,32 +8907,71 @@ function _iaProvedores(owner) {
   const pref = _cfg('ia_sug_model', owner);
   return ordem.filter(k => process.env[IA_PROVEDORES[k].chave]).map(k => {
     const p = IA_PROVEDORES[k]; const ms = (pref && p.modelos.includes(pref)) ? [pref].concat(p.modelos.filter(m => m !== pref)) : (process.env['IA_MODELO_' + k.toUpperCase()] ? [process.env['IA_MODELO_' + k.toUpperCase()]].concat(p.modelos) : p.modelos);
-    return { nome: k, url: p.url, key: process.env[p.chave], modelos: ms };
+    return { nome: k, url: p.url, key: process.env[p.chave], modelos: ms, corrida: !!p.corrida };
   });
 }
 const _iaTemChave = () => _iaProvedores().length > 0;
+// 🏁 Corrida entre os modelos de um provedor (Gemini). Em 19/10/2026 à noite o gemini-3.8-flash
+// ficou "em alta demanda" (503) e travando até os 55 s de prazo; só depois o 3.5-flash era
+// chamado e a sugestão levava 60 s ("a IA estava pensando rápido, mas agora está demorando").
+// Agora: chama o 1º modelo; se em IA_ESPERA_MS (12 s) ele não respondeu, o 2º entra em paralelo
+// e vale a primeira resposta boa (o outro pedido é cancelado). Se um falha na hora (503/429),
+// o próximo entra imediatamente. Devolve { model, r } ou null (todos falharam → anota já
+// registrou cada falha; 'provedor' = chave recusada, pula o provedor).
+async function _iaCorrida(prov, pede, anota) {
+  const espera = Math.max(1000, Number(process.env.IA_ESPERA_MS) || 12000);
+  const vivos = new Map(); let i = 0, chaveRecusada = false;
+  const lanca = () => { const model = prov.modelos[i++]; const ctrl = new AbortController();
+    const p = pede(prov, model, ctrl.signal).then(r => ({ ok: true, model, r }), e => ({ ok: false, model, e }));
+    vivos.set(model, { p, ctrl }); };
+  lanca();
+  while (vivos.size) {
+    let timer = null;
+    const relogio = (i < prov.modelos.length && !chaveRecusada) ? new Promise(res => { timer = setTimeout(() => res({ espera: true }), espera); }) : null;
+    const res = await Promise.race([...vivos.values()].map(v => v.p).concat(relogio ? [relogio] : []));
+    if (timer) clearTimeout(timer);
+    if (res.espera) { console.log('IA ' + prov.nome + ' (' + prov.modelos[i - 1] + ') sem resposta em ' + (espera / 1000) + ' s — ' + prov.modelos[i] + ' entra na corrida'); lanca(); continue; }
+    vivos.delete(res.model);
+    if (res.ok) { for (const v of vivos.values()) { try { v.ctrl.abort(); } catch (_) {} } return { model: res.model, r: res.r }; }
+    if (res.e && (res.e.code === 'ERR_CANCELED' || res.e.name === 'CanceledError')) continue; // (cancelado por nós)
+    let q; try { q = anota(prov, res.model, res.e); } catch (e) { for (const v of vivos.values()) { try { v.ctrl.abort(); } catch (_) {} } throw e; }
+    if (q === 'provedor') chaveRecusada = true;
+    else if (!vivos.size && i < prov.modelos.length) lanca(); // (falhou na hora: o próximo entra já)
+  }
+  return null;
+}
 async function _iaChamaGroq(sys, usr, owner, _nivel) {
   const provs = _iaProvedores(owner);
   if (!provs.length) throw new Error('sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)');
   let ultimoErro = null; const falhas = []; // 🔎 cada provedor/modelo que falhou e por quê (vai no log e no aviso)
-  for (const prov of provs) for (const model of prov.modelos) {
+  const pede = (prov, model, signal) => {
     const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 3000 }; // (3000: o Gemini "pensa" antes de responder e o JSON vinha cortado no meio do "porque")
     if (/gpt-oss|gemini/i.test(model)) body.reasoning_effort = 'low'; // Gemini "pensa" demais: estourava 25 s e vinha cortado
-    try {
-      const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.key, 'Content-Type': 'application/json' }, timeout: prov.nome === 'gemini' ? 55000 : 25000 });
-      const msg = (r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message) || {};
-      return { texto: String(msg.content || ''), model: prov.nome + ':' + model, encurtado: _nivel || 0 };
-    } catch (e) {
-      ultimoErro = e;
-      const st = e.response && e.response.status;
-      const em = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || (e.response && e.response.data && JSON.stringify(e.response.data).slice(0, 200)) || e.message || '');
-      falhas.push(prov.nome + ':' + model + ' → ' + (st || e.code || 'erro') + ' ' + em.replace(/\s+/g, ' ').slice(0, 160));
-      console.error('IA ' + prov.nome + ' (' + model + ') falhou: ' + (st || e.code || '') + ' ' + em.slice(0, 200));
-      // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
-      // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
-      if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e) || e.code === 'ECONNABORTED' || /timeout/i.test(em)) continue; // (demorou demais: tenta o próximo)
-      if (st === 401 || st === 403) { console.error('IA ' + prov.nome + ': chave recusada — ' + em.slice(0, 120)); break; } // chave inválida: pula para o próximo provedor
-      throw e;
+    return axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.key, 'Content-Type': 'application/json' }, timeout: prov.nome === 'gemini' ? 55000 : 25000, signal });
+  };
+  const pronto = (prov, model, r) => { const msg = (r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message) || {}; return { texto: String(msg.content || ''), model: prov.nome + ':' + model, encurtado: _nivel || 0 }; };
+  // devolve 'proximo' (tenta outro modelo), 'provedor' (chave recusada: pula o provedor) ou lança
+  const anota = (prov, model, e) => {
+    ultimoErro = e;
+    const st = e.response && e.response.status;
+    const em = String((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || (e.response && e.response.data && JSON.stringify(e.response.data).slice(0, 200)) || e.message || '');
+    falhas.push(prov.nome + ':' + model + ' → ' + (st || e.code || 'erro') + ' ' + em.replace(/\s+/g, ' ').slice(0, 160));
+    console.error('IA ' + prov.nome + ' (' + model + ') falhou: ' + (st || e.code || '') + ' ' + em.slice(0, 200));
+    // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
+    // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
+    if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e) || e.code === 'ECONNABORTED' || /timeout/i.test(em)) return 'proximo'; // (demorou demais: tenta o próximo)
+    if (st === 401 || st === 403) { console.error('IA ' + prov.nome + ': chave recusada — ' + em.slice(0, 120)); return 'provedor'; } // chave inválida: pula para o próximo provedor
+    throw e;
+  };
+  for (const prov of provs) {
+    if (prov.corrida && prov.modelos.length > 1) { // 🏁 corrida (ver _iaCorrida)
+      const v = await _iaCorrida(prov, pede, anota);
+      if (v) return pronto(prov, v.model, v.r);
+      continue;
+    }
+    for (const model of prov.modelos) {
+      try { return pronto(prov, model, await pede(prov, model)); }
+      catch (e) { const q = anota(prov, model, e); if (q === 'provedor') break; }
     }
   }
   // todos recusaram e o motivo é tamanho: encurta e tenta de novo (até 2 níveis)
@@ -9600,7 +9639,14 @@ async function _iaGuardaExemplo(owner, b) {
     ctxLinhas = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha);
   }
   if (!treino && _iaFalaVazia(leadLinhas)) return { ok: true, guardado: false, motivo: 'o lead só mandou figurinha/mídia — não ensina nada' }; // 🎓 no treino tudo ensina (ela escolheu o que o cliente mandou)
-  const an = t => _iaMascara(_iaAnonima(t, nome)).slice(0, 1500);
+  // 🎓 No treino ela cola textos REAIS para a IA entender o contexto (aceite com nome e link do
+  // cliente): o nome em MAIÚSCULAS vira {nome}, o link vira {link} (como sempre), "Cliente N" vira
+  // {nome} — nada pessoal fica na memória e a IA não tem o que copiar.
+  const anTreino = t => { let x = String(t || '');
+    x = x.replace(/\bCliente \d\b/g, '{nome}');
+    x = x.replace(/(^|\n)\s*([A-ZÁÉÍÓÚÂÊÔÃÕÇ]{2,}(?:\s+(?:DE|DA|DO|DOS|DAS|E|[A-ZÁÉÍÓÚÂÊÔÃÕÇ]{2,})){1,6})\s*(?=\n|$)/g, (m, a, n) => /BANCO|S\.A|LTDA|SIAPE|INSS|FGTS|CEP|CPF|PIX/.test(n) ? m : a + '{nome}'); // linha só com nome em maiúsculas
+    return x; };
+  const an = t => _iaMascara(_iaAnonima(treino ? anTreino(t) : t, nome)).slice(0, 1500);
   // a chave identifica a fala do lead só para SUBSTITUIR o exemplo; guardada como resumo (sem o telefone)
   const chave = require('crypto').createHash('sha1').update(String(b.chave || (phone + '|' + leadLinhas.join('|')))).digest('hex').slice(0, 12);
   const ex = {
