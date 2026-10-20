@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 382;
+const SERVER_VER = 383;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9141,7 +9141,15 @@ async function _iaSugere(owner, phone, forcar, opts) {
   let brutas = null, erroMsgs = null;
   if (treino) {
     const n = opts.conversa.length;
-    brutas = opts.conversa.map((m, i) => ({ id: 'treino' + i, direction: m.quem === 'eu' ? 'outbound' : 'inbound', type: 'text', content: String(m.texto || '').slice(0, 1500), timestamp: new Date(Date.now() - (n - i) * 60000).toISOString() })).reverse();
+    // 📎 no treino, foto/documento/áudio do cliente vêm como marcador no texto e viram o mesmo tipo
+    // de mensagem que a conversa real tem: "[Imagem recebida]", "[Documento: extrato.pdf]", "[Áudio: o que ele falou]"
+    const _tipoTreino = (t) => { const x = String(t || '').trim(); let m;
+      if (/^\[(imagem|foto)[^\]]*\]$/i.test(x)) return { type: 'image', content: '[Imagem recebida]' };
+      if ((m = /^\[documento:?\s*([^\]]*)\]$/i.exec(x))) return { type: 'document', content: '[Documento: ' + (m[1].trim() || 'arquivo') + ']' };
+      if ((m = /^\[(?:áudio|audio):?\s*([^\]]*)\]$/i.exec(x))) return { type: 'audio', content: '[Áudio recebido]', transcript: m[1].trim() || null };
+      if (/^\[(vídeo|video)[^\]]*\]$/i.test(x)) return { type: 'video', content: '[Vídeo recebido]' };
+      return { type: 'text', content: x.slice(0, 1500) }; };
+    brutas = opts.conversa.map((m, i) => ({ id: 'treino' + i, direction: m.quem === 'eu' ? 'outbound' : 'inbound', ...(m.quem === 'eu' ? { type: 'text', content: String(m.texto || '').slice(0, 1500) } : _tipoTreino(m.texto)), timestamp: new Date(Date.now() - (n - i) * 60000).toISOString() })).reverse();
   } else {
     ({ data: brutas, error: erroMsgs } = await supabase.from('messages').select('*')
       .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
