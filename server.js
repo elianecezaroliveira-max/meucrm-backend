@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 383;
+const SERVER_VER = 384;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8788,7 +8788,9 @@ function _iaMascara(t) {
     .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, '[DATA]');
 }
 // Fala do lead que é só figurinha/mídia sem texto: não ensina nada (31 exemplos assim poluíam a memória)
-const _iaFalaVazia = (linhas) => ![].concat(linhas || []).some(x => { const t = String(x || '').replace(/^Lead: /, '').trim(); return t && !/^\(?\[?(figurinha|sticker|áudio|audio|imagem|image|vídeo|video|documento|document)\b/i.test(t) && !_iaEhMarcador(t); });
+// (documento e áudio com transcrição CONTAM: "o lead mandou o extrato → hora de digitar" é contexto de
+//  verdade — ela: "Como que não ensina, olha o contexto". Figurinha/foto/vídeo sem texto seguem vazios.)
+const _iaFalaVazia = (linhas) => ![].concat(linhas || []).some(x => { const t = String(x || '').replace(/^Lead: /, '').trim(); if (!t) return false; if (/^\(?\[?(documento|document)\b/i.test(t)) return true; if (/^\(?\[?(áudio|audio)\b/i.test(t)) return /[:]\s*\S/.test(t); return !/^\(?\[?(figurinha|sticker|imagem|image|vídeo|video)\b/i.test(t) && !_iaEhMarcador(t); });
 // ── Novidades (informações novas com data) e resumo da parte antiga da conversa ──
 const _iaNovK = (owner) => _iaMemK(owner, 'novidades');
 async function _iaNovidades(owner) {
@@ -9592,7 +9594,7 @@ async function _iaGuardaExemplo(owner, b) {
     leadLinhas = doLead.map(m => _iaLinha(m).replace(/^Lead: /, ''));
     ctxLinhas = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha);
   }
-  if (_iaFalaVazia(leadLinhas)) return { ok: true, guardado: false, motivo: 'o lead só mandou figurinha/mídia — não ensina nada' };
+  if (!treino && _iaFalaVazia(leadLinhas)) return { ok: true, guardado: false, motivo: 'o lead só mandou figurinha/mídia — não ensina nada' }; // 🎓 no treino tudo ensina (ela escolheu o que o cliente mandou)
   const an = t => _iaMascara(_iaAnonima(t, nome)).slice(0, 1500);
   // a chave identifica a fala do lead só para SUBSTITUIR o exemplo; guardada como resumo (sem o telefone)
   const chave = require('crypto').createHash('sha1').update(String(b.chave || (phone + '|' + leadLinhas.join('|')))).digest('hex').slice(0, 12);
