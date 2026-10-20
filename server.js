@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 378;
+const SERVER_VER = 379;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8914,7 +8914,7 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
   if (!provs.length) throw new Error('sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)');
   let ultimoErro = null; const falhas = []; // 🔎 cada provedor/modelo que falhou e por quê (vai no log e no aviso)
   for (const prov of provs) for (const model of prov.modelos) {
-    const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 1500 };
+    const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 3000 }; // (3000: o Gemini "pensa" antes de responder e o JSON vinha cortado no meio do "porque")
     if (/gpt-oss/i.test(model)) body.reasoning_effort = 'low';
     try {
       const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.key, 'Content-Type': 'application/json' }, timeout: 25000 });
@@ -8959,6 +8959,16 @@ function _iaExtraiMensagens(texto) {
       const o = JSON.parse(t.slice(ini, fim + 1));
       if (o && Array.isArray(o.mensagens)) return limpa(o.mensagens);
     } catch (_) {}
+  }
+  // JSON cortado no meio (resposta longa demais): salva o que der da lista "mensagens"; se nem
+  // isso, NADA — antes o JSON cru virava "mensagem" e aparecia na tela como sugestão
+  if (/^\s*(```[a-z]*\s*)?\{/.test(t)) {
+    const m = /"mensagens"\s*:\s*\[([\s\S]*)/.exec(t);
+    if (m) {
+      let corpo = m[1]; { let dentro = false, esc = false; for (let i = 0; i < corpo.length; i++) { const ch = corpo[i]; if (esc) { esc = false; continue; } if (ch === '\\') { esc = true; continue; } if (ch === '"') dentro = !dentro; else if (ch === ']' && !dentro) { corpo = corpo.slice(0, i); break; } } } // só até o fim da lista
+      const itens = []; const re = /"((?:[^"\\]|\\.)*)"/g; let x; while ((x = re.exec(corpo))) itens.push(x[1].replace(/\\n/g, '\n').replace(/\\"/g, '"')); return limpa(itens);
+    }
+    return [];
   }
   // sem JSON: cada parágrafo vira uma mensagem
   return limpa(t.replace(/```[a-z]*/g, '').split(/\n\s*\n/));
@@ -9198,7 +9208,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + bancosTxt
     + '### REGRAS DE SAÍDA\n'
     + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
-    + '- Responda SOMENTE com JSON no formato {"assunto":"...","porque":"...","mensagens":["...","..."]}: "assunto" em 2–5 palavras; "porque" em 1 ou 2 frases curtas, em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."],"porque":"..."}: "assunto" em 2–5 palavras; as mensagens VÊM ANTES do porquê; "porque" em 1 ou 2 frases curtas (no máximo 300 caracteres), em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
     + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
