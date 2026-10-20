@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 380;
+const SERVER_VER = 381;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9140,7 +9140,16 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
   const c = _iaSugCache[chave];
   if (c && !forcar && !treino && Date.now() - c.t < 10 * 60000) return c.r;
-  const resumoAntigo = (antigas.length && !treino) ? await _iaResumoAntigo(owner, phone, antigas) : '';
+  // ⏱️ O resumo da parte antiga é OUTRA chamada à IA: antes a sugestão esperava por ela (dobrava o
+  // tempo). Agora usa o resumo já guardado; se precisa refazer, refaz em segundo plano e esta
+  // sugestão sai sem ele (a próxima já pega o novo).
+  const _t0 = Date.now();
+  let resumoAntigo = '';
+  if (antigas.length && !treino) {
+    const ate = String(antigas[antigas.length - 1].id), ck = (owner || ' ') + '|' + phone, cR = _iaResumoCache.get(ck);
+    if (cR && cR.ate === ate && cR.texto) resumoAntigo = cR.texto;
+    else { resumoAntigo = (cR && cR.texto) || ''; _iaResumoAntigo(owner, phone, antigas).catch(() => {}); }
+  }
   const novidades = await _iaNovidades(owner);
   let lead = null;
   if (treino) lead = { name: String(opts.nome || 'Cliente').slice(0, 40), stage_id: null, tags: [], notes: String(opts.notas || '').slice(0, 400) };
@@ -9290,8 +9299,9 @@ async function _iaSugere(owner, phone, forcar, opts) {
     novidades: novidades.slice(-3).map(n => String(n.texto || '').slice(0, 140)),
     momentos: itensSemRep.filter(it => it.tipo !== 'texto').map(it => ({ tipo: it.tipo, nome: it.tipo === 'rapida' ? '/' + it.atalho : it.nome, momento: it.tipo === 'rapida' ? _momento(String(quando.rapidas[it.atalho] || '').trim(), usos.rapidas[it.atalho]) : _momento(String(quando.bots[it.id] || '').trim(), usos.bots[it.id]) })),
     fase: { etapa: etapa || '', dias_uteis_desde_minha: _ultMinha ? _iaDiasUteis(_ultMinha.timestamp) : null, dias_uteis_desde_inicio: _pri ? _iaDiasUteis(_pri.timestamp) : null, resumo_antigo: !!resumoAntigo, mensagens_lidas: msgs.length + antigas.length },
-    modelo: model,
+    modelo: model, tempo_ms: Date.now() - _t0,
   };
+  console.log('IA sugestão em ' + ((Date.now() - _t0) / 1000).toFixed(1) + ' s (' + model + ', ' + (usr.length / 4 | 0) + ' tokens aprox.)');
   const r = { mensagens, itens, model, ultima_id: ult.id, lead: doLead.map(_iaLinha), contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha),
     transcricoes: doLead.filter(m => m.type === 'audio' && m.transcript).map(m => String(m.transcript).slice(0, 600)), explicacao }; // o app mostra o que o lead disse no áudio
   // 🔍 Sem sugestão? Ela quer saber O MOTIVO em cada caso (e o app não fica tentando de novo à toa)
