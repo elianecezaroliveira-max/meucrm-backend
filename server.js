@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 388;
+const SERVER_VER = 389;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -11962,6 +11962,7 @@ async function sendPushToOwner(owner, payload, opt) {
     // Aviso SÓ de contador (conversa lida em outro aparelho): não vai para iPhone — o iOS
     // exige uma notificação visível a cada push e cancela a inscrição depois de 3 "mudos".
     if (opt && opt.soSemNotificacao) subs = subs.filter(s => !/web\.push\.apple\.com/i.test(String(s.endpoint || '')));
+    if (opt && opt.soApple) subs = subs.filter(s => /web\.push\.apple\.com/i.test(String(s.endpoint || ''))); // 🍎 só iPhone (aviso "lida" com notificação)
     await Promise.all(subs.map(async (s) => {
       try {
         // urgency 'high': sem isso o Google/Apple entregam com prioridade normal e o celular
@@ -11992,8 +11993,26 @@ function _badgeAvisa(owner, phone) {
   if (_badgeAvisoT[k]) clearTimeout(_badgeAvisoT[k].t);
   _badgeAvisoT[k] = { fones, t: setTimeout(() => {
     delete _badgeAvisoT[k];
-    sendPushToOwner(owner, { tipo: 'badge', fechar: Array.from(fones).map(f => 'chat-' + f) }, { soSemNotificacao: true }).catch(() => {});
+    const lista = Array.from(fones), tags = lista.map(f => 'chat-' + f);
+    sendPushToOwner(owner, { tipo: 'badge', fechar: tags }, { soSemNotificacao: true }).catch(() => {});
+    _lidaAvisaIphone(owner, lista, tags).catch(() => {});
   }, 2000) };
+}
+// 🍎 iPhone: não existe push mudo (a Apple exige notificação visível e cancela a inscrição depois
+// de 3 mudos), então o número do ícone só mudava quando ela abria o app. Ela quis testar: a
+// conversa lida no computador manda ao iPhone uma notificação "Fulano · ✓ lida no computador"
+// com a MESMA tag da notificação da mensagem (substitui a antiga) e o contador certo no ícone.
+// Muitas lidas de uma vez (mais de 5 em 2 s) viram UM aviso só: "✓ N conversas lidas".
+// Desliga com a variável do Railway IPHONE_AVISO_LIDA=0.
+async function _lidaAvisaIphone(owner, fones, tags) {
+  if (String(process.env.IPHONE_AVISO_LIDA || '1') === '0' || !fones.length) return;
+  if (fones.length > 5) return sendPushToOwner(owner, { tipo: 'lida', title: 'FILAZ', body: '✓ ' + fones.length + ' conversas lidas no computador', tag: 'lidas', fechar: tags, silent: true }, { soApple: true });
+  let nomes = {};
+  try { const { data } = await supabase.from('contacts').select('phone, name').eq('owner', owner).in('phone', fones.flatMap(f => phoneVariants(f))); for (const c of (data || [])) nomes[String(c.phone || '').replace(/\D/g, '')] = c.name; } catch (_) {}
+  for (const f of fones) {
+    const nome = nomes[String(f).replace(/\D/g, '')] || f;
+    await sendPushToOwner(owner, { tipo: 'lida', title: String(nome), body: '✓ lida no computador', tag: 'chat-' + f, phone: f, fechar: ['chat-' + f], silent: true }, { soApple: true });
+  }
 }
 
 // Teste de conexão N8N — envia evento de teste para o webhook configurado
