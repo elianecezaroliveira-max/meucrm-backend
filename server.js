@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 389;
+const SERVER_VER = 390;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -4520,6 +4520,15 @@ function _dripDentroDaJanela(r) {
   const toMin = t => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '')); return m ? (+m[1]) * 60 + (+m[2]) : null; };
   const a = toMin(r.hora_ini), b = toMin(r.hora_fim);
   if (a == null && b == null) return true;
+  // 🔁 UM CICLO POR DIA: depois que a fila ESVAZIOU (ciclo fechado) já dentro do horário de hoje,
+  // lead que entrar na etapa mais tarde ESPERA o horário de começar de amanhã — ela: "se eu
+  // colocar um lead depois que o gotejamento acabou, não é para ativar automaticamente; somente
+  // naquela hora". (▶ Iniciar à mão continua valendo a qualquer hora.)
+  if (a != null && r.ciclo_fechado && r.last && r.last.vazio && r.last.quando) {
+    const inicioHojeMs = Date.UTC(agora.getUTCFullYear(), agora.getUTCMonth(), agora.getUTCDate()) + a * 60000 + 3 * 3600000;
+    const fechouMs = Date.parse(r.last.quando);
+    if (fechouMs >= inicioHojeMs && Date.now() >= inicioHojeMs) return false;
+  }
   if (a != null && b != null) return a <= b ? (hm >= a && hm < b) : (hm >= a || hm < b);
   // só "começa às": a partir daquela hora segue até esvaziar a fila (varando a madrugada);
   // se a fila estiver vazia às 00:00 e chegar lead novo, espera a hora de começar
@@ -13358,4 +13367,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
