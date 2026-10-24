@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 390;
+const SERVER_VER = 391;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6993,9 +6993,12 @@ async function _linkTemporarioDoCofre(caminho) {
   } catch (_) { return null; }
 }
 // Substitui variáveis aceitando vários formatos: {nome} (nome) [nome] {{nome}}, maiúsc/minúsc
+// 🌤️ {saudacao} = "Bom dia" / "Boa tarde" / "Boa noite" pela hora de Brasília (dia 5h–11h59, tarde 12h–17h59)
+function _saudacaoAgora() { const h = new Date(Date.now() - 3 * 3600000).getUTCHours(); return h >= 5 && h < 12 ? 'Bom dia' : h >= 12 && h < 18 ? 'Boa tarde' : 'Boa noite'; }
 function applyVars(str, name, phone, notes) {
   if (!str) return str;
   return String(str)
+    .replace(/[\{\(\[]{1,2}\s*sauda[cç][aã]o\s*[\}\)\]]{1,2}/gi, () => _saudacaoAgora())
     .replace(/[\{\(\[]{1,2}\s*nome\s*[\}\)\]]{1,2}/gi, name || '')
     .replace(/[\{\(\[]{1,2}\s*telefone\s*[\}\)\]]{1,2}/gi, phone || '')
     .replace(_VAR_NOTAS_RE, notes || '');
@@ -7801,6 +7804,17 @@ async function processNode(run, depth=0) {
     // Olha o cadastro do lead e escolhe o caminho: Sim (__sim__) ou Não (__nao__)
     let bate = false;
     try {
+      // 📅 "Respondeu no MESMO DIA?": a resposta do lead (última mensagem dele) é do mesmo dia (Brasília)
+      // da última mensagem que ELA/o bot mandou antes dela. Ela: "só quando for respondido no mesmo dia
+      // vai direto para 'Vou realizar a simulação'; no dia seguinte, primeiro 'Bom dia/Boa tarde, fulano'".
+      if (cfg.campo === 'mesmo_dia') {
+        bate = await _leadRespondeuNoMesmoDia(phone, OW);
+        if (cfg.negar) bate = !bate;
+        const nxt0 = await getNextNodeId(nodeId, bate ? '__sim__' : '__nao__');
+        if (nxt0) { await supabase.from('bot_runs').update({ current_node_id:nxt0, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt0}, depth+1); }
+        else await stopRun(runId,'completed');
+        return;
+      }
       const { data: ct } = await supabase.from('contacts').select('tags, stage_id')
         .eq('phone', phone).eq('owner', OW).maybeSingle();
       if (cfg.campo === 'etapa') {
@@ -7831,6 +7845,20 @@ async function processNode(run, depth=0) {
   }
 }
 
+// 📅 A última resposta do lead é do mesmo dia (Brasília) da última mensagem enviada antes dela?
+// Sem resposta do lead na conversa: compara a última enviada com AGORA.
+async function _leadRespondeuNoMesmoDia(phone, owner) {
+  const { data: brutas } = await supabase.from('messages').select('direction, timestamp, type')
+    .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
+    .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(40);
+  const msgs = (brutas || []).filter(m => m && m.type !== 'note');
+  const iIn = msgs.findIndex(m => m.direction === 'inbound');
+  const dia = ts => { const d = new Date(Date.parse(ts) - 3 * 3600000); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1) + '-' + d.getUTCDate(); };
+  const resposta = iIn >= 0 ? msgs[iIn] : null;
+  const enviada = msgs.slice(iIn >= 0 ? iIn + 1 : 0).find(m => m.direction === 'outbound');
+  if (!enviada) return true; // nada enviado antes: não há "dia seguinte"
+  return dia(resposta ? resposta.timestamp : new Date().toISOString()) === dia(enviada.timestamp);
+}
 // Encerra a sequência do bot quando o LEAD responde, se o bot pedir isso
 // (chave no passo "Início"). Não mexe em execuções que estão ESPERANDO resposta:
 // nessas a resposta é justamente o que faz o fluxo seguir.
