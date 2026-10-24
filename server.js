@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 391;
+const SERVER_VER = 392;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7809,6 +7809,9 @@ async function processNode(run, depth=0) {
       // vai direto para 'Vou realizar a simulação'; no dia seguinte, primeiro 'Bom dia/Boa tarde, fulano'".
       if (cfg.campo === 'mesmo_dia') {
         bate = await _leadRespondeuNoMesmoDia(phone, OW);
+        // 🕐 "e em horário comercial": o Sim só vale se AGORA está dentro dos dias/horas (ela: "o sim é
+        // somente se a pessoa respondeu no mesmo dia e em horário comercial")
+        if (bate && cfg.expediente) bate = !!businessHoursState(Date.now(), { days: cfg.days, start: cfg.start, end: cfg.end }).open;
         if (cfg.negar) bate = !bate;
         const nxt0 = await getNextNodeId(nodeId, bate ? '__sim__' : '__nao__');
         if (nxt0) { await supabase.from('bot_runs').update({ current_node_id:nxt0, updated_at:new Date().toISOString() }).eq('id',runId); await processNode({...run,current_node_id:nxt0}, depth+1); }
