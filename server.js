@@ -186,7 +186,11 @@ const { AsyncLocalStorage } = require('async_hooks');
 const _gastoCtx = new AsyncLocalStorage();
 const _BANCO_GB_MES = Math.max(0.1, parseFloat(process.env.BANCO_GB_MES || '5') || 5);
 const _BANCO_DIA_CICLO = Math.min(28, Math.max(1, parseInt(process.env.BANCO_DIA_CICLO || '1', 10) || 1));
-const _BANCO_ORCAMENTO = Math.round(_BANCO_GB_MES * 1024 * 1024 * 1024);
+// 📏 Calibração: o medidor soma o JSON que o Supabase devolve; no fio vai comprimido (gzip), e o
+// painel do Supabase contou 5,47 GB onde o medidor somou 9,9 GB (ciclo 28/09–28/10) = 0,55.
+// BANCO_FATOR (Railway) ajusta; 0,6 é um pouco conservador de propósito.
+const _BANCO_FATOR = Math.min(1, Math.max(0.2, parseFloat(process.env.BANCO_FATOR || '0.6') || 0.6));
+const _BANCO_ORCAMENTO = Math.round(_BANCO_GB_MES * 1024 * 1024 * 1024 / _BANCO_FATOR); // (em "bytes do medidor")
 function _cicloInicio(t) {
   const d = new Date(t || Date.now());
   let a = d.getUTCFullYear(), m = d.getUTCMonth();
@@ -245,6 +249,7 @@ function _gastoResumo() {
   const rotas = Object.entries(_gasto.rotas).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([rota, bytes]) => ({ rota, bytes }));
   return { ciclo_inicio: ini.toISOString().slice(0, 10), ciclo_fim: fim.toISOString().slice(0, 10), dia_do_ciclo: diaDoCiclo, dias_no_ciclo: diasCiclo,
     orcamento: _BANCO_ORCAMENTO, gasto: _gasto.bytes, pct: Math.round(_gasto.bytes / _BANCO_ORCAMENTO * 1000) / 10, projecao,
+    cota_gb: _BANCO_GB_MES, fator: _BANCO_FATOR, gasto_real_gb: Math.round(_gasto.bytes * _BANCO_FATOR / 1073741824 * 100) / 100, projecao_real_gb: Math.round(projecao * _BANCO_FATOR / 1073741824 * 100) / 100,
     nivel: _gastoNivel(), poll_seg: _gastoPollSeg(), hoje: _gasto.dias[new Date().toISOString().slice(0, 10)] || 0,
     dias: _gasto.dias, rotas, medido_desde: _gasto.desde, servidor: _EU_GASTO };
 }
@@ -559,7 +564,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 393;
+const SERVER_VER = 394;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8641,14 +8646,18 @@ function _iaLinhasJsonl(txt) {
 // 💸 A memória (310 KB de exemplos) era baixada INTEIRA a cada minuto: a varredura de 3 em 3 min
 // e cada sugestão pagavam 310 KB — 1,2 GB em 9 dias. Agora: depois de 1 min, só se confere o
 // updated_at das 3 chaves (uns 200 bytes); a memória inteira só desce de novo se alguém gravou.
+const _iaCarimbo = x => { const d = Date.parse(x); return isNaN(d) ? String(x || '') : new Date(d).toISOString(); }; // (o banco devolve "+00:00", nós gravamos "Z")
 async function _iaMemoria(owner, semCache) {
   const k = owner || ' ', c = _iaMemCache[k];
   if (c && !semCache && Date.now() - c.t < 60000) return c;
   const chaves = [_iaMemK(owner, 'estilo'), _iaMemK(owner, 'fluxo'), _iaMemK(owner, 'exemplos')];
-  if (c && !semCache && supabase) {
+  // 💸 "semCache" (antes de gravar) NÃO baixa a memória inteira de novo: confere o carimbo updated_at
+  // (uns 200 bytes) e só rebaixa se alguém gravou — a varredura gravava dezenas de exemplos por dia e
+  // cada um puxava os 300 KB da memória (≈1 GB/mês de saída do Supabase)
+  if (c && supabase) {
     try {
       const { data: carimbos } = await supabase.from('settings').select('key, updated_at').in('key', chaves);
-      const ass = (carimbos || []).map(r => r.key + '@' + r.updated_at).sort().join('|');
+      const ass = (carimbos || []).map(r => r.key + '@' + _iaCarimbo(r.updated_at)).sort().join('|');
       if (ass === c.assinatura) { c.t = Date.now(); return c; } // nada mudou: a cópia da memória vale
     } catch (_) {}
   }
@@ -8661,15 +8670,23 @@ async function _iaMemoria(owner, semCache) {
         else if (r.key.endsWith('::fluxo')) m.fluxo = r.value || '';
         else if (r.key.endsWith('::exemplos')) { m.brutoExemplos = r.value || ''; m.exemplos = _iaLinhasJsonl(r.value); }
       }
-      m.assinatura = (data || []).map(r => r.key + '@' + r.updated_at).sort().join('|');
+      m.assinatura = (data || []).map(r => r.key + '@' + _iaCarimbo(r.updated_at)).sort().join('|');
     } catch (e) { console.error('IA memória:', e.message); }
   }
   _iaMemCache[k] = m;
   return m;
 }
 async function _iaMemoriaGrava(owner, parte, valor) {
-  await supabase.from('settings').upsert({ key: _iaMemK(owner, parte), value: String(valor || ''), updated_at: new Date().toISOString() });
-  delete _iaMemCache[owner || ' '];
+  const quando = new Date().toISOString();
+  await supabase.from('settings').upsert({ key: _iaMemK(owner, parte), value: String(valor || ''), updated_at: quando });
+  // a cópia na memória recebe o que acabou de ser gravado (e o carimbo novo): a próxima leitura não baixa nada
+  const k = owner || ' ', c = _iaMemCache[k];
+  if (c && c.assinatura) {
+    const ch = _iaMemK(owner, parte);
+    if (parte === 'exemplos') { c.brutoExemplos = String(valor || ''); c.exemplos = _iaLinhasJsonl(valor); } else c[parte] = String(valor || '');
+    const partes = c.assinatura.split('|').filter(x => x && !x.startsWith(ch + '@')); partes.push(ch + '@' + _iaCarimbo(quando));
+    c.assinatura = partes.sort().join('|'); c.t = Date.now();
+  } else delete _iaMemCache[k];
 }
 // Ligada quando ela ligou — ou, sem escolha ainda, quando já existe memória (a chave
 // nunca foi mexida em contas sem memória, então nada muda para as outras donas)
