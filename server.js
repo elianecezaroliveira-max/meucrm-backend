@@ -559,7 +559,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 392;
+const SERVER_VER = 393;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -857,7 +857,7 @@ async function _reacaoNaoLida(phone, owner, nome, previa) {
 // tique dela (nada de "Você: ...") e a conversa fica lida.
 // O filtro por last_message_direction evita atropelar uma mensagem do cliente
 // que tenha chegado no meio do caminho.
-async function _previaEnviada(owner, phone, status) {
+async function _previaEnviada(owner, phone, status, req) {
   if (!supabase || !phone) return;
   try {
     let tinhaNaoLida = false;
@@ -874,7 +874,7 @@ async function _previaEnviada(owner, phone, status) {
     await qS;
     // a conversa fica lida de qualquer jeito (mesmo quando o tique já estava mais alto)
     await supabase.from('contacts').update({ unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' ').gt('unread_count', 0);
-    if (tinhaNaoLida) _badgeAvisa(owner, phone); // respondida (por mim ou pelo bot) → o celular tira o aviso
+    if (tinhaNaoLida) _badgeAvisa(owner, phone, { celular: _pedidoDoCelular(req) }); // respondida (por mim ou pelo bot) → o celular tira o aviso
   } catch (e) { console.error('Prévia da conversa enviada:', e.message); }
 }
 
@@ -2501,7 +2501,7 @@ app.post("/send", async (req, res) => {
         await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
         await supabase.from('messages').insert(await _comAutor({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: safeAccountId, status: wamid ? 'sent' : 'pending', wamid, owner: req.owner || null, quoted_id: quoted_id || null, quoted_content: quoted_content || null, quoted_direction: quoted_direction || null }, req));
         await applyPendingStatus(wamid); // recibo que chegou antes da gravação (grupos respondem em ms)
-        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', req);
       }
       return res.json({ success: true, via: 'evolution' });
     } catch(e) {
@@ -2559,7 +2559,7 @@ app.post("/send", async (req, res) => {
         console.error("Erro ao salvar mensagem enviada:", msgErr.message, msgErr.details);
       } else {
         await applyPendingStatus(wamid);
-        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', req);
         console.log("Mensagem enviada salva no banco:", message.substring(0, 50));
       }
     }
@@ -2928,7 +2928,7 @@ app.post("/send-media", async (req, res) => {
           if (req._wfOut && req._wfOut.length && wamid)
             await supabase.from('messages').update({ waveform: JSON.stringify(Array.from(req._wfOut)) }).eq('wamid', wamid).eq('phone', to);
         } catch (_) {}
-        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+        await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', req);
       }
       console.log(`Mídia (${msgType}) enviada via WhatsApp QR: ${evolutionInstance}`);
       // media_id devolvido → o app mantém a prévia local no lugar (foto não pisca)
@@ -3031,7 +3031,7 @@ app.post("/send-media", async (req, res) => {
         media_id: mediaId, media_mime_type: sendMime, // permite exibir a mídia no CRM
       }, req));
       await applyPendingStatus(mediaWamid);
-      await _previaEnviada(req.owner, to, mediaWamid ? 'sent' : 'pending');
+      await _previaEnviada(req.owner, to, mediaWamid ? 'sent' : 'pending', req);
     }
     // 🗄️ Guarda uma cópia do que EU enviei por 6 meses (a Meta apaga em ~30 dias)
     try { if (mediaId && token) arquivaMidiaApi(mediaId, token, sendMime).catch(() => {}); } catch (_) {}
@@ -5941,7 +5941,7 @@ app.post("/send-template", async (req, res) => {
     console.log("Template enviado:", template_name, "→", to, "wamid:", tplWamid);
     res.json({ success: true, data: response.data });
     // o resto (status que chegou antes, prévia) não segura a resposta
-    applyPendingStatus(tplWamid).then(() => _previaEnviada(req.owner, to, tplWamid ? 'sent' : 'pending')).catch(() => {});
+    applyPendingStatus(tplWamid).then(() => _previaEnviada(req.owner, to, tplWamid ? 'sent' : 'pending', req)).catch(() => {});
   } catch (err) {
     if (_reg.emVoo) _falhou(); // a Meta recusou: pode tentar de novo na hora
     const e = err.response?.data?.error || {};
@@ -6367,7 +6367,7 @@ async function saveOutboundSpecial(req, to, account_id, type, content, wamid) {
   const preview = _previaCurta(_previaMidia(type, content));
   await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id || null, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
   await supabase.from('messages').insert(await _comAutor({ phone: to, content, type, direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id || null, status: wamid ? 'sent' : 'pending', wamid: wamid || null, owner: req.owner || null }, req));
-  await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending');
+  await _previaEnviada(req.owner, to, wamid ? 'sent' : 'pending', req);
 }
 
 // 📍 Enviar localização (QR e API oficial)
@@ -6735,7 +6735,7 @@ app.put('/contacts/:phone/mute', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   // 🔇 Igual ao WhatsApp: silenciou, a notificação daquela conversa SAI da bandeja dos
   // celulares e ela deixa de contar no número do ícone (o aviso "badge" faz os dois).
-  if (req.body.muted) _badgeAvisa(req.owner, fone);
+  if (req.body.muted) _badgeAvisa(req.owner, fone, { celular: _pedidoDoCelular(req) });
   res.json({ success: true });
 });
 
@@ -6947,7 +6947,7 @@ app.put("/contacts/:phone/read", async (req, res) => {
   const { error } = await supabase
     .from("contacts").update({ unread_count: 0, first_unread_at: null }).eq("phone", req.params.phone).eq("owner", req.owner || ' ');
   if (error) return res.status(500).json({ error: error.message });
-  if (tinhaNaoLida) _badgeAvisa(req.owner, req.params.phone);
+  if (tinhaNaoLida) _badgeAvisa(req.owner, req.params.phone, { celular: _pedidoDoCelular(req) });
   res.json({ success: true });
   // QR Code: lida aqui = lida no celular (recibo de leitura). Só quando havia algo a ler
   // (ou chegou mensagem há pouco): o app chama esta rota a cada envio.
@@ -12025,17 +12025,21 @@ async function sendPushToOwner(owner, payload, opt) {
 // notificação daquela conversa e acertar o número do ícone — antes o celular ficava com o
 // contador antigo até abrir o app. Junta avisos seguidos (2 s) para não disparar um por clique.
 const _badgeAvisoT = {};
-function _badgeAvisa(owner, phone) {
+// 📱 O pedido veio do celular (app no iPhone/Android)? Então a conversa foi lida/respondida NO celular:
+// o aviso "✓ lida no computador" não faz sentido ("Mesmo respondendo pelo celular aparece a notificação")
+const _pedidoDoCelular = (req) => /iPhone|iPad|Android|Mobile/i.test(String((req && req.headers && req.headers['user-agent']) || ''));
+function _badgeAvisa(owner, phone, opts) {
   if (!owner) return;
   const k = String(owner);
   const fones = (_badgeAvisoT[k] && _badgeAvisoT[k].fones) || new Set();
   if (phone) fones.add(String(phone));
+  const celular = !!(opts && opts.celular) || !!(_badgeAvisoT[k] && _badgeAvisoT[k].celular);
   if (_badgeAvisoT[k]) clearTimeout(_badgeAvisoT[k].t);
-  _badgeAvisoT[k] = { fones, t: setTimeout(() => {
+  _badgeAvisoT[k] = { fones, celular, t: setTimeout(() => {
     delete _badgeAvisoT[k];
     const lista = Array.from(fones), tags = lista.map(f => 'chat-' + f);
     sendPushToOwner(owner, { tipo: 'badge', fechar: tags }, { soSemNotificacao: true }).catch(() => {});
-    _lidaAvisaIphone(owner, lista, tags).catch(() => {});
+    if (!celular) _lidaAvisaIphone(owner, lista, tags).catch(() => {}); // lida no celular: sem aviso no iPhone
   }, 2000) };
 }
 // 🍎 iPhone: não existe push mudo (a Apple exige notificação visível e cancela a inscrição depois
