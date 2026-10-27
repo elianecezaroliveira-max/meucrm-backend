@@ -564,7 +564,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 396;
+const SERVER_VER = 397;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -5760,6 +5760,8 @@ app.get("/templates", async (req, res) => {
     const response = await axios.get(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, {
       params: { access_token: account.token, fields: "id,name,status,category,language,components,rejected_reason,quality_score", limit: 100 },
     });
+    // a listagem já traz o corpo de cada modelo → fica guardado para o bot (sem depender da Meta na hora do envio)
+    try { (response.data.data || []).forEach(t => { const b = (t.components || []).find(c => c.type === 'BODY'); if (t.status === 'APPROVED' && b && b.text) _tmplCorpoAnota(account.waba_id, t.name, t.language, b.text); }); } catch (_) {}
     res.json(response.data.data || []);
   } catch (err) {
     console.error("Erro ao listar templates:", err.response?.data || err.message);
@@ -7230,23 +7232,77 @@ async function botGetAcct(accountId, owner) {
   return { phone_number_id: process.env.PHONE_NUMBER_ID, token: process.env.WHATSAPP_TOKEN, waba_id: process.env.WABA_ID };
 }
 
-// Busca o corpo (BODY) de um modelo aprovado na Meta — com cache em memória
+// Busca o corpo (BODY) de um modelo aprovado na Meta — com cache em memória, 2 tentativas e uma cópia
+// guardada no banco (settings tmpl_corpo::waba::nome::idioma). Ela (print da Elizete/Geraldo): a Meta não
+// devolvia o corpo na hora do bot e a mensagem ficava gravada como "[Modelo: anac_54856]" na conversa,
+// embora o lead tenha recebido o texto certo.
 const _tmplBodyCache = {};
-async function getTemplateBodyText(token, wabaId, name, lang) {
-  if (!token || !wabaId || !name) return null;
+const _tmplCorpoChave = (wabaId, name, lang) => 'tmpl_corpo::' + wabaId + '::' + name + '::' + (lang || '');
+function _tmplCorpoAnota(wabaId, name, lang, txt) {
+  // guarda no cache e no banco (só quando é novidade — 1 gravação por modelo por servidor)
+  if (!txt) return;
   const key = wabaId + '|' + name + '|' + (lang || '');
-  if (_tmplBodyCache[key] !== undefined) return _tmplBodyCache[key];
+  if (_tmplBodyCache[key] === txt) return;
+  _tmplBodyCache[key] = txt;
+  if (supabase) supabase.from('settings').upsert({ key: _tmplCorpoChave(wabaId, name, lang), value: txt, updated_at: new Date().toISOString() }).then(() => {}, () => {});
+}
+async function _metaCorpoDoModelo(token, wabaId, name, lang) {
+  const pega = async (params) => {
+    const r = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}/message_templates`, { params: Object.assign({ access_token: token, fields: 'name,language,components', limit: 100 }, params) });
+    return r.data?.data || [];
+  };
+  let list = await pega({ name });
+  if (!list.some(t => t.name === name)) list = await pega({}); // o filtro por nome voltou vazio → lista inteira
+  const tmpl = list.find(t => t.name === name && (!lang || t.language === lang)) || list.find(t => t.name === name);
+  return tmpl?.components?.find(c => c.type === 'BODY')?.text || null;
+}
+async function getTemplateBodyText(token, wabaId, name, lang) {
+  if (!wabaId || !name) return null;
+  const key = wabaId + '|' + name + '|' + (lang || '');
+  if (_tmplBodyCache[key]) return _tmplBodyCache[key];
+  let txt = null, erro = null;
+  for (let tent = 0; tent < 2 && !txt && token; tent++) {
+    try { txt = await _metaCorpoDoModelo(token, wabaId, name, lang); }
+    catch (e) { erro = e; if (tent === 0) await new Promise(r => setTimeout(r, 1200)); }
+  }
+  if (txt) { _tmplCorpoAnota(wabaId, name, lang, txt); return txt; }
+  // ⚠️ falha passageira da Meta NÃO fica guardada (ficava "null" para sempre → erro 132000 até reiniciar)
+  console.warn('Modelo ' + name + ': a Meta não devolveu o corpo' + (erro ? ' — ' + JSON.stringify(erro.response?.data?.error || erro.message) : ' (não está na lista do WABA ' + wabaId + ')') + '; usando a cópia guardada, se houver');
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('settings').select('value').eq('key', _tmplCorpoChave(wabaId, name, lang)).maybeSingle();
+      if (data && data.value) { _tmplBodyCache[key] = data.value; return data.value; }
+    } catch (_) {}
+  }
+  return null;
+}
+
+// Mensagens antigas gravadas como "[Modelo: nome]" (a Meta não tinha devolvido o corpo na hora): assim que o
+// corpo aparece, troca pelo texto de verdade — só para modelo com UMA variável ({{1}} = nome do lead, que é o
+// que o bot manda). Falhas de envio ficam como estão. Roda uma vez por modelo por servidor.
+const _modeloJaPreencheu = {};
+async function _modeloPreencheAntigos(owner, name, bodyText) {
+  if (!supabase || !owner || !name || !bodyText) return 0;
+  const k = owner + '|' + name; if (_modeloJaPreencheu[k]) return 0; _modeloJaPreencheu[k] = true;
+  const vars = new Set(bodyText.match(/\{\{\d+\}\}/g) || []);
+  if (vars.size !== 1 || !vars.has('{{1}}')) return 0;
+  const rotulo = '[Modelo: ' + name + ']';
+  let n = 0;
   try {
-    const r = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}/message_templates`, {
-      params: { access_token: token, name, fields: 'name,language,components', limit: 10 }
-    });
-    const list = r.data?.data || [];
-    const tmpl = list.find(t => t.name === name && (!lang || t.language === lang)) || list.find(t => t.name === name) || list[0];
-    const body = tmpl?.components?.find(c => c.type === 'BODY');
-    const txt = body?.text || null;
-    _tmplBodyCache[key] = txt;
-    return txt;
-  } catch(e) { return null; } // ⚠️ falha passageira da Meta NÃO fica guardada: ficava "null" para sempre e todo envio seguinte do modelo saía sem variáveis (erro 132000 até o servidor reiniciar)
+    const { data: rows } = await supabase.from('messages').select('id,phone').eq('owner', owner).eq('content', rotulo).neq('status', 'failed').limit(300);
+    if (!rows || !rows.length) return 0;
+    const fones = [...new Set(rows.map(r => r.phone))];
+    const { data: cts } = await supabase.from('contacts').select('phone,name,last_message_preview').eq('owner', owner).in('phone', fones);
+    const porFone = {}; (cts || []).forEach(c => { porFone[c.phone] = c; });
+    for (const r of rows) {
+      const txt = renderTemplateBody(bodyText, [(porFone[r.phone] && porFone[r.phone].name) || r.phone]);
+      await supabase.from('messages').update({ content: txt }).eq('id', r.id); n++;
+      const c = porFone[r.phone];
+      if (c && c.last_message_preview === rotulo) { await supabase.from('contacts').update({ last_message_preview: txt.length > 80 ? txt.substring(0, 80) + '…' : txt }).eq('owner', owner).eq('phone', r.phone); c.last_message_preview = txt; }
+    }
+    if (n) console.log('Modelo ' + name + ': ' + n + ' mensagem(ns) antiga(s) "[Modelo: …]" agora mostram o texto de verdade');
+  } catch (e) { console.error('modelo antigos:', e.message); }
+  return n;
 }
 
 // Substitui {{1}}, {{2}}… pelos valores das variáveis (posicional)
@@ -7316,6 +7372,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
       await applyPendingStatus(tWamid);
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
+      if (bodyText) await _modeloPreencheAntigos(owner, cfg.template_name, bodyText); // conserta as antigas "[Modelo: …]"
       return tWamid || true;
     }
     return true;
