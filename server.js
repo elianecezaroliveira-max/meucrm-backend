@@ -30,14 +30,28 @@ let supabase = null;
 const _tabVer = { contacts: 0, messages: 0 };
 const _sujoLog = { contacts: [] };          // [{ ver, fones:[…] | null }] (null = tudo)
 const _verConv = new Map();                 // telefone → versão da conversa
-function _marcaSujo(tabela, fones) {
+// 💸 O QUE mudou em cada conversa (v401): a conversa aberta era relida INTEIRA (300 linhas) a cada
+// recibo de entrega/leitura — era a maior leitura que sobrou (~2 GB/ciclo). Agora cada escrita em
+// messages anota o que tocou (ids, wamids, "entrou linha nova"); o GET /messages relê só isso e
+// encaixa na cópia guardada. Escrita sem id/wamid (ex.: status por telefone) = relê a conversa inteira.
+const _convTocadas = new Map();             // telefone → [{ ver, ids:[], wamids:[], novas, tudo }]
+function _anotaTocada(fones, toque) {
+  for (const f of fones) for (const v of (typeof phoneVariants === 'function' ? phoneVariants(f) : [String(f)])) {
+    const l = _convTocadas.get(v) || [];
+    l.push(Object.assign({ ver: _verConv.get(v) || 0 }, toque));
+    if (l.length > 60) l.splice(0, l.length - 60);
+    _convTocadas.set(v, l);
+  }
+}
+function _marcaSujo(tabela, fones, toque) {
   _tabVer[tabela]++;
   if (tabela === 'contacts') {
     _sujoLog.contacts.push({ ver: _tabVer.contacts, fones: fones ? fones.map(String) : null });
     if (_sujoLog.contacts.length > 400) _sujoLog.contacts.splice(0, _sujoLog.contacts.length - 400);
   } else {
-    if (!fones) { _verConv.clear(); _verGeralMsgs++; return; }
+    if (!fones) { _verConv.clear(); _convTocadas.clear(); _verGeralMsgs++; return; }
     for (const f of fones) for (const v of (typeof phoneVariants === 'function' ? phoneVariants(f) : [String(f)])) _verConv.set(v, (_verConv.get(v) || 0) + 1);
+    _anotaTocada(fones, toque || { tudo: true });
   }
 }
 let _verGeralMsgs = 0; // escrita em messages SEM telefone conhecido: todas as conversas releem
@@ -68,6 +82,33 @@ function _lembraWamid(wamid, fone) {
   if (_fonePorWamid.size > 8000) { const k = _fonePorWamid.keys().next().value; _fonePorWamid.delete(k); }
 }
 const _versaoConversa = (fone) => _verGeralMsgs + '|' + ((typeof phoneVariants === 'function' ? phoneVariants(fone) : [String(fone)]).map(v => _verConv.get(v) || 0).join(','));
+const _gastoIncremental = { poupadas: 0 }; // quantas vezes a conversa foi completada sem reler inteira
+// O que mudou na conversa desde a versão `verAntes` (a que a cópia guardada tem).
+// null = não dá para saber (escrita sem telefone, toque "tudo", registro estourado): relê inteira.
+function _convMudancasDesde(fone, verAntes) {
+  try {
+    const [geral, lista] = String(verAntes || '').split('|');
+    if (geral !== String(_verGeralMsgs)) return null;
+    const vars = typeof phoneVariants === 'function' ? phoneVariants(fone) : [String(fone)];
+    const antes = String(lista || '').split(',');
+    const r = { novas: false, ids: [], wamids: [] };
+    for (let i = 0; i < vars.length; i++) {
+      const vAntes = Number(antes[i] || 0), vAgora = _verConv.get(vars[i]) || 0;
+      if (vAgora === vAntes) continue;
+      const log = (_convTocadas.get(vars[i]) || []).filter(t => t.ver > vAntes);
+      // o registro não cobre tudo o que mudou (foi cortado) → relê inteira
+      if (log.length < (vAgora - vAntes)) return null;
+      for (const t of log) {
+        if (t.tudo) return null;
+        if (t.novas) r.novas = true;
+        (t.ids || []).forEach(x => r.ids.push(x)); (t.wamids || []).forEach(x => r.wamids.push(x));
+      }
+    }
+    r.ids = [...new Set(r.ids.map(String))]; r.wamids = [...new Set(r.wamids)];
+    if (r.ids.length + r.wamids.length > 80) return null; // muita coisa: a leitura inteira sai mais barata
+    return r;
+  } catch (_) { return null; }
+}
 function _embrulhaParaCache(cli) {
   const fromOrig = cli.from.bind(cli);
   cli.from = (tabela) => {
@@ -96,7 +137,8 @@ function _embrulhaParaCache(cli) {
         const arr = Array.isArray(linhas) ? linhas : [linhas];
         const fones = arr.map(r => r && r[campoFone]).filter(Boolean);
         if (tabela === 'messages') arr.forEach(r => { if (r) _lembraWamid(r.wamid, r.phone); });
-        _marcaSujo(tabela, fones.length === arr.length && fones.length ? fones : null);
+        // upsert pode ALTERAR linha existente (não só entrar nova): sem wamid/id conhecidos → relê a conversa
+        _marcaSujo(tabela, fones.length === arr.length && fones.length ? fones : null, m === 'insert' ? { novas: true } : { tudo: true });
         const donos = arr.map(r => r && r.owner).filter(Boolean);
         return _depoisDeGravar(orig(linhas, ...a), (v) => { if (!v || !v.error) _acorda(donos.length ? donos : null); });
       };
@@ -106,18 +148,36 @@ function _embrulhaParaCache(cli) {
       const orig = b[m].bind(b);
       b[m] = (...a) => {
         const fb = orig(...a);
-        const fones = [], donos = []; let marcado = false, semFone = false;
+        const fones = [], donos = [], ids = [], wamids = []; let marcado = false, semFone = false;
         try {
           const eqO = fb.eq.bind(fb), inO = fb.in.bind(fb), thenO = fb.then.bind(fb);
           fb.eq = (c, v) => {
             if (c === 'owner') donos.push(v);
             if (c === campoFone) fones.push(v);
-            else if (c === 'wamid' && tabela === 'messages') { const f = _fonePorWamid.get(String(v)); if (f) fones.push(f); else semFone = true; }
+            else if (c === 'wamid' && tabela === 'messages') { wamids.push(String(v)); const f = _fonePorWamid.get(String(v)); if (f) fones.push(f); else semFone = true; }
+            else if (c === 'id' && tabela === 'messages') ids.push(v);
             return eqO(c, v);
           };
-          fb.in = (c, v) => { if (c === campoFone) (v || []).forEach(x => fones.push(x)); return inO(c, v); };
-          fb.then = (ok, err) => { if (!marcado) { marcado = true; _marcaSujo(tabela, (fones.length && !semFone) ? fones : null); }
-            return thenO(v => { try { if (!v || !v.error) _acorda(donos.length ? donos : null); } catch (_) {} return ok ? ok(v) : v; }, err); };
+          fb.in = (c, v) => { if (c === campoFone) (v || []).forEach(x => fones.push(x)); else if (c === 'id' && tabela === 'messages') (v || []).forEach(x => ids.push(x)); else if (c === 'wamid' && tabela === 'messages') (v || []).forEach(x => wamids.push(String(x))); return inO(c, v); };
+          // o que foi tocado: de preferência os ids que a escrita DEVOLVEU (.select('id')) — valem
+          // para qualquer filtro; senão os ids/wamids do filtro; senão "tudo" (relê a conversa)
+          const toque = (v) => {
+            if (tabela !== 'messages') return { tudo: true };
+            if (v && Array.isArray(v.data) && v.data.every(r => r && r.id != null)) return { ids: v.data.map(r => r.id), wamids: [] };
+            return (ids.length || wamids.length) ? { ids: ids.slice(), wamids: wamids.slice() } : { tudo: true };
+          };
+          fb.then = (ok, err) => thenO(v => {
+            // marca DEPOIS da gravação: a resposta (.select('id, phone')) ensina o telefone de um
+            // recibo por wamid que a memória não conhecia — antes isso invalidava TODAS as conversas
+            if (!marcado) {
+              marcado = true;
+              let fs = fones;
+              if (semFone && tabela === 'messages' && v && Array.isArray(v.data) && v.data.length && v.data.every(r => r && r.phone)) { fs = fones.concat(v.data.map(r => r.phone)); semFone = false; v.data.forEach(r => { if (r.wamid) _lembraWamid(r.wamid, r.phone); }); }
+              _marcaSujo(tabela, (fs.length && !semFone) ? fs : null, toque(v));
+            }
+            try { if (!v || !v.error) _acorda(donos.length ? donos : null); } catch (_) {}
+            return ok ? ok(v) : v;
+          }, (e) => { if (!marcado) { marcado = true; _marcaSujo(tabela, (fones.length && !semFone) ? fones : null, toque()); } if (err) return err(e); throw e; });
         } catch (_) { _marcaSujo(tabela, null); }
         return fb;
       };
@@ -251,7 +311,7 @@ function _gastoResumo() {
     orcamento: _BANCO_ORCAMENTO, gasto: _gasto.bytes, pct: Math.round(_gasto.bytes / _BANCO_ORCAMENTO * 1000) / 10, projecao,
     cota_gb: _BANCO_GB_MES, fator: _BANCO_FATOR, gasto_real_gb: Math.round(_gasto.bytes * _BANCO_FATOR / 1073741824 * 100) / 100, projecao_real_gb: Math.round(projecao * _BANCO_FATOR / 1073741824 * 100) / 100,
     nivel: _gastoNivel(), poll_seg: _gastoPollSeg(), hoje: _gasto.dias[new Date().toISOString().slice(0, 10)] || 0,
-    dias: _gasto.dias, rotas, medido_desde: _gasto.desde, servidor: _EU_GASTO };
+    dias: _gasto.dias, rotas, medido_desde: _gasto.desde, servidor: _EU_GASTO, conversas_poupadas: _gastoIncremental.poupadas };
 }
 const _EU_GASTO = 'p' + process.pid;
 const _GASTO_K = () => 'gasto_banco::' + _cicloInicio().toISOString().slice(0, 10);
@@ -586,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 400;
+const SERVER_VER = 401;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -932,7 +992,7 @@ async function _mirrorContactStatus(wamid, status) {
             .lt('timestamp', r.timestamp)
             .or('status.is.null,status.in.(' + abaixo + ')');
           q2 = r.owner ? q2.eq('owner', r.owner) : q2.is('owner', null);
-          await q2;
+          await q2.select('id'); // (.select('id'): a conversa guardada relê só as linhas que mudaram)
         } catch (_) {}
       }
     }
@@ -982,7 +1042,7 @@ async function _esperaEnvioDoBot(wamid, ms) {
 async function updateMsgStatus(wamid, upd) {
   if (!supabase || !wamid || !upd?.status) return;
   // Tique de entrega/leitura vale SÓ para mensagem enviada por mim (outbound)
-  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound'); _mirrorContactStatus(wamid, 'failed'); _avisaEsperaStatus(wamid, 'failed'); return; }
+  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound').select('id, phone, wamid'); _mirrorContactStatus(wamid, 'failed'); _avisaEsperaStatus(wamid, 'failed'); return; }
   const rank = _ST_RANK[upd.status];
   if (rank === undefined) return;
   const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
@@ -991,10 +1051,10 @@ async function updateMsgStatus(wamid, upd) {
   if (upd.status === 'delivered') upd2.delivered_at = new Date().toISOString();
   if (upd.status === 'read') upd2.read_at = new Date().toISOString();
   let { data: mexeu, error: eCol } = await supabase.from('messages').update(upd2).eq('wamid', wamid).eq('direction', 'outbound')
-    .or('status.is.null,status.in.(' + lower.join(',') + ')').select('id');
+    .or('status.is.null,status.in.(' + lower.join(',') + ')').select('id, phone, wamid'); // (phone: ensina a conversa do recibo à memória)
   if (eCol) { // colunas de horário ainda não existem no banco: segue só com o status
     ({ data: mexeu } = await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound')
-      .or('status.is.null,status.in.(' + lower.join(',') + ')').select('id'));
+      .or('status.is.null,status.in.(' + lower.join(',') + ')').select('id, phone, wamid'));
   }
   // 🕐 O recibo chegou ANTES de a mensagem ser gravada (no QR o "entregue" de um grupo volta em
   // milissegundos, antes do insert): guarda e aplica assim que a linha existir — senão o tique
@@ -1235,7 +1295,7 @@ app.post("/webhook", async (req, res) => {
         // (a Meta reenvia webhooks: a mesma reação não pode contar duas vezes)
         if (message.id && !_carimbaChegada('meta|reacao|' + message.id)) { console.log('↩️ Reação repetida ignorada:', message.id); continue; }
         if (supabase && targetWamid) {
-          await supabase.from('messages').update({ reaction: emoji, reaction_by: 'contact' }).eq('wamid', targetWamid);
+          await supabase.from('messages').update({ reaction: emoji, reaction_by: 'contact' }).eq('wamid', targetWamid).select('id, phone');
           // Prévia da lista IGUAL ao WhatsApp: "Reagiu com ❤️ a: …" (e sobe a conversa)
           if (emoji) { try {
             const { data: alvo } = await supabase.from('messages').select('content, phone, owner').eq('wamid', targetWamid).maybeSingle();
@@ -1427,7 +1487,7 @@ app.post("/webhook", async (req, res) => {
         // Etiqueta "Encaminhada" (opcional — ignora se a coluna não existir)
         try {
           if (message.context && (message.context.forwarded || message.context.frequently_forwarded) && message.id)
-            await supabase.from('messages').update({ forwarded: true }).eq('wamid', message.id);
+            await supabase.from('messages').update({ forwarded: true }).eq('wamid', message.id).select('id, phone');
         } catch (_) {}
         // 💬 respondeu citando uma mensagem (inclusive o botão de um modelo)
         if (!msgErr && message.context && message.context.id && message.id)
@@ -2616,7 +2676,7 @@ app.post("/react", async (req, res) => {
         await sock.sendMessage(jid, {
           react: { text: emoji || '', key: { remoteJid: jid, fromMe: msgRow?.direction === 'outbound', id: wamid } },
         });
-        await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid).eq('owner', req.owner || ' ');
+        await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid).eq('owner', req.owner || ' ').select('id, phone');
         res.json({ success: true, via: 'qr' });
         _previaMinhaReacao(wamid, emoji, req.owner).catch(() => {});
         return;
@@ -2708,8 +2768,8 @@ function _qrTextoEditado(ed) {
 async function _qrAplicaEdicao(wamidAlvo, novoTxt) {
   if (!supabase || !wamidAlvo || !novoTxt) return false;
   try {
-    const { error } = await supabase.from('messages').update({ content: novoTxt, edited: true }).eq('wamid', wamidAlvo);
-    if (error) await supabase.from('messages').update({ content: novoTxt }).eq('wamid', wamidAlvo); // banco sem a coluna "edited"
+    const { error } = await supabase.from('messages').update({ content: novoTxt, edited: true }).eq('wamid', wamidAlvo).select('id, phone');
+    if (error) await supabase.from('messages').update({ content: novoTxt }).eq('wamid', wamidAlvo).select('id, phone'); // banco sem a coluna "edited"
     return true;
   } catch (_) { return false; }
 }
@@ -3463,7 +3523,7 @@ app.get('/audio-dur/:mediaId', async (req, res) => {
         const { data: ms } = await supabase.from('messages').select('id, content').eq('media_id', mediaId).eq('owner', req.owner || ' ').limit(3);
         for (const m of (ms || [])) {
           if (/\(\d+:\d{2}\)/.test(String(m.content || ''))) continue; // já tem
-          await supabase.from('messages').update({ content: '🎤 Mensagem de voz (' + _fmtDur(val) + ')' }).eq('id', m.id);
+          await supabase.from('messages').update({ content: '🎤 Mensagem de voz (' + _fmtDur(val) + ')' }).eq('id', m.id).select('id, phone');
         }
       } catch (_) {}
     }
@@ -3846,7 +3906,7 @@ app.post('/transcribe', async (req, res) => {
     try { mp3 = await _paraMp3(bruto); ehMp3 = (mp3 !== bruto); } catch (e) { console.warn('conversão mp3 falhou, mandando original:', e.message); }
     const texto = await _transcreverBuffer(mp3, ehMp3, mime);
     if (!texto) return res.json({ ok: true, transcript: '', vazio: true });
-    const { error: upErr } = await supabase.from('messages').update({ transcript: texto }).eq('id', id);
+    const { error: upErr } = await supabase.from('messages').update({ transcript: texto }).eq('id', id).select('id, phone');
     if (upErr) {
       // coluna ainda não existe? devolve o texto mesmo assim e avisa
       return res.json({ ok: true, transcript: texto, nao_salvo: true, aviso: 'Rode atualizacao-transcricao.sql no Supabase para o texto ficar salvo (' + upErr.message + ')' });
@@ -4498,6 +4558,31 @@ function _dripCarenciaMs(r) { return Math.min(_DRIP_CARENCIA_MS, Math.max(90000,
 // hora_ini, hora_fim, next_at, last }]
 // ═══════════════════════════════════════════════════════════════════════════
 function _dripRegras(owner) { try { const a = JSON.parse(_cfg('drip_rules', owner) || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+// 📜 HISTÓRICO DO GOTEJAMENTO (v401): os últimos 200 leads movidos (hora, lead, regra, motivo). Só ficava
+// o último; para conferir "está no segundo certo?" era preciso vasculhar o banco. Gravação juntada (1 s).
+const _DRIP_HIST_N = 200;
+const _dripHistPend = new Map(); // owner → timer
+function _dripHist(owner) { try { const a = JSON.parse(_cfg('drip_hist', owner) || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+function _dripHistAnota(owner, item) {
+  const k = 'drip_hist::' + (owner || ' ');
+  const lista = _dripHist(owner);
+  lista.unshift(item);
+  if (lista.length > _DRIP_HIST_N) lista.length = _DRIP_HIST_N;
+  _settings[k] = JSON.stringify(lista);
+  clearTimeout(_dripHistPend.get(owner));
+  _dripHistPend.set(owner, setTimeout(() => {
+    _dripHistPend.delete(owner);
+    if (supabase) supabase.from('settings').upsert({ key: k, value: _settings[k], updated_at: new Date().toISOString() }, { onConflict: 'key' }).then(() => {}, e => console.error('histórico do gotejamento:', e && e.message));
+  }, 1000));
+}
+// Intervalo REAL medido por regra (mediana entre leads seguidos, últimos 40 do histórico)
+function _dripRitmoReal(owner, regraId) {
+  const ts = _dripHist(owner).filter(h => h.regra === regraId).map(h => Date.parse(h.t)).filter(Boolean).sort((a, b) => a - b).slice(-41);
+  const gaps = []; for (let i = 1; i < ts.length; i++) { const g = (ts[i] - ts[i - 1]) / 1000; if (g > 0 && g < 6 * 3600) gaps.push(g); }
+  if (!gaps.length) return null;
+  gaps.sort((a, b) => a - b);
+  return { mediana_seg: Math.round(gaps[Math.floor(gaps.length / 2)]), min_seg: Math.round(gaps[0]), max_seg: Math.round(gaps[gaps.length - 1]), n: gaps.length };
+}
 async function _dripSalva(owner, regras) {
   const k = 'drip_rules::' + (owner || ' ');
   const value = JSON.stringify(regras);
@@ -4793,6 +4878,7 @@ async function _dripTick() {
         r.vazio_desde = null; // entrou lead: a contagem de carência recomeça
         r.movidos = (r.movidos || 0) + 1; r.ciclo_fechado = false; r._tocada = true;
         r.last = { quando: new Date().toISOString(), phone: lead.phone, name: lead.name || '', proximo_em_seg: Math.max(0, Math.round((Date.parse(r.next_at) - Date.now()) / 1000)), motivo: rodaManual ? 'manual' : 'automatico' };
+        try { _dripHistAnota(owner, { t: r.last.quando, regra: r.id, nome: r.nome || '', phone: lead.phone, name: lead.name || '', motivo: r.last.motivo, para: r.para }); } catch (_) {}
         // 🔔 Era o ÚLTIMO da fila? Marca agora: o aviso de fim sai quando a carência passar
         // (sem esperar o próximo horário). Leitura de 1 linha só com o telefone.
         try {
@@ -4840,6 +4926,13 @@ app.get('/drip', async (req, res) => {
   const janela = {};
   for (const r of regras) janela[r.id] = _dripDentroDaJanela(r);
   res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay() });
+});
+// 📜 Histórico: os últimos 200 leads movidos pelo gotejamento (mais recente primeiro) + ritmo real por regra
+app.get('/drip/historico', (req, res) => {
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const regras = _dripRegras(req.owner);
+  const ritmo = {}; for (const r of regras) ritmo[r.id] = _dripRitmoReal(req.owner, r.id);
+  res.json({ itens: _dripHist(req.owner), ritmo });
 });
 app.put('/drip', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -5349,15 +5442,20 @@ async function _msgLixGuarda(owner, phone, nome, linhas, oque) {
 app.delete("/messages/id/:id", async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Supabase não configurado" });
   const OW = req.owner || ' ';
+  let _foneApagada = null;
   // Antes de apagar: cópia na lixeira (30 dias)
   try {
     const { data: linhas } = await supabase.from('messages').select('*').eq('id', req.params.id).eq('owner', OW).limit(1);
     if (linhas && linhas.length) {
+      _foneApagada = linhas[0].phone || null;
       const txt = String(linhas[0].content || '').replace(/\s+/g, ' ').slice(0, 60);
       await _msgLixGuarda(OW, linhas[0].phone, txt, linhas, 'uma mensagem');
     }
   } catch (e) { console.error('Lixeira de mensagem:', e.message); }
-  const { error } = await supabase.from("messages").delete().eq("id", req.params.id).eq("owner", OW);
+  // (com o telefone no filtro, só ESTA conversa é relida — sem ele todas as conversas guardadas eram invalidadas)
+  let del = supabase.from("messages").delete().eq("id", req.params.id).eq("owner", OW);
+  if (_foneApagada) del = del.in('phone', phoneVariants(_foneApagada));
+  const { error } = await del;
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -5516,10 +5614,33 @@ app.get("/messages/:phone", async (req, res) => {
   let _euBusquei = false;
   let corpo;
   try {
-    corpo = await _comCache(_chaveC, _versaoConversa(req.params.phone), _CACHE_TTL_MS, async () => {
+    corpo = await _comCache(_chaveC, _versaoConversa(req.params.phone), _CACHE_TTL_MS, async (c) => {
       _euBusquei = true;
       let brutas, error, mais = null;
-      if (_lim) {
+      // 💸 LEITURA INCREMENTAL (v401): já tenho a conversa guardada e sei o que mudou nela desde então
+      // (ids/wamids tocados, linhas novas) → relê só isso e encaixa. Senão, relê inteira como antes.
+      const inc = (c && c.corpo && Array.isArray(c.corpo.data) && (Date.now() - c.t) < _CACHE_TTL_MS) ? _convMudancasDesde(req.params.phone, c.ver) : null;
+      if (inc) {
+        const vars = phoneVariants(req.params.phone), OWq = req.owner || ' ';
+        let dados = c.corpo.data.slice(); mais = c.corpo.mais;
+        const porId = new Map(dados.map(m => [String(m.id), m]));
+        const pega = async (q) => { const r = await q; if (r.error) throw new Error(r.error.message); return r.data || []; };
+        const lidas = [];
+        if (inc.novas) {
+          const maxId = dados.reduce((a, m) => (Number(m.id) > a ? Number(m.id) : a), 0);
+          lidas.push(...await pega(supabase.from('messages').select('*').in('phone', vars).eq('owner', OWq).gt('id', maxId).order('id', { ascending: true })));
+        }
+        if (inc.ids.length) lidas.push(...await pega(supabase.from('messages').select('*').in('phone', vars).eq('owner', OWq).in('id', inc.ids)));
+        if (inc.wamids.length) lidas.push(...await pega(supabase.from('messages').select('*').in('phone', vars).eq('owner', OWq).in('wamid', inc.wamids)));
+        const vieram = new Set(lidas.map(m => String(m.id)));
+        // tocadas que NÃO voltaram = apagadas
+        for (const id of inc.ids) if (!vieram.has(String(id))) porId.delete(String(id));
+        if (inc.wamids.length) { const ws = new Set(inc.wamids.map(String)); for (const [id, m] of porId) if (m.wamid && ws.has(String(m.wamid)) && !vieram.has(id)) porId.delete(id); }
+        for (const m of lidas) porId.set(String(m.id), m);
+        brutas = [...porId.values()].sort((a, b) => (String(a.timestamp) < String(b.timestamp) ? -1 : String(a.timestamp) > String(b.timestamp) ? 1 : ((Number(a.id) - Number(b.id)) || String(a.id).localeCompare(String(b.id)))));
+        if (_lim && brutas.length > _lim) { const corte = brutas.length - _lim; brutas = brutas.slice(corte); mais = (typeof mais === 'number' && mais > 0) ? mais + corte : -1; }
+        _gastoIncremental.poupadas++;
+      } else if (_lim) {
         // (ordem ESTÁVEL: horário e depois id — duas linhas no mesmo horário vinham
         //  em ordem diferente a cada pedido e a bolha era recriada na tela)
         const r = await supabase.from("messages").select("*").in("phone", phoneVariants(req.params.phone)).eq("owner", req.owner || ' ')
@@ -5592,14 +5713,14 @@ app.get("/messages/:phone", async (req, res) => {
         const { data: ultReal, error: eR } = await supabase.from('messages').select('timestamp').eq('phone', ph).eq('owner', OW)
           .eq('direction', 'outbound').not('read_at', 'is', null).order('timestamp', { ascending: false }).limit(1).maybeSingle();
         if (!eR && ultReal) await supabase.from('messages').update({ status: 'delivered' }).eq('phone', ph).eq('owner', OW)
-          .eq('direction', 'outbound').eq('status', 'read').is('read_at', null).gt('timestamp', ultReal.timestamp);
+          .eq('direction', 'outbound').eq('status', 'read').is('read_at', null).gt('timestamp', ultReal.timestamp).select('id'); // (.select('id'): a conversa guardada relê só essas linhas)
       } catch (_) {}
       const { data: ultR } = await base().eq('status', 'read').order('timestamp', { ascending: false }).limit(1).maybeSingle();
       if (ultR) await supabase.from('messages').update({ status: 'read' }).eq('phone', ph).eq('owner', OW).eq('direction', 'outbound')
-        .lt('timestamp', ultR.timestamp).or('status.is.null,status.in.(pending,sent,delivered)');
+        .lt('timestamp', ultR.timestamp).or('status.is.null,status.in.(pending,sent,delivered)').select('id');
       const { data: ultD } = await base().eq('status', 'delivered').order('timestamp', { ascending: false }).limit(1).maybeSingle();
       if (ultD) await supabase.from('messages').update({ status: 'delivered' }).eq('phone', ph).eq('owner', OW).eq('direction', 'outbound')
-        .lt('timestamp', ultD.timestamp).or('status.is.null,status.in.(pending,sent)');
+        .lt('timestamp', ultD.timestamp).or('status.is.null,status.in.(pending,sent)').select('id');
       // Prévia = status REAL da última mensagem enviada (nunca "lida" por herança)
       const { data: c } = await supabase.from('contacts').select('last_message_status, last_message_at, last_message_direction').eq('phone', ph).eq('owner', OW).maybeSingle();
       if (c && c.last_message_direction === 'outbound') {
@@ -5625,14 +5746,14 @@ app.put('/messages/:id/waveform', async (req, res) => {
   let q = supabase.from('messages').update({ waveform: JSON.stringify(arr.map(v => Math.round(Number(v)))) })
     .eq('id', req.params.id).eq('owner', req.owner);
   if (req.body.phone) q = q.eq('phone', String(req.body.phone));
-  const { error } = await q.is('waveform', null);
+  const { error } = await q.is('waveform', null).select('id, phone');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 app.put('/messages/:id/star', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('messages').update({ starred: !!req.body.starred })
-    .eq('id', req.params.id).eq('owner', req.owner || ' ');
+    .eq('id', req.params.id).eq('owner', req.owner || ' ').select('id, phone');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -5765,7 +5886,7 @@ setInterval(_soMaestro(_agTick), 30000);
 app.put('/messages/:id/pin', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   const { error } = await supabase.from('messages').update({ pinned: !!req.body.pinned })
-    .eq('id', req.params.id).eq('owner', req.owner || ' ');
+    .eq('id', req.params.id).eq('owner', req.owner || ' ').select('id, phone');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -7318,7 +7439,7 @@ async function _modeloPreencheAntigos(owner, name, bodyText) {
     const porFone = {}; (cts || []).forEach(c => { porFone[c.phone] = c; });
     for (const r of rows) {
       const txt = renderTemplateBody(bodyText, [(porFone[r.phone] && porFone[r.phone].name) || r.phone]);
-      await supabase.from('messages').update({ content: txt }).eq('id', r.id); n++;
+      await supabase.from('messages').update({ content: txt }).eq('id', r.id).select('id, phone'); n++;
       const c = porFone[r.phone];
       if (c && c.last_message_preview === rotulo) { await supabase.from('contacts').update({ last_message_preview: txt.length > 80 ? txt.substring(0, 80) + '…' : txt }).eq('owner', owner).eq('phone', r.phone); c.last_message_preview = txt; }
     }
@@ -9176,7 +9297,7 @@ async function _iaTranscreveSePrecisar(m) {
     const texto = await _transcreverBuffer(mp3, ehMp3, mime);
     _iaTranscritos.set(k, texto || '');
     if (_iaTranscritos.size > 500) _iaTranscritos.delete(_iaTranscritos.keys().next().value);
-    if (texto) { m.transcript = texto; try { await supabase.from('messages').update({ transcript: texto }).eq('id', m.id); } catch (_) {} }
+    if (texto) { m.transcript = texto; try { await supabase.from('messages').update({ transcript: texto }).eq('id', m.id).select('id, phone'); } catch (_) {} }
     return texto || '';
   } catch (e) { console.warn('IA: transcrição do áudio falhou:', e.message); return ''; }
 }
@@ -10248,20 +10369,39 @@ app.get('/bots', async (req,res) => {
   // 📈 Estatísticas leves por bot (execuções, última, em andamento) para os cartões
   try {
     if (String(req.query.stats || '') === '1' && bots.length) {
-      const ids = bots.map(b => b.id);
-      const { data: runs } = await supabase.from('bot_runs').select('bot_id, status, created_at').in('bot_id', ids).order('created_at', { ascending: false }).limit(5000);
-      const st = {};
-      for (const r of (runs || [])) {
-        const o = st[r.bot_id] = st[r.bot_id] || { execucoes: 0, andamento: 0, ultima: null };
-        o.execucoes++;
-        if (r.status === 'waiting_reply' || r.status === 'running') o.andamento++;
-        if (!o.ultima) o.ultima = r.created_at;
+      // 💸 guardado 2 min por conta: a tela de Bots relia até 5000 execuções (≈ 400 KB) a cada abertura
+      const OWk = req.owner || ' ';
+      let ex = _botsExtraCache[OWk];
+      if (!ex || Date.now() - ex.t > 120000) {
+        const ids = bots.map(b => b.id);
+        const { data: runs } = await supabase.from('bot_runs').select('bot_id, status, created_at').in('bot_id', ids).order('created_at', { ascending: false }).limit(5000);
+        const st = {};
+        for (const r of (runs || [])) {
+          const o = st[r.bot_id] = st[r.bot_id] || { execucoes: 0, andamento: 0, ultima: null };
+          o.execucoes++;
+          if (r.status === 'waiting_reply' || r.status === 'running') o.andamento++;
+          if (!o.ultima) o.ultima = r.created_at;
+        }
+        // 🔎 resumo do que cada bot DIZ (textos e modelos dos passos "Enviar mensagem"): a busca da tela
+        // de Bots acha o bot pelo conteúdo, não só pelo nome (v611)
+        const resumo = {};
+        try {
+          const { data: nos } = await supabase.from('bot_nodes').select('bot_id, type, config').in('bot_id', ids);
+          for (const n of (nos || [])) {
+            if (n.type !== 'message' && n.type !== 'template') continue;
+            const c = n.config || {};
+            const t = [c.text, c.message, c.template_name, c.caption].filter(x => typeof x === 'string' && x.trim()).join(' ');
+            if (t) resumo[n.bot_id] = ((resumo[n.bot_id] || '') + ' ' + t).slice(0, 600);
+          }
+        } catch (_) {}
+        ex = _botsExtraCache[OWk] = { t: Date.now(), st, resumo };
       }
-      for (const b of bots) b._stats = st[b.id] || { execucoes: 0, andamento: 0, ultima: null };
+      for (const b of bots) { b._stats = ex.st[b.id] || { execucoes: 0, andamento: 0, ultima: null }; b._resumo = (ex.resumo[b.id] || '').trim(); }
     }
   } catch (_) {}
   res.json(bots);
 });
+const _botsExtraCache = {}; // dono → { t, st, resumo }
 app.get('/bots/:id', async (req,res) => {
   if (!supabase) return res.json({});
   const { data,error } = await supabase.from('bots').select('*').eq('id',req.params.id).eq('owner', req.owner || ' ').single();
@@ -10269,7 +10409,7 @@ app.get('/bots/:id', async (req,res) => {
   res.json(data||{});
 });
 app.post('/bots', async (req,res) => {
-  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
+  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; delete _botsExtraCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { name,trigger_type,trigger_stage_id,account_id } = req.body;
   const { data,error } = await supabase.from('bots').insert({ name:name||'Novo Bot', trigger_type:trigger_type||'manual', trigger_stage_id:trigger_stage_id||null, account_id:account_id||null, active:true, owner:req.owner||null }).select().single();
@@ -10277,7 +10417,7 @@ app.post('/bots', async (req,res) => {
   res.json(data);
 });
 app.put('/bots/:id', async (req,res) => {
-  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
+  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; delete _botsExtraCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   const { name,trigger_type,trigger_stage_id,active } = req.body;
   const upd = {};
@@ -10334,7 +10474,7 @@ async function _botSnapSalvar(owner, botId, nos, ligacoes) {
   } catch (e) { console.error('cópia do fluxo do bot:', e.message); }
 }
 app.put('/bots/:id/flow', async (req,res) => {
-  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
+  try { delete _iaAutoCache[req.owner || ' ']; delete _iaCatCache[req.owner || ' ']; delete _botsExtraCache[req.owner || ' ']; } catch (_) {} // a IA relê os textos dos bots
   if (!supabase) return res.status(500).json({error:'Supabase não configurado'});
   if (!_exigeAdmin(req, res, 'mexer no fluxo de um bot')) return;
   _audita(req, 'Bot alterado', 'salvou o fluxo do bot ' + req.params.id);
@@ -10698,6 +10838,7 @@ const CHAVES_POR_CONTA = new Set([
   'tmpl_alias', // apelidos dos modelos da API (nome só no CRM)
   'sheets_sync', // planilha do Google ligada ao pipeline (importação de leads)
   'drip_rules',  // gotejamento: mover leads aos poucos de uma etapa para outra
+  'drip_hist',   // histórico do gotejamento: os últimos 200 leads movidos (hora, lead, regra)
   'stage_trash', // lixeira de colunas do pipeline (desfazer exclusão)
   'lead_trash',  // lixeira de leads excluídos (30 dias)
   'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
@@ -11356,7 +11497,7 @@ app.get('/relatorios', async (req, res) => {
     const desdeISO = new Date(iniBrt.getTime() + 3 * 3600000).toISOString();
 
     const temAutor = await _colunaSentBy();
-    const cols = 'timestamp, direction, phone' + (temAutor ? ', sent_by' : '');
+    const cols = 'timestamp, direction, phone, account_id, status' + (temAutor ? ', sent_by' : ''); // (account_id/status: relatório por número)
     const msgs = [];
     let limitado = false;
     for (let p = 0; p < 30; p++) {
@@ -11479,6 +11620,31 @@ app.get('/relatorios', async (req, res) => {
       leadsTotal = count || 0;
     } catch (_) {}
 
+    // ── 📱 POR NÚMERO (v401): enviadas, entregues/lidas, falhas e conversas que RESPONDERAM por conta.
+    // "Respondeu" = depois de uma enviada por aquele número, o lead mandou algo no período. Muitas
+    // falhas ou poucas respostas num número é o primeiro sinal de qualidade caindo na Meta.
+    const porNumero = {};
+    try {
+      const { data: contas } = await supabase.from('accounts').select('id, name, phone_display, type, evolution_instance').eq('owner', req.owner);
+      const nomeConta = {}; (contas || []).forEach(a => { nomeConta[String(a.id)] = a; });
+      for (const f in porFone) {
+        const lista = porFone[f].slice().sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+        const abertas = new Set(); // contas que enviaram e ainda esperam o lead responder
+        for (const m of lista) {
+          if (m.direction === 'outbound') {
+            const k = String(m.account_id || '_');
+            const o = porNumero[k] = porNumero[k] || { id: m.account_id || null, enviadas: 0, entregues: 0, lidas: 0, falhas: 0, conversas: new Set(), responderam: new Set() };
+            o.enviadas++; o.conversas.add(f);
+            if (m.status === 'failed') o.falhas++;
+            else { if (m.status === 'delivered' || m.status === 'read') o.entregues++; if (m.status === 'read') o.lidas++; abertas.add(k); }
+          } else { for (const k of abertas) if (porNumero[k]) porNumero[k].responderam.add(f); abertas.clear(); }
+        }
+      }
+      for (const k in porNumero) { const o = porNumero[k], a = nomeConta[k]; o.nome = a ? (a.name || '') : (k === '_' ? '(sem número)' : '(número apagado)'); o.numero = a ? (a.phone_display || '') : ''; o.tipo = a ? (a.evolution_instance ? 'qr' : 'api') : null; }
+    } catch (_) {}
+    const numeros = Object.values(porNumero).map(o => ({ id: o.id, nome: o.nome, numero: o.numero, tipo: o.tipo, enviadas: o.enviadas, entregues: o.entregues, lidas: o.lidas, falhas: o.falhas, conversas: o.conversas.size, responderam: o.responderam.size,
+      resposta_pct: o.conversas.size ? Math.round(o.responderam.size / o.conversas.size * 100) : null, falha_pct: o.enviadas ? Math.round(o.falhas / o.enviadas * 1000) / 10 : 0 })).sort((a, b) => b.enviadas - a.enviadas);
+
     const atendentes = Object.values(porAutor).map(o => ({
       email: o.email, enviadas: o.enviadas, conversas: o.conversas.size,
       resposta_media_min: mediaDe(o.respostas), resposta_mediana_min: med(o.respostas), ate10_pct: ate10(o.respostas), respostas: o.respostas.length,
@@ -11495,7 +11661,7 @@ app.get('/relatorios', async (req, res) => {
       },
       horas, funil,
       resposta: { media_min: mediaDe(esperas), mediana_min: med(esperas), ate10_pct: ate10(esperas), amostras: esperas.length },
-      atendentes,
+      atendentes, numeros,
       automacao: { enviadas: automacao.enviadas, conversas: automacao.conversas.size },
       sem_resposta: { n: esperando.length, lista: topo }
     });
@@ -11984,6 +12150,55 @@ app.get('/diagnostico/banco', async (req, res) => {
 app.get('/diagnostico/gasto', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   try { res.json(_gastoResumo()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// 🩺 SAÚDE DO FILAZ (v401): um resumo só — gasto do banco, cada número (token vivo? falhas nas últimas
+// 24 h?), cada regra do gotejamento (ligada? último lead? ritmo real × configurado) e o servidor.
+// Antes isso exigia entrar no banco e nos logs. A conferência do token na Meta fica guardada 10 min.
+const _saudeTokenCache = new Map(); // account id → { t, r }
+async function _saudeToken(acct) {
+  const c = _saudeTokenCache.get(acct.id);
+  if (c && Date.now() - c.t < 10 * 60000) return c.r;
+  let r;
+  if (!acct.phone_number_id || !acct.token) r = { estado: 'sem_token' };
+  else {
+    try {
+      const x = await axios.get(`https://graph.facebook.com/v23.0/${acct.phone_number_id}`, { params: { access_token: acct.token, fields: 'display_phone_number,quality_rating,name_status' }, timeout: 8000 });
+      r = { estado: 'ok', qualidade: (x.data && x.data.quality_rating) || null, numero: (x.data && x.data.display_phone_number) || null };
+    } catch (e) {
+      const er = e.response && e.response.data && e.response.data.error;
+      const code = er && er.code;
+      r = { estado: (code === 190 || (e.response && e.response.status === 401)) ? 'vencido' : 'erro', detalhe: er ? (er.message || '') : (e.message || '') };
+    }
+  }
+  _saudeTokenCache.set(acct.id, { t: Date.now(), r });
+  return r;
+}
+app.get('/saude', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const OW = req.owner;
+  try {
+    const gasto = _gastoResumo();
+    const { data: contas } = await supabase.from('accounts').select('id,name,phone_display,type,phone_number_id,token,waba_id,evolution_instance,status').eq('owner', OW);
+    const desde24 = new Date(Date.now() - 86400000).toISOString();
+    const numeros = [];
+    for (const a of (contas || [])) {
+      const n = { id: a.id, nome: a.name || '', numero: a.phone_display || '', tipo: a.evolution_instance ? 'qr' : 'api' };
+      if (a.evolution_instance) n.token = { estado: _waState[a.evolution_instance] === 'open' ? 'ok' : 'desconectado' };
+      else n.token = await _saudeToken(a);
+      try { const f = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('owner', OW).eq('account_id', a.id).eq('status', 'failed').gte('timestamp', desde24); n.falhas_24h = f.count || 0; } catch (_) { n.falhas_24h = null; }
+      try { const e = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('owner', OW).eq('account_id', a.id).eq('direction', 'outbound').gte('timestamp', desde24); n.enviadas_24h = e.count || 0; } catch (_) { n.enviadas_24h = null; }
+      numeros.push(n);
+    }
+    const gotejamento = _dripRegras(OW).map(r => { const nn = parseInt(r.numeros, 10) >= 1 ? parseInt(r.numeros, 10) : 1; return {
+      id: r.id, nome: r.nome || '', ligada: !!(r.manual || r.agendado), modo: r.manual ? 'manual' : (r.agendado ? 'automatico' : 'parada'), na_janela: _dripDentroDaJanela(r),
+      last: r.last || null, next_at: r.next_at || null, movidos: r.movidos || 0, ciclo_fechado: !!r.ciclo_fechado,
+      cfg: { min_seg: Math.round((Number(r.min_seg) || 210) / nn), max_seg: Math.round((Number(r.max_seg) || 300) / nn), numeros: nn, hora_ini: r.hora_ini || '', hora_fim: r.hora_fim || '' },
+      real: _dripRitmoReal(OW, r.id) }; });
+    const mem = process.memoryUsage();
+    res.json({ agora: new Date().toISOString(), gasto: { cota_gb: gasto.cota_gb, gasto_real_gb: gasto.gasto_real_gb, projecao_real_gb: gasto.projecao_real_gb, nivel: gasto.nivel, dia_do_ciclo: gasto.dia_do_ciclo, dias_no_ciclo: gasto.dias_no_ciclo, ciclo_fim: gasto.ciclo_fim, conversas_poupadas: gasto.conversas_poupadas },
+      numeros, gotejamento, servidor: { versao: SERVER_VER, maestro: process.env.SEM_MAESTRO === '1' || !!_souMaestro, no_ar_desde: _NO_AR_DESDE, memoria_mb: Math.round(mem.rss / 1048576) } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Na subida: avisa no log o que falta (só o maestro, para não repetir com vários servidores)
 setTimeout(() => { _soMaestro(async () => {
@@ -12816,7 +13031,7 @@ async function _qrMarcaApagada(instanceName, wamid) {
   const { data: m } = await q.limit(1).maybeSingle();
   if (!m) return;
   const agora = new Date().toISOString();
-  const { error } = await supabase.from('messages').update({ apagada_em: agora }).eq('id', m.id);
+  const { error } = await supabase.from('messages').update({ apagada_em: agora }).eq('id', m.id).select('id, phone');
   if (error) { console.error('apagada_em:', error.message); return; }
   try {
     const { data: c } = await supabase.from('contacts').select('last_message_at').eq('phone', m.phone).eq('owner', m.owner || ' ').maybeSingle();
@@ -13516,4 +13731,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dripHist, _dripRitmoReal, _dripTick, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
