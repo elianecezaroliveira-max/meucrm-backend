@@ -335,8 +335,10 @@ let _souMaestro = false, _maestroChecado = 0;
 async function _euSouMaestro() {
   if (!supabase) return true;                        // sem banco (bancada/local): faz tudo
   if (process.env.SEM_MAESTRO === '1') return true;  // escape, se um dia atrapalhar
+  if (_encerrando) return false;                     // sendo desligado: já devolveu a batuta
   const agora = Date.now();
-  if (agora - _maestroChecado < 20000) return _souMaestro;
+  // de reserva olha mais vezes (8 s): assume logo quando o outro devolve a batuta no deploy
+  if (agora - _maestroChecado < (_souMaestro ? 20000 : 8000)) return _souMaestro;
   _maestroChecado = agora;
   try {
     const { data } = await supabase.from('settings').select('value').eq('key', _MAESTRO_K).maybeSingle();
@@ -352,6 +354,26 @@ async function _euSouMaestro() {
     return _souMaestro;
   } catch (e) { console.error('maestro:', e.message); return _souMaestro; } // erro de banco: mantém o que era
 }
+// 🚪 DEPLOY SEM PAUSA NOS TRABALHOS DE FUNDO: ao ser desligado (o Railway manda SIGTERM ao servidor
+// velho), o maestro DEVOLVE a batuta na hora (em: 0). O servidor novo assume no próximo olhar (≤ 8 s)
+// em vez de esperar o carimbo envelhecer (90 s) — ela pediu para conferir o ritmo do gotejamento:
+// a cada deploy os leads paravam ~100 s (12:09 e 12:35 de 27/10), o resto do dia estava no segundo certo.
+let _encerrando = false;
+async function _maestroSolta() {
+  _encerrando = true;
+  if (!supabase || !_souMaestro) return false;
+  _souMaestro = false;
+  try {
+    await supabase.from('settings').upsert({ key: _MAESTRO_K, value: JSON.stringify({ quem: _EU, em: 0, solto: true }), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    console.log('Desligando: devolvi os trabalhos de fundo para o próximo servidor');
+    return true;
+  } catch (_) { return false; }
+}
+for (const sinal of ['SIGTERM', 'SIGINT']) process.on(sinal, () => {
+  const sai = () => process.exit(0);
+  const t = setTimeout(sai, 2500); // não espera mais que isso para sair
+  _maestroSolta().then(() => { clearTimeout(t); sai(); }, () => { clearTimeout(t); sai(); });
+});
 const _soMaestro = (fn) => async (...a) => { try { if (!await _euSouMaestro()) return; } catch (_) {} return _gastoCtx.run({ rota: 'fundo:' + (fn.name || 'trabalho') }, () => fn(...a)); };
 // Já gravada? O carimbo de chegada vive na MEMÓRIA do processo — com dois servidores no ar
 // um não enxerga o carimbo do outro e a mesma mensagem entrava duas vezes. O wamid no banco
@@ -564,7 +586,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 398;
+const SERVER_VER = 399;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -13489,4 +13511,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
