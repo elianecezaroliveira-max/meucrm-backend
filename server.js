@@ -564,7 +564,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 395;
+const SERVER_VER = 396;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7246,7 +7246,7 @@ async function getTemplateBodyText(token, wabaId, name, lang) {
     const txt = body?.text || null;
     _tmplBodyCache[key] = txt;
     return txt;
-  } catch(e) { _tmplBodyCache[key] = null; return null; }
+  } catch(e) { return null; } // ⚠️ falha passageira da Meta NÃO fica guardada: ficava "null" para sempre e todo envio seguinte do modelo saía sem variáveis (erro 132000 até o servidor reiniciar)
 }
 
 // Substitui {{1}}, {{2}}… pelos valores das variáveis (posicional)
@@ -7287,18 +7287,26 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   let bodyText = null;
   try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR'); } catch(_) {}
   const provided = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone, notes));
-  const needed = bodyText ? new Set(bodyText.match(/\{\{\d+\}\}/g) || []).size : provided.length;
-  const vars = [];
-  for (let i = 0; i < needed; i++) {
-    const p = provided[i];
-    vars.push(p && p.trim() ? p : (i === 0 ? (name || phone) : ' ')); // preenche o que faltar (1ª = nome)
-  }
-  const tmpl = { name: cfg.template_name, language: { code: cfg.language || 'pt_BR' } };
-  if (vars.length) tmpl.components = [{ type: 'body', parameters: vars.map(t => ({ type: 'text', text: t })) }];
-  try {
-    const r = await axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
-      { messaging_product: 'whatsapp', to: phone, type: 'template', template: tmpl },
+  // Sem o corpo do modelo (a Meta não respondeu agora): os modelos dela têm {{1}} = nome — manda ao menos 1
+  const needed = bodyText ? new Set(bodyText.match(/\{\{\d+\}\}/g) || []).size : Math.max(provided.length, 1);
+  const montaVars = (n) => { const v = []; for (let i = 0; i < n; i++) { const p = provided[i]; v.push(p && p.trim() ? p : (i === 0 ? (name || phone) : ' ')); } return v; }; // preenche o que faltar (1ª = nome)
+  let vars = montaVars(needed);
+  const montaTmpl = (v) => { const t = { name: cfg.template_name, language: { code: cfg.language || 'pt_BR' } }; if (v.length) t.components = [{ type: 'body', parameters: v.map(x => ({ type: 'text', text: x })) }]; return t; };
+  const posta = (v) => axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
+      { messaging_product: 'whatsapp', to: phone, type: 'template', template: montaTmpl(v) },
       { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
+  try {
+    let r;
+    try { r = await posta(vars); }
+    catch (e1) {
+      // 132000 "number of params (N) does not match the expected number of params (M)": a Meta diz quantas
+      // são — refaz na hora com M variáveis em vez de registrar a falha
+      const det = String(e1.response?.data?.error?.error_data?.details || e1.response?.data?.error?.message || '');
+      const m = e1.response?.data?.error?.code === 132000 ? /expected number of params \((\d+)\)/i.exec(det) : null;
+      if (!m) throw e1;
+      vars = montaVars(parseInt(m[1], 10) || 0);
+      r = await posta(vars);
+    }
     if (supabase) {
       const ts = new Date().toISOString();
       // Monta o texto real do modelo (troca {{n}} pelas variáveis)
