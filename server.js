@@ -564,7 +564,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 397;
+const SERVER_VER = 398;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -10681,6 +10681,7 @@ const CHAVES_POR_CONTA = new Set([
   'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
   'onboarding',  // passos de estreia já concluídos/dispensados
   'bots_fav',    // bots favoritos: sobem para o topo na hora de escolher
+  'bots_fav_tarefas', // bots favoritos da tela de TAREFAS (separados dos do chat)
   'ia_sug_on', 'ia_sug_model', // sugestões de resposta por IA (cartão acima do campo)
   'ia_bancos', 'ia_fones_teste' // IA: bancos para onde ela porta hoje; números de teste
 ]);
