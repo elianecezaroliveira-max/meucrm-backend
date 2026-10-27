@@ -564,7 +564,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 394;
+const SERVER_VER = 395;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -12065,14 +12065,18 @@ function _badgeAvisa(owner, phone, opts) {
 // com a MESMA tag da notificação da mensagem (substitui a antiga) e o contador certo no ícone.
 // Muitas lidas de uma vez (mais de 5 em 2 s) viram UM aviso só: "✓ N conversas lidas".
 // Desliga com a variável do Railway IPHONE_AVISO_LIDA=0.
+// IPHONE_AVISO_LIDA: '1' (padrão) = a notificação "✓ lida" aparece e SOME SOZINHA em 3 s (ela: "tem como
+// esconder essa notificação?") — o iOS exige mostrar algo, mas nada impede fechar logo depois; o número do
+// ícone já foi acertado. 'fixo' = fica na tela de bloqueio como antes. '0' = não manda nada ao iPhone.
 async function _lidaAvisaIphone(owner, fones, tags) {
   if (String(process.env.IPHONE_AVISO_LIDA || '1') === '0' || !fones.length) return;
-  if (fones.length > 5) return sendPushToOwner(owner, { tipo: 'lida', title: 'FILAZ', body: '✓ ' + fones.length + ' conversas lidas no computador', tag: 'lidas', fechar: tags, silent: true }, { soApple: true });
+  const sumir_ms = String(process.env.IPHONE_AVISO_LIDA || '1') === 'fixo' ? 0 : 3000;
+  if (fones.length > 5) return sendPushToOwner(owner, { tipo: 'lida', title: 'FILAZ', body: '✓ ' + fones.length + ' conversas lidas no computador', tag: 'lidas', fechar: tags, silent: true, sumir_ms }, { soApple: true });
   let nomes = {};
   try { const { data } = await supabase.from('contacts').select('phone, name').eq('owner', owner).in('phone', fones.flatMap(f => phoneVariants(f))); for (const c of (data || [])) nomes[String(c.phone || '').replace(/\D/g, '')] = c.name; } catch (_) {}
   for (const f of fones) {
     const nome = nomes[String(f).replace(/\D/g, '')] || f;
-    await sendPushToOwner(owner, { tipo: 'lida', title: String(nome), body: '✓ lida no computador', tag: 'chat-' + f, phone: f, fechar: ['chat-' + f], silent: true }, { soApple: true });
+    await sendPushToOwner(owner, { tipo: 'lida', title: String(nome), body: '✓ lida no computador', tag: 'chat-' + f, phone: f, fechar: ['chat-' + f], silent: true, sumir_ms }, { soApple: true });
   }
 }
 
