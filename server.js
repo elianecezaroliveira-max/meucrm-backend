@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 402;
+const SERVER_VER = 403;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7536,7 +7536,7 @@ async function _metaCorpoDoModelo(token, wabaId, name, lang) {
   const tmpl = list.find(t => t.name === name && (!lang || t.language === lang)) || list.find(t => t.name === name);
   return tmpl?.components?.find(c => c.type === 'BODY')?.text || null;
 }
-async function getTemplateBodyText(token, wabaId, name, lang) {
+async function getTemplateBodyText(token, wabaId, name, lang, owner) {
   if (!wabaId || !name) return null;
   const key = wabaId + '|' + name + '|' + (lang || '');
   if (_tmplBodyCache[key]) return _tmplBodyCache[key];
@@ -7553,6 +7553,28 @@ async function getTemplateBodyText(token, wabaId, name, lang) {
       const { data } = await supabase.from('settings').select('value').eq('key', _tmplCorpoChave(wabaId, name, lang)).maybeSingle();
       if (data && data.value) { _tmplBodyCache[key] = data.value; return data.value; }
     } catch (_) {}
+    // 🔎 (v403) O modelo NÃO está no WABA guardado para esta conta (o número pode ter mudado de WABA na Meta
+    // — caso do 101 com anac_54856, dia 28/10): procura o mesmo nome nos OUTROS WABAs da dona, com o token de
+    // cada um; e, por fim, na cópia guardada de qualquer WABA. Avisa no log para ela conferir o WABA da conta.
+    if (owner && !erro) {
+      try {
+        const { data: contas } = await supabase.from('accounts').select('id, name, token, waba_id').eq('owner', owner).neq('waba_id', wabaId);
+        const vistos = new Set([String(wabaId)]);
+        for (const a of (contas || [])) {
+          if (!a.waba_id || !a.token || vistos.has(String(a.waba_id))) continue;
+          vistos.add(String(a.waba_id));
+          let t2 = null; try { t2 = await _metaCorpoDoModelo(a.token, a.waba_id, name, lang); } catch (_) {}
+          if (t2) {
+            console.warn('Modelo ' + name + ': achado no WABA ' + a.waba_id + ' (conta "' + a.name + '") — confira o WABA ID da conta que usa o WABA ' + wabaId + ' em Contas, pode estar desatualizado');
+            _tmplCorpoAnota(wabaId, name, lang, t2); return t2;
+          }
+        }
+      } catch (_) {}
+      try {
+        const { data: qualquer } = await supabase.from('settings').select('key, value').like('key', 'tmpl_corpo::%::' + name + '::' + (lang || '')).limit(1);
+        if (qualquer && qualquer.length && qualquer[0].value) { _tmplBodyCache[key] = qualquer[0].value; return qualquer[0].value; }
+      } catch (_) {}
+    }
   }
   return null;
 }
@@ -7621,7 +7643,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
   let bodyText = null;
-  try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR'); } catch(_) {}
+  try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR', owner); } catch(_) {}
   const provided = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone, notes));
   // Sem o corpo do modelo (a Meta não respondeu agora): os modelos dela têm {{1}} = nome — manda ao menos 1
   const needed = bodyText ? new Set(bodyText.match(/\{\{\d+\}\}/g) || []).size : Math.max(provided.length, 1);
