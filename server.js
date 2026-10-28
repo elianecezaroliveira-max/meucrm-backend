@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 403;
+const SERVER_VER = 404;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7536,7 +7536,62 @@ async function _metaCorpoDoModelo(token, wabaId, name, lang) {
   const tmpl = list.find(t => t.name === name && (!lang || t.language === lang)) || list.find(t => t.name === name);
   return tmpl?.components?.find(c => c.type === 'BODY')?.text || null;
 }
-async function getTemplateBodyText(token, wabaId, name, lang, owner) {
+// 🔎 Descobre em QUAL WABA o número (phone_number_id) está hoje na Meta — o cadastro do FILAZ pode ter
+// ficado com o WABA antigo (o número mudou de WABA). Usa o token da própria conta: negócio dono do WABA
+// atual → WABAs próprios e de clientes → qual tem o número. Guardado 6 h por conta.
+const _wabaDescCache = new Map();
+async function _wabaDescobrir(acct) {
+  if (!acct || !acct.token || !acct.phone_number_id) return null;
+  const c = _wabaDescCache.get(acct.id); if (c && Date.now() - c.t < 6 * 3600000) return c.waba;
+  let waba = null;
+  try {
+    let biz = null;
+    if (acct.waba_id) { try { const r = await axios.get(`https://graph.facebook.com/v23.0/${acct.waba_id}`, { params: { access_token: acct.token, fields: 'owner_business_info' }, timeout: 10000 }); biz = r.data && r.data.owner_business_info && r.data.owner_business_info.id; } catch (_) {} }
+    if (biz) {
+      for (const edge of ['owned_whatsapp_business_accounts', 'client_whatsapp_business_accounts']) {
+        let url = `https://graph.facebook.com/v23.0/${biz}/${edge}`, params = { access_token: acct.token, fields: 'id,name,phone_numbers{id,display_phone_number}', limit: 100 };
+        for (let p = 0; p < 5 && url && !waba; p++) {
+          const r = await axios.get(url, { params, timeout: 15000 });
+          for (const w of ((r.data && r.data.data) || [])) if (((w.phone_numbers && w.phone_numbers.data) || []).some(n => String(n.id) === String(acct.phone_number_id))) { waba = String(w.id); break; }
+          url = (r.data && r.data.paging && r.data.paging.next) || null; params = undefined;
+        }
+        if (waba) break;
+      }
+    }
+  } catch (e) { console.warn('descobrir WABA da conta ' + (acct.name || acct.id) + ':', (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message); }
+  _wabaDescCache.set(acct.id, { t: Date.now(), waba });
+  return waba;
+}
+// Confere e CORRIGE o WABA da conta no banco quando a Meta diz outro. Devolve { antes, agora, mudou }.
+async function _wabaConferir(acct) {
+  const real = await _wabaDescobrir(acct);
+  if (!real || real === String(acct.waba_id || '')) return { antes: acct.waba_id || null, agora: real, mudou: false };
+  try { await supabase.from('accounts').update({ waba_id: real }).eq('id', acct.id); } catch (e) { return { antes: acct.waba_id, agora: real, mudou: false, erro: e.message }; }
+  console.warn('Conta "' + (acct.name || acct.id) + '": o WABA no FILAZ era ' + acct.waba_id + ' e na Meta o número está no WABA ' + real + ' — corrigido no cadastro');
+  return { antes: acct.waba_id || null, agora: real, mudou: true };
+}
+app.post('/accounts/:id/waba-conferir', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { data: a } = await supabase.from('accounts').select('id, name, phone_number_id, token, waba_id, evolution_instance').eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
+  if (a.evolution_instance || !a.token) return res.status(400).json({ error: 'Só contas da API oficial têm WABA.' });
+  _wabaDescCache.delete(a.id);
+  res.json(await _wabaConferir(a));
+});
+async function getTemplateBodyText(token, wabaId, name, lang, owner, acct) {
+  // 🔎 (v404) o modelo não está no WABA guardado → confere na Meta em qual WABA o número está hoje; se for
+  // outro, corrige o cadastro e procura o modelo lá (caso do 101: FILAZ com o WABA antigo, 28/10)
+  if (acct && acct.id) {
+    const r0 = await _getTemplateBodyTextBase(token, wabaId, name, lang, owner, true);
+    if (r0) return r0;
+    const conf = await _wabaConferir(acct);
+    if (conf.mudou && conf.agora) { const r1 = await _getTemplateBodyTextBase(token, conf.agora, name, lang, owner, true); if (r1) { _tmplCorpoAnota(wabaId, name, lang, r1); return r1; } }
+    return _getTemplateBodyTextBase(token, wabaId, name, lang, owner, false);
+  }
+  return _getTemplateBodyTextBase(token, wabaId, name, lang, owner, false);
+}
+async function _getTemplateBodyTextBase(token, wabaId, name, lang, owner, soMeta) {
   if (!wabaId || !name) return null;
   const key = wabaId + '|' + name + '|' + (lang || '');
   if (_tmplBodyCache[key]) return _tmplBodyCache[key];
@@ -7546,6 +7601,7 @@ async function getTemplateBodyText(token, wabaId, name, lang, owner) {
     catch (e) { erro = e; if (tent === 0) await new Promise(r => setTimeout(r, 1200)); }
   }
   if (txt) { _tmplCorpoAnota(wabaId, name, lang, txt); return txt; }
+  if (soMeta) return null;
   // ⚠️ falha passageira da Meta NÃO fica guardada (ficava "null" para sempre → erro 132000 até reiniciar)
   console.warn('Modelo ' + name + ': a Meta não devolveu o corpo' + (erro ? ' — ' + JSON.stringify(erro.response?.data?.error || erro.message) : ' (não está na lista do WABA ' + wabaId + ')') + '; usando a cópia guardada, se houver');
   if (supabase) {
@@ -7643,7 +7699,7 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   }
   // Busca o corpo do modelo para saber QUANTAS variáveis ele exige (evita erro 132000)
   let bodyText = null;
-  try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR', owner); } catch(_) {}
+  try { bodyText = await getTemplateBodyText(acct.token, acct.waba_id, cfg.template_name, cfg.language || 'pt_BR', owner, acct); } catch(_) {}
   const provided = (cfg.vars || []).map(v => applyVars(String(v || ''), name || phone, phone, notes));
   // Sem o corpo do modelo (a Meta não respondeu agora): os modelos dela têm {{1}} = nome — manda ao menos 1
   const needed = bodyText ? new Set(bodyText.match(/\{\{\d+\}\}/g) || []).size : Math.max(provided.length, 1);
