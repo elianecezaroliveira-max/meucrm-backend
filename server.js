@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 404;
+const SERVER_VER = 405;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -12613,12 +12613,11 @@ function _badgeAvisa(owner, phone, opts) {
 // esconder essa notificação?") — o iOS exige mostrar algo, mas nada impede fechar logo depois; o número do
 // ícone já foi acertado. 'fixo' = fica na tela de bloqueio como antes. '0' = não manda nada ao iPhone.
 async function _lidaAvisaIphone(owner, fones, tags) {
-  if (String(process.env.IPHONE_AVISO_LIDA || '1') === '0' || !fones.length) return;
-  // '1' (padrão) = fecha NO MESMO INSTANTE em que aparece (sumir_ms 1): ela: "não dá para tirar essa
-  // notificação? mas quero que continue marcando como lida" — o iOS exige mostrar, mas fechar na hora é
-  // permitido: a notificação antiga da mensagem some, o ícone fica certo, e o aviso quase não se vê.
-  // 'breve' = fica 3 s; 'fixo' = fica na tela; '0' = não manda.
-  const modo = String(process.env.IPHONE_AVISO_LIDA || '1');
+  // (v405) DESLIGADO por padrão — ela: "Retira o LIDO NO COMPUTADOR, não ficou legal". No iPhone não existe
+  // push mudo, então sem este aviso a bolinha do ícone só zera quando ela abre o FILAZ no celular.
+  // Para ligar de novo: IPHONE_AVISO_LIDA=1 (fecha no mesmo instante), 'breve' (3 s) ou 'fixo' (fica).
+  if (String(process.env.IPHONE_AVISO_LIDA || '0') === '0' || !fones.length) return;
+  const modo = String(process.env.IPHONE_AVISO_LIDA || '0');
   const sumir_ms = modo === 'fixo' ? 0 : modo === 'breve' ? 3000 : 1;
   if (fones.length > 5) return sendPushToOwner(owner, { tipo: 'lida', title: 'FILAZ', body: '✓ ' + fones.length + ' conversas lidas no computador', tag: 'lidas', fechar: tags, silent: true, sumir_ms }, { soApple: true });
   let nomes = {};
