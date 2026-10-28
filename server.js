@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 401;
+const SERVER_VER = 402;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1042,7 +1042,7 @@ async function _esperaEnvioDoBot(wamid, ms) {
 async function updateMsgStatus(wamid, upd) {
   if (!supabase || !wamid || !upd?.status) return;
   // Tique de entrega/leitura vale SÓ para mensagem enviada por mim (outbound)
-  if (upd.status === 'failed') { await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound').select('id, phone, wamid'); _mirrorContactStatus(wamid, 'failed'); _avisaEsperaStatus(wamid, 'failed'); return; }
+  if (upd.status === 'failed') { const { data: fal } = await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound').select('id, phone, wamid, owner, account_id'); for (const f of (fal || [])) _vigiaFalha(f.owner, f.account_id).catch(() => {}); _mirrorContactStatus(wamid, 'failed'); _avisaEsperaStatus(wamid, 'failed'); return; }
   const rank = _ST_RANK[upd.status];
   if (rank === undefined) return;
   const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
@@ -2535,6 +2535,53 @@ app.get('/assinatura', (req, res) => {
   const cfg = _assinaturaCfg(req.owner);
   const quem = String(req.usuario || req.owner || '').toLowerCase();
   res.json({ ligado: cfg.ligado, nomes: cfg.nomes, meu_nome: cfg.nomes[quem] || _nomeDoEmail(quem), eu: quem });
+});
+// ═══════════════════════════════════════════════════════════════════
+// 🌙 NÃO PERTURBE POR NÚMERO (v402): settings silencio::dona = { [idDaConta]: { on, ini:'20:00', fim:'08:00',
+// dias:[0] } }. Dentro da janela o número não envia nada: bots ficam PAUSADOS até abrir, o gotejamento
+// espera, e o envio à mão pede confirmação ("Enviar mesmo assim?"). Protege contra disparo fora de hora e
+// contra reclamação noturna na Meta. Horário de Brasília.
+// ═══════════════════════════════════════════════════════════════════
+function _silencioCfg(owner) { try { const o = JSON.parse(_cfg('silencio', owner) || '{}'); return o && typeof o === 'object' ? o : {}; } catch (_) { return {}; } }
+function _silencioAgora(owner, accountId, agoraMs) {
+  const c = accountId && _silencioCfg(owner)[String(accountId)];
+  if (!c || !c.on) return { bloqueado: false };
+  const toMin = t => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '')); return m ? (+m[1]) * 60 + (+m[2]) : null; };
+  const a = toMin(c.ini), b = toMin(c.fim);
+  const dias = Array.isArray(c.dias) ? c.dias.map(Number) : [];
+  const temHoras = a != null && b != null && a !== b;
+  if (!temHoras && !dias.length) return { bloqueado: false };
+  const BRT = 3 * 3600000;
+  let t = (agoraMs || Date.now());
+  // anda minuto a minuto até achar um instante livre (no máximo 8 dias)
+  const bloqueadoEm = (ms) => {
+    const d = new Date(ms - BRT); const hm = d.getUTCHours() * 60 + d.getUTCMinutes();
+    if (dias.includes(d.getUTCDay())) return true;
+    if (!temHoras) return false;
+    return a < b ? (hm >= a && hm < b) : (hm >= a || hm < b);
+  };
+  if (!bloqueadoEm(t)) return { bloqueado: false };
+  const fim = t + 8 * 86400000;
+  t = Math.floor(t / 60000) * 60000;
+  while (t < fim && bloqueadoEm(t)) t += 60000;
+  const d = new Date(t - BRT), p = n => String(n).padStart(2, '0');
+  const hoje = new Date((agoraMs || Date.now()) - BRT).getUTCDate() === d.getUTCDate();
+  return { bloqueado: true, ate: t, ate_txt: (hoje ? '' : p(d.getUTCDate()) + '/' + p(d.getUTCMonth() + 1) + ' às ') + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) };
+}
+// 🌙 envio à mão: pede confirmação (o app reenvia com ?forcar=1)
+app.use(['/send', '/send-media', '/send-template', '/send-location', '/send-contact', '/send-poll'], async (req, res, next) => {
+  try {
+    if (req.method !== 'POST' || !req.owner) return next();
+    if (String(req.query.forcar || (req.body && req.body.forcar) || '') === '1' || (req.body && req.body.forcar === true)) return next();
+    const cfg = _silencioCfg(req.owner); if (!Object.keys(cfg).length) return next();
+    let acct = req.body && (req.body.account_id || req.body.accountId) || null;
+    const to = req.body && (req.body.to || req.body.phone);
+    if (!acct && to && supabase) { try { const { data: c } = await supabase.from('contacts').select('account_id').eq('owner', req.owner).in('phone', phoneVariants(String(to))).limit(1).maybeSingle(); acct = c && c.account_id; } catch (_) {} }
+    const sil = _silencioAgora(req.owner, acct);
+    if (!sil.bloqueado) return next();
+    let nome = ''; try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', acct).maybeSingle(); nome = a ? (a.phone_display || a.name || '') : ''; } catch (_) {}
+    return res.status(409).json({ silencio: true, ate: new Date(sil.ate).toISOString(), ate_txt: sil.ate_txt, error: 'O número ' + (nome ? '"' + nome + '" ' : '') + 'está em "não perturbe" até ' + sil.ate_txt + '.' });
+  } catch (_) { return next(); }
 });
 app.post("/send", async (req, res) => {
   if (!_exigeLogin(req, res)) return;
@@ -4155,7 +4202,7 @@ app.get("/search", async (req, res) => {
     const phones = [...new Set((msgRows || []).filter(m => _bateSemAcento(m.content, term)).map(m => m.phone).filter(Boolean))];
 
     // 2. Contatos por nome/telefone OU entre os telefones encontrados
-    let orCond = `name.ilike.${like},phone.ilike.${like}`;
+    let orCond = `name.ilike.${like},phone.ilike.${like},notes.ilike.${like}`; // (notes: as Anotações do lead também entram na busca — v402)
     // Número digitado com máscara — "(15) 98165-1975", "15 98165 1975", "+55 15…" —
     // tem de achar o contato: compara só os dígitos
     const soDig = raw.replace(/\D/g, '');
@@ -4176,7 +4223,7 @@ app.get("/search", async (req, res) => {
     }
     if (phones.length) orCond += `,phone.in.(${phones.join(",")})`;
     let cq = supabase.from("contacts")
-      .select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction")
+      .select("phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, notes")
       .eq("owner", req.owner || ' ')
       .or(orCond)
       .not("last_message_preview", "is", null)
@@ -4196,7 +4243,8 @@ app.get("/search", async (req, res) => {
       for (const v of formas) if (v && v.length >= 4 && f.includes(v)) return true;
       return false;
     };
-    const lista = (data || []).filter(c => achouPorMensagem.has(c.phone) || _bateSemAcento(c.name, term) || bateFone(c.phone));
+    const lista = (data || []).filter(c => achouPorMensagem.has(c.phone) || _bateSemAcento(c.name, term) || bateFone(c.phone) || _bateSemAcento(c.notes, term));
+    lista.forEach(c => { if (c.notes && _bateSemAcento(c.notes, term) && !_bateSemAcento(c.name, term)) c.achou_na_nota = String(c.notes).replace(/\s+/g, ' ').slice(0, 80); delete c.notes; });
     res.json(lista);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -4620,6 +4668,32 @@ async function _dripSalvaProgresso(owner, regrasDoTick) {
   }
   await _dripSalva(owner, atuais);
 }
+// 🌙 Contas (números) que o bot da etapa de destino usa — para o gotejamento esperar o "não perturbe".
+// Guardado 60 s por dona (uma leitura leve de bots/passos).
+const _dripContasCache = {};
+async function _dripContasDoDestino(owner, stageId) {
+  const c = _dripContasCache[owner];
+  if (!c || Date.now() - c.t > 60000) {
+    const mapa = {};
+    try {
+      const { data: bots } = await supabase.from('bots').select('id, trigger_stage_id, account_id').eq('owner', owner).eq('trigger_type', 'stage_enter').eq('active', true);
+      const ids = (bots || []).map(b => b.id);
+      const { data: nos } = ids.length ? await supabase.from('bot_nodes').select('bot_id, config').in('bot_id', ids) : { data: [] };
+      for (const b of (bots || [])) {
+        const st = String(b.trigger_stage_id || ''); const set = mapa[st] = mapa[st] || new Set();
+        if (b.account_id) set.add(String(b.account_id));
+        for (const n of (nos || [])) if (n.bot_id === b.id && n.config && n.config.account_id) set.add(String(n.config.account_id));
+      }
+    } catch (_) {}
+    _dripContasCache[owner] = { t: Date.now(), mapa };
+  }
+  return [...(_dripContasCache[owner].mapa[String(stageId || '')] || [])];
+}
+async function _dripSilenciada(owner, r) {
+  if (!Object.keys(_silencioCfg(owner)).length) return false;
+  const contas = await _dripContasDoDestino(owner, r.para);
+  return contas.some(id => _silencioAgora(owner, id).bloqueado);
+}
 function _dripDentroDaJanela(r) {
   // ⏹ "Parar" com o automático ligado: fica parada até o horário marcado (fim da
   // janela de hoje) — depois o automático retoma sozinho na próxima janela
@@ -4720,8 +4794,10 @@ async function _dripTick() {
         }
         // Roda se: ▶ iniciado à mão (ignora dia/horário, até esvaziar ou pausar)
         //      ou: 🕐 automático ligado E dentro dos dias/horários
-        const rodaManual = !!r.manual;
-        const rodaAuto = !!r.agendado && _dripDentroDaJanela(r);
+        // 🌙 número do bot de destino em "não perturbe": a regra espera (manual ou automático)
+        const _sil = await _dripSilenciada(owner, r);
+        const rodaManual = !!r.manual && !_sil;
+        const rodaAuto = !!r.agendado && !_sil && _dripDentroDaJanela(r);
         // 🕐 AUTOMÁTICO não dispara na hora: ao ligar (ou quando a janela do dia abre) o
         // primeiro lead só sai depois do intervalo — ela ligou o Automático e o bot da etapa
         // de destino disparou no mesmo segundo. ▶ Iniciar à mão continua imediato.
@@ -5075,6 +5151,12 @@ function _sheetsIdDeUrl(v) {
   const m = /\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/.exec(t);
   return m ? m[1] : t.replace(/[^a-zA-Z0-9_-]/g, '');
 }
+async function _lerPlanilhaBruta(spreadsheetId, sheetName) {
+  const tok = await _googleAccessToken();
+  const range = encodeURIComponent("'" + String(sheetName).replace(/'/g, "''") + "'!A1:C500");
+  const r = await axios.get(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`, { headers: { Authorization: 'Bearer ' + tok }, params: { valueRenderOption: 'FORMATTED_VALUE' }, timeout: 30000 });
+  return (r.data && r.data.values) || [];
+}
 async function _lerPlanilha(spreadsheetId, sheetName) {
   const tok = await _googleAccessToken();
   const range = encodeURIComponent("'" + String(sheetName || 'Página1').replace(/'/g, "''") + "'!A1:Z5000");
@@ -5278,7 +5360,19 @@ async function _sheetsBackup(owner, motivo) {
     await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Anotações', abaNotas);
     await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Etiquetas', abaTags);
     await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Tarefas', abaTarefas);
-    const r = { quando: new Date().toISOString(), ok: true, leads: (cts || []).length, tarefas: (tks || []).length, motivo: motivo || 'manual' };
+    // 💾 (v402) CONFIGURAÇÕES também: bots (passos e ligações), respostas rápidas, etiquetas, automações por
+    // etapa, gotejamento, etapas e FAQs — o mesmo JSON do download manual, em pedaços de 40 mil letras
+    // (limite de uma célula). Se o Supabase pausar, nada disso se perde; restaura em Config ▸ Faturamento.
+    const bk = await _backupMonta(owner || ' ');
+    const txt = JSON.stringify(bk);
+    const abaCfg = [['O que é', 'Conteúdo', 'Backup em'], ['Backup das configurações do FILAZ (bots, respostas rápidas, etiquetas, automações, gotejamento, etapas, FAQs). Não edite as linhas "Parte N". Para restaurar: Config ▸ Faturamento ▸ Restaurar da planilha.', '', quando]];
+    for (let i = 0, n = 1; i < txt.length; i += 40000, n++) abaCfg.push(['Parte ' + n, txt.slice(i, i + 40000), quando]);
+    const abaBots = [['Bot', 'Gatilho', 'Ativo', 'Passos', 'O que diz (resumo)', 'Backup em']]
+      .concat(bk.bots.map(x => [x.bot.name || '', x.bot.trigger_type === 'stage_enter' ? 'Ao entrar em ' + (etapa[String(x.bot.trigger_stage_id)] || '?') : 'Manual', x.bot.active ? 'sim' : 'não', String(x.nos.length),
+        x.nos.filter(nn => nn.type === 'message' || nn.type === 'template').map(nn => { const c = nn.config || {}; return c.text || c.message || (c.template_name ? '[Modelo: ' + c.template_name + ']' : ''); }).filter(Boolean).join(' | ').slice(0, 2000), quando]));
+    await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Configurações', abaCfg);
+    await _sheetsEscreveAba(cfg.spreadsheet_id, tok, 'FILAZ Bots', abaBots);
+    const r = { quando: new Date().toISOString(), ok: true, leads: (cts || []).length, tarefas: (tks || []).length, bots: bk.bots.length, configuracoes: Object.keys(bk.settings).length, motivo: motivo || 'manual' };
     cfg.backup = r; await _sheetsSalvaCfg(owner, cfg);
     console.log('💾 Backup na planilha (' + owner + '): ' + r.leads + ' leads, ' + r.tarefas + ' tarefas');
     return r;
@@ -5297,23 +5391,24 @@ app.post('/sheets/backup', async (req, res) => {
   const r = await _sheetsBackup(req.owner, 'manual');
   res.status(r.ok ? 200 : 400).json(r);
 });
-// toda segunda-feira às 6h (Brasília), uma vez por semana por conta
-setInterval(async () => {
-  try {
-    if (!supabase || !_googleSA()) return;
-    const agora = new Date(Date.now() - 3 * 3600000); // horário de Brasília
-    if (agora.getUTCDay() !== 1 || agora.getUTCHours() !== 6) return;
-    for (const k in _settings) {
-      if (!k.startsWith('sheets_sync::')) continue;
-      const owner = k.slice('sheets_sync::'.length).trim();
-      let cfg = {}; try { cfg = JSON.parse(_settings[k] || '{}'); } catch (_) {}
-      if (!owner || !cfg.spreadsheet_id) continue;
-      const ult = cfg.backup && cfg.backup.quando ? Date.parse(cfg.backup.quando) : 0;
-      if (Date.now() - ult < 6 * 86400000) continue; // já fez nesta semana
-      await _sheetsBackup(owner, 'semanal');
-    }
-  } catch (e) { console.error('💾 backup semanal:', e.message); }
-}, 10 * 60 * 1000);
+// 💾 TODO DIA às 6h (Brasília), uma vez por dia por conta — era só segunda-feira (v402: diário, com as
+// configurações junto). Só o maestro roda; BACKUP_HORA muda a hora.
+async function _backupDiarioTick() {
+  if (!supabase || !_googleSA()) return;
+  const agora = new Date(Date.now() - 3 * 3600000); // horário de Brasília
+  const hora = Math.max(0, Math.min(23, parseInt(process.env.BACKUP_HORA || '6', 10) || 6));
+  if (agora.getUTCHours() !== hora) return;
+  for (const k in _settings) {
+    if (!k.startsWith('sheets_sync::')) continue;
+    const owner = k.slice('sheets_sync::'.length).trim();
+    let cfg = {}; try { cfg = JSON.parse(_settings[k] || '{}'); } catch (_) {}
+    if (!owner || !cfg.spreadsheet_id) continue;
+    const ult = cfg.backup && cfg.backup.quando ? Date.parse(cfg.backup.quando) : 0;
+    if (Date.now() - ult < 20 * 3600000) continue; // já fez hoje
+    await _sheetsBackup(owner, 'diario');
+  }
+}
+setInterval(() => { _soMaestro(_backupDiarioTick)().catch(e => console.error('💾 backup diário:', e.message)); }, 10 * 60 * 1000);
 // ⏰ Sincronização automática: a cada hora, para as contas que ligaram "auto"
 setInterval(async () => {
   try {
@@ -7154,6 +7249,47 @@ function applyVars(str, name, phone, notes) {
     .replace(_VAR_NOTAS_RE, notes || '');
 }
 
+// 🚨 VIGIA DE FALHAS POR NÚMERO (v402): N falhas de envio na última hora pelo mesmo número (padrão 5,
+// FALHAS_AVISO) → aviso na sininho + push, e as regras de gotejamento cujo bot de destino usa esse número
+// ficam PARADAS por FALHAS_PAUSA_MIN minutos (padrão 120; 0 = não pausa). Antes, um número com token
+// vencido ou bloqueado derrubava o disparo inteiro em silêncio — ela só via abrindo Relatórios.
+const _falhasConta = new Map(); // owner|acct → [ms]
+const _falhasAvisado = new Map(); // owner|acct → ms do último aviso
+async function _vigiaFalha(owner, accountId) {
+  try {
+    if (!supabase || !owner || !accountId) return;
+    const lim = Math.max(1, parseInt(process.env.FALHAS_AVISO || '5', 10) || 5);
+    const k = owner + '|' + accountId, agora = Date.now();
+    const l = (_falhasConta.get(k) || []).filter(t => agora - t < 3600000); l.push(agora); _falhasConta.set(k, l);
+    if (l.length < lim) return;
+    if (_falhasAvisado.get(k) && agora - _falhasAvisado.get(k) < 3600000) return; // 1 aviso por hora por número
+    _falhasAvisado.set(k, agora);
+    let nome = accountId;
+    try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', accountId).maybeSingle(); if (a) nome = a.phone_display || a.name || accountId; } catch (_) {}
+    // regras de gotejamento cujo bot da etapa de destino envia por este número
+    const pausaMin = Math.max(0, parseInt(process.env.FALHAS_PAUSA_MIN || '120', 10) || 0);
+    const pausadas = [];
+    if (pausaMin > 0) {
+      try {
+        const regras = _dripRegras(owner).filter(r => (r.manual || r.agendado) && r.para);
+        if (regras.length) {
+          const { data: bots } = await supabase.from('bots').select('id, trigger_stage_id, account_id').eq('owner', owner).eq('trigger_type', 'stage_enter').eq('active', true).in('trigger_stage_id', [...new Set(regras.map(r => String(r.para)))]);
+          const ids = (bots || []).map(b => b.id);
+          const usa = new Set((bots || []).filter(b => String(b.account_id || '') === String(accountId)).map(b => String(b.trigger_stage_id)));
+          if (ids.length) {
+            const { data: nos } = await supabase.from('bot_nodes').select('bot_id, config').in('bot_id', ids);
+            for (const n of (nos || [])) if (n.config && String(n.config.account_id || '') === String(accountId)) { const b = (bots || []).find(x => x.id === n.bot_id); if (b) usa.add(String(b.trigger_stage_id)); }
+          }
+          let mudou = false;
+          for (const r of regras) if (usa.has(String(r.para))) { r.parado_ate = new Date(agora + pausaMin * 60000).toISOString(); if (r.manual) { r.manual = false; r._desligarManual = true; } pausadas.push(r.nome || r.id); mudou = true; }
+          if (mudou) { const todas = _dripRegras(owner); for (const r of regras) { const a = todas.find(x => x.id === r.id); if (a) { a.parado_ate = r.parado_ate; if (r._desligarManual) a.manual = false; } } await _dripSalva(owner, todas); }
+        }
+      } catch (e) { console.error('vigia de falhas (gotejamento):', e.message); }
+    }
+    const txt = 'O número "' + nome + '" teve ' + l.length + ' falhas de envio na última hora.' + (pausadas.length ? ' O gotejamento ' + pausadas.map(n => '"' + n + '"').join(', ') + ' ficou PARADO por ' + (pausaMin >= 60 ? Math.round(pausaMin / 60) + ' h' : pausaMin + ' min') + ' — confira o número em Config ▸ Diagnóstico ▸ Saúde e toque ▶ para retomar.' : ' Confira o número em Config ▸ Diagnóstico ▸ Saúde.');
+    await addNotice(owner, txt, 'falhas:' + accountId, { tipo: 'erro', alvo: 'contas' });
+  } catch (e) { console.error('vigia de falhas:', e.message); }
+}
 // Registra no CRM uma mensagem de bot que FALHOU — fica visível na conversa com ⚠️ e o MOTIVO,
 // para o usuário saber que houve tentativa e por que não foi enviada.
 async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
@@ -7176,6 +7312,7 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
         'botfail:' + (accountId || 'sem'), { tipo: 'erro', alvo: 'bots' });
     } catch (_) {}
     await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
+    _vigiaFalha(owner, accountId).catch(() => {}); // 🚨 muitas falhas no mesmo número → aviso + pausa
   } catch(e) { console.error('recordBotFail:', e.message); }
 }
 
@@ -7801,6 +7938,10 @@ async function processNode(run, depth=0) {
       try { await supabase.from('bot_runs').update({ account_id: cfg.account_id, updated_at: new Date().toISOString() }).eq('id', runId); } catch (_) {}
       run.account_id = cfg.account_id; // os próximos passos herdam este número
     }
+    // 🌙 número em "não perturbe": a execução fica PAUSADA neste passo até a janela abrir (o ciclo retoma e
+    // re-avalia este mesmo nó — nada sai fora de hora, e nada se perde)
+    { const sil = _silencioAgora(botOwner, nodeAcct);
+      if (sil.bloqueado) { await supabase.from('bot_runs').update({ status: 'paused', pause_until: new Date(sil.ate).toISOString(), updated_at: new Date().toISOString() }).eq('id', runId); return; } }
     if (cfg.mode === 'template' && cfg.template_name) {
       sendOk = await sendBotTemplate(phone, acctId, { ...cfg, account_id: nodeAcct }, name, notes, botOwner);
     } else {
@@ -8494,7 +8635,7 @@ async function _retomaUma(run, conferir) {
     // Se o nó atual é "Horário comercial" ou "Aguardar até um horário", re-avalia
     // o próprio nó (não avança às cegas: ele mesmo decide se já é hora)
     const curNode = await _nodeById(run.current_node_id);
-    if (curNode?.type === 'business_hours' || curNode?.type === 'wait_until') {
+    if (curNode?.type === 'business_hours' || curNode?.type === 'wait_until' || curNode?.type === 'message') { // (message: pausado pelo "não perturbe")
       await supabase.from('bot_runs').update({ status:'running', pause_until:null, updated_at:now }).eq('id',run.id);
       await processNode({...run, status:'running'});
       return;
@@ -10311,29 +10452,31 @@ app.get('/uso-conta', async (req, res) => {
 
 // ── BACKUP: baixa tudo o que é configuração (não leva conversas nem leads) ──
 const _BK_CHAVES = ['quick_replies', 'tag_catalog', 'tag_cores', 'stage_actions', 'drip_rules', 'sheets_sync'];
+// Monta o backup das configurações (respostas rápidas, etiquetas, automações, gotejamento, planilha,
+// etapas, FAQs e bots com passos e ligações). Usado pelo download manual e pelo backup diário na planilha.
+async function _backupMonta(owner) {
+  const out = { vetra: 'backup', versao: SERVER_VER, dono: owner, quando: new Date().toISOString(), settings: {}, bots: [], etapas: [], faqs: [] };
+  for (const k of _BK_CHAVES) {
+    const { data } = await supabase.from('settings').select('value').eq('key', k + '::' + owner).maybeSingle();
+    if (data?.value) out.settings[k] = data.value;
+  }
+  const { data: etapas } = await supabase.from('pipeline_stages').select('*').eq('owner', owner);
+  out.etapas = etapas || [];
+  const { data: faqs } = await supabase.from('faqs').select('*').eq('owner', owner);
+  out.faqs = faqs || [];
+  const { data: bots } = await supabase.from('bots').select('*').eq('owner', owner);
+  const ids = (bots || []).map(b => b.id);
+  const { data: nosTodos } = ids.length ? await supabase.from('bot_nodes').select('*').in('bot_id', ids) : { data: [] };
+  const { data: ligTodas } = ids.length ? await supabase.from('bot_edges').select('*').in('bot_id', ids) : { data: [] };
+  for (const b of (bots || [])) out.bots.push({ bot: b, nos: (nosTodos || []).filter(n => n.bot_id === b.id), ligacoes: (ligTodas || []).filter(l => l.bot_id === b.id) });
+  return out;
+}
 app.get('/backup', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Backup das configurações é do fornecedor do FILAZ.' });
   if (_bancoPoupa(req, res, 'o backup manual')) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
   if (!req.owner) return res.status(401).json({ error: 'Faça login' });
-  try {
-    const out = { vetra: 'backup', versao: SERVER_VER, dono: req.owner, quando: new Date().toISOString(), settings: {}, bots: [], etapas: [], faqs: [] };
-    for (const k of _BK_CHAVES) {
-      const { data } = await supabase.from('settings').select('value').eq('key', k + '::' + req.owner).maybeSingle();
-      if (data?.value) out.settings[k] = data.value;
-    }
-    const { data: etapas } = await supabase.from('pipeline_stages').select('*').eq('owner', req.owner);
-    out.etapas = etapas || [];
-    const { data: faqs } = await supabase.from('faqs').select('*').eq('owner', req.owner);
-    out.faqs = faqs || [];
-    const { data: bots } = await supabase.from('bots').select('*').eq('owner', req.owner);
-    for (const b of (bots || [])) {
-      const { data: nos } = await supabase.from('bot_nodes').select('*').eq('bot_id', b.id);
-      const { data: lig } = await supabase.from('bot_edges').select('*').eq('bot_id', b.id);
-      out.bots.push({ bot: b, nos: nos || [], ligacoes: lig || [] });
-    }
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await _backupMonta(req.owner)); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Restaura SÓ as configurações (respostas rápidas, etiquetas, automações,
 // gotejamento e planilha). Bots e etapas ficam no arquivo, mas não são
@@ -10346,17 +10489,36 @@ app.post('/backup/restaurar', async (req, res) => {
   _audita(req, 'Backup restaurado', 'restaurou de um arquivo');
   const bk = req.body || {};
   if (bk.vetra !== 'backup' || !bk.settings) return res.status(400).json({ error: 'Arquivo de backup inválido' });
+  try { res.json({ success: true, restaurados: await _backupRestauraSettings(req.owner, bk) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+async function _backupRestauraSettings(owner, bk) {
   const feitos = [];
+  for (const k of _BK_CHAVES) {
+    if (!bk.settings || bk.settings[k] == null) continue;
+    const val = typeof bk.settings[k] === 'string' ? bk.settings[k] : JSON.stringify(bk.settings[k]);
+    const chave = k + '::' + owner;
+    await supabase.from('settings').upsert({ key: chave, value: val, updated_at: new Date().toISOString() });
+    _settings[chave] = val;
+    feitos.push(k);
+  }
+  return feitos;
+}
+// 💾 Restaurar as configurações a partir do backup DIÁRIO guardado na planilha (aba "FILAZ Configurações")
+app.post('/sheets/restaurar-config', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Restaurar é do fornecedor do FILAZ.' });
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!_exigeAdmin(req, res, 'restaurar um backup')) return;
   try {
-    for (const k of _BK_CHAVES) {
-      if (bk.settings[k] == null) continue;
-      const val = typeof bk.settings[k] === 'string' ? bk.settings[k] : JSON.stringify(bk.settings[k]);
-      const chave = k + '::' + req.owner;
-      await supabase.from('settings').upsert({ key: chave, value: val, updated_at: new Date().toISOString() });
-      _settings[chave] = val;
-      feitos.push(k);
-    }
-    res.json({ success: true, restaurados: feitos });
+    const cfg = await _sheetsCfg(req.owner);
+    if (!cfg.spreadsheet_id) return res.status(400).json({ error: 'Nenhuma planilha configurada.' });
+    const linhas = await _lerPlanilhaBruta(cfg.spreadsheet_id, 'FILAZ Configurações');
+    const partes = linhas.filter(l => /^parte \d+/i.test(String(l[0] || ''))).sort((a, b) => parseInt(a[0].replace(/\D/g, ''), 10) - parseInt(b[0].replace(/\D/g, ''), 10)).map(l => String(l[1] || ''));
+    if (!partes.length) return res.status(400).json({ error: 'A aba "FILAZ Configurações" não tem backup ainda.' });
+    const bk = JSON.parse(partes.join(''));
+    if (bk.vetra !== 'backup' || !bk.settings) return res.status(400).json({ error: 'Backup da planilha inválido' });
+    _audita(req, 'Backup restaurado', 'restaurou da planilha (' + (bk.quando || '') + ')');
+    res.json({ success: true, quando: bk.quando, restaurados: await _backupRestauraSettings(req.owner, bk) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -10839,6 +11001,7 @@ const CHAVES_POR_CONTA = new Set([
   'sheets_sync', // planilha do Google ligada ao pipeline (importação de leads)
   'drip_rules',  // gotejamento: mover leads aos poucos de uma etapa para outra
   'drip_hist',   // histórico do gotejamento: os últimos 200 leads movidos (hora, lead, regra)
+  'silencio',    // 🌙 não perturbe por número: horário/dias em que o número não envia nada
   'stage_trash', // lixeira de colunas do pipeline (desfazer exclusão)
   'lead_trash',  // lixeira de leads excluídos (30 dias)
   'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
@@ -13731,4 +13894,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dripHist, _dripRitmoReal, _dripTick, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
