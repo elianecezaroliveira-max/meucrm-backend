@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 406;
+const SERVER_VER = 408;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1016,7 +1016,7 @@ function _avisaEsperaStatus(wamid, status) {
 // demorar muito mais do que o cronômetro configurado. Sem notícia dentro do
 // prazo → vale como enviada. BOT_ESPERA_ENVIO_MS ajusta o prazo.
 async function _esperaEnvioDoBot(wamid, ms) {
-  if (!wamid || typeof wamid !== 'string' || !supabase) return true;
+  if (!wamid || typeof wamid !== 'string' || !supabase || wamid === 'repetido') return true; // ('repetido' = barrado pelo anti-reenvio: segue)
   const prazo = ms != null ? Number(ms) : Number(process.env.BOT_ESPERA_ENVIO_MS != null ? process.env.BOT_ESPERA_ENVIO_MS : 6000);
   const fim = Date.now() + Math.max(0, prazo);
   const olha = async () => {
@@ -4778,6 +4778,7 @@ async function _dripTick() {
     if (!owner.trim() || _dripLock.has(owner)) continue;
     _dripLock.add(owner);
     try {
+      if (_paradaGeral(owner)) { _dripLock.delete(owner); continue; } // ⛔ PARAR TUDO: o gotejamento não move ninguém
       const regras = _dripRegras(owner);
       let mudou = false;
       const etapas = await _dripEtapasDoDono(owner);
@@ -7403,7 +7404,37 @@ async function sendBotFoto(phone, acct, usedAcctId, imgUrl, legenda, owner, midi
   return wamid;
 }
 
-async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, midiaPath) {
+// 🛡️ ANTI-REENVIO (v407) — a mesma EXECUÇÃO de bot nunca manda o MESMO texto/modelo duas vezes para o lead.
+// Rede de segurança independente da lógica do motor (em 29/10 uma falha na retomada reenviou 64 modelos
+// de ontem). Dois olhos: a memória do processo (passo já enviado nesta execução) e o banco (mensagem igual
+// para o lead desde que a execução começou). Quando barra: não envia, anota no log e na sininho, e o fluxo
+// segue como se tivesse enviado (não perde o lead). BOT_ANTIREPETE=0 desliga.
+const _botPassosEnviados = new Map(); // runId → Map(nodeId → ms)
+function _antiRepeteLigado() { return String(process.env.BOT_ANTIREPETE || '1') !== '0'; }
+function _botPassoJaEnviado(runId, nodeId) {
+  if (!runId || !nodeId) return false;
+  const m = _botPassosEnviados.get(String(runId)); const t = m && m.get(String(nodeId));
+  return !!(t && Date.now() - t < 72 * 3600000);
+}
+function _botAnotaPasso(runId, nodeId) {
+  if (!runId || !nodeId) return;
+  let m = _botPassosEnviados.get(String(runId)); if (!m) { m = new Map(); _botPassosEnviados.set(String(runId), m); }
+  m.set(String(nodeId), Date.now());
+  if (_botPassosEnviados.size > 5000) { const k = _botPassosEnviados.keys().next().value; _botPassosEnviados.delete(k); }
+}
+async function _botJaMandou(phone, owner, desde, conteudos) {
+  if (!supabase || !desde || !conteudos || !conteudos.length) return false;
+  try {
+    const { data } = await supabase.from('messages').select('id').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').eq('direction', 'outbound').gte('timestamp', desde).in('content', conteudos.filter(Boolean)).limit(1);
+    return !!(data && data.length);
+  } catch (_) { return false; }
+}
+async function _antiRepeteBarra(phone, owner, accountId, oque) {
+  console.error('🛡️ ANTI-REENVIO: bot ia mandar DE NOVO para ' + phone + ' (' + oque + ') — barrado');
+  try { await addNotice(owner, 'O FILAZ barrou um reenvio: o bot ia mandar de novo "' + String(oque).slice(0, 60) + '" para ' + phone + '. Nada foi enviado. Se isso se repetir, me avise.', 'antirepete:' + phone, { tipo: 'erro', alvo: 'bots' }); } catch (_) {}
+  return 'repetido';
+}
+async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, midiaPath, guarda) {
   let acct, usedAcctId;
   if (await _estaBloqueado(phone, owner)) { await _recordBotFail(phone, text || '[Imagem]', 'Contato bloqueado — o bot não envia para ele.', nodeAccountId || accountId || null, owner, 'text'); return null; }
   if (nodeAccountId) {
@@ -7425,6 +7456,8 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, 
     return null;
   }
   const phoneNumberId = acct.phone_number_id, token = acct.token;
+  // 🛡️ a mesma execução já mandou este texto para o lead? então NÃO manda de novo
+  if (guarda && guarda.desde && _antiRepeteLigado() && text && await _botJaMandou(phone, owner, guarda.desde, [text])) return _antiRepeteBarra(phone, owner, usedAcctId, text);
   // 📷 Passo com FOTO: manda a imagem (o texto vira legenda)
   if (imgUrl) {
     try { return await sendBotFoto(phone, acct, usedAcctId, imgUrl, text, owner, midiaPath); }
@@ -7709,6 +7742,11 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   const posta = (v) => axios.post(`https://graph.facebook.com/v23.0/${acct.phone_number_id}/messages`,
       { messaging_product: 'whatsapp', to: phone, type: 'template', template: montaTmpl(v) },
       { headers: { Authorization: `Bearer ${acct.token}`, 'Content-Type': 'application/json' } });
+  // 🛡️ a mesma execução já mandou este modelo para o lead? então NÃO manda de novo
+  if (cfg._desde && _antiRepeteLigado()) {
+    const jaMostrado = [bodyText ? renderTemplateBody(bodyText, vars) : null, '[Modelo: ' + cfg.template_name + ']'];
+    if (await _botJaMandou(phone, owner, cfg._desde, jaMostrado)) return _antiRepeteBarra(phone, owner, usedAcctId, '[Modelo: ' + cfg.template_name + ']');
+  }
   try {
     let r;
     try { r = await posta(vars); }
@@ -7948,6 +7986,55 @@ async function _criaTarefaDoBot(cfg, run) {
   try { await addNotice(run.owner, 'A tarefa "' + title + '" do bot não foi criada para ' + nome + ' (' + phone + '). Crie na mão e me avise.', 'tarefa-bot:' + phone + ':' + title, { tipo: 'erro' }); } catch (_) {}
   return false;
 }
+// ⛔ PARADA GERAL (v408) — o botão "PARAR TUDO" dela: enquanto ligada, o gotejamento não move ninguém e
+// nenhum bot ENVIA (a execução fica estacionada no passo "Enviar", com status 'paused', e segue de onde
+// parou quando ela retomar — sem reenviar o que já saiu). Passos que não falam com o lead (etiqueta,
+// tarefa, etapa) continuam. settings parada_geral::dona = { on, desde, por }.
+function _paradaGeral(owner) { try { const o = JSON.parse(_cfg('parada_geral', owner) || 'null'); return o && o.on ? o : null; } catch (_) { return null; } }
+async function _paradaGeralSalva(owner, on, por) {
+  const k = 'parada_geral::' + (owner || ' ');
+  const v = JSON.stringify(on ? { on: true, desde: new Date().toISOString(), por: por || null } : { on: false, retomada_em: new Date().toISOString() });
+  await supabase.from('settings').upsert({ key: k, value: v, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  _settings[k] = v;
+}
+app.get('/parada', (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const p = _paradaGeral(req.owner);
+  res.json({ on: !!p, desde: p ? p.desde : null, por: p ? p.por : null });
+});
+app.put('/parada', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const on = !!(req.body && (req.body.on === true || String(req.body.on) === '1' || String(req.body.on) === 'true'));
+  if (!on && !_exigeAdmin(req, res, 'retomar os envios')) return; // qualquer um pode PARAR; só administrador retoma
+  try {
+    await _paradaGeralSalva(req.owner, on, req.usuario || req.owner);
+    let estacionadas = 0;
+    if (on) {
+      // tudo que está "rodando" agora vai estacionar no próximo passo "Enviar"; o que já espera resposta
+      // ou está pausado fica como está (o prazo vencido só segue quando ela retomar)
+      try { _audita(req, 'PARAR TUDO', 'bots e gotejamento parados'); } catch (_) {}
+      try { const { count } = await supabase.from('bot_runs').select('id', { count: 'exact', head: true }).eq('owner', req.owner).in('status', ['running', 'paused', 'waiting_reply']); estacionadas = count || 0; } catch (_) {}
+      try { addNotice(req.owner, '⛔ PARAR TUDO: bots e gotejamento parados por ' + (req.usuario || 'você') + '. Nada é enviado até você retomar (botão Retomar no alto da tela).', 'parada:' + Date.now(), { tipo: 'erro', alvo: 'bots' }); } catch (_) {}
+    } else {
+      try { _audita(req, 'Retomar envios', 'parada geral desligada'); } catch (_) {}
+      // ao retomar, as execuções estacionadas (paused com pause_until no passado) são retomadas pelo ciclo
+      // normal; as que venceram há mais de 15 min seriam descartadas — reaproxima o prazo para AGORA
+      try { await supabase.from('bot_runs').update({ pause_until: new Date(Date.now() + 5000).toISOString(), updated_at: new Date().toISOString() }).eq('owner', req.owner).eq('status', 'paused').lt('pause_until', new Date().toISOString()); } catch (_) {}
+    }
+    res.json({ ok: true, on, estacionadas });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Bot está ativo? (cache de 20 s) — desligar o bot na tela também encerra o que ele estava fazendo
+const _botAtivoCache = new Map();
+async function _botAtivo(botId) {
+  if (!botId) return true;
+  const c = _botAtivoCache.get(String(botId)); if (c && Date.now() - c.t < 20000) return c.ativo;
+  let ativo = true;
+  try { const { data } = await supabase.from('bots').select('active').eq('id', botId).maybeSingle(); if (data) ativo = data.active !== false; } catch (_) {}
+  _botAtivoCache.set(String(botId), { t: Date.now(), ativo });
+  return ativo;
+}
 async function processNode(run, depth=0) {
   if (!supabase) return;
   // ⏱️ Instante em que a mensagem ANTERIOR saiu: vale só para o passo logo seguinte
@@ -7999,6 +8086,14 @@ async function processNode(run, depth=0) {
     else await stopRun(runId,'completed');
 
   } else if (node.type === 'message') {
+    // 🔌 bot DESLIGADO na tela: a execução encerra aqui (ela: "cliquei no botão que desliga o bot e não desligou nada")
+    if (!(await _botAtivo(run.bot_id))) { console.log('Bot desligado — execução encerrada no passo "Enviar" (' + phone + ')'); await stopRun(runId, 'stopped'); return; }
+    // ⛔ PARAR TUDO ligado: estaciona neste passo (status 'paused'); segue daqui quando ela retomar
+    if (_paradaGeral(botOwner)) {
+      if (run.status !== 'paused') await supabase.from('bot_runs').update({ status: 'paused', pause_until: new Date(Date.now() + 10 * 60000).toISOString(), updated_at: new Date().toISOString() }).eq('id', runId);
+      else await supabase.from('bot_runs').update({ pause_until: new Date(Date.now() + 10 * 60000).toISOString(), updated_at: new Date().toISOString() }).eq('id', runId);
+      return;
+    }
     const { data:ct } = await supabase.from('contacts').select('name,notes').eq('phone',phone).eq('owner',OW).maybeSingle();
     const name = ct?.name || phone;
     const notes = ct?.notes || '';
@@ -8020,12 +8115,17 @@ async function processNode(run, depth=0) {
     // re-avalia este mesmo nó — nada sai fora de hora, e nada se perde)
     { const sil = _silencioAgora(botOwner, nodeAcct);
       if (sil.bloqueado) { await supabase.from('bot_runs').update({ status: 'paused', pause_until: new Date(sil.ate).toISOString(), updated_at: new Date().toISOString() }).eq('id', runId); return; } }
-    if (cfg.mode === 'template' && cfg.template_name) {
-      sendOk = await sendBotTemplate(phone, acctId, { ...cfg, account_id: nodeAcct }, name, notes, botOwner);
+    // 🛡️ este passo JÁ saiu nesta execução (memória do processo)? então não sai de novo
+    if (_antiRepeteLigado() && _botPassoJaEnviado(runId, nodeId)) { sendOk = await _antiRepeteBarra(phone, botOwner, nodeAcct, cfg.mode === 'template' ? '[Modelo: ' + cfg.template_name + ']' : String(cfg.text || '').slice(0, 60)); }
+    else if (cfg.mode === 'template' && cfg.template_name) {
+      sendOk = await sendBotTemplate(phone, acctId, { ...cfg, account_id: nodeAcct, _desde: run.created_at || null }, name, notes, botOwner);
     } else {
       const text = applyVars(cfg.text || '', name, phone, notes);
       // Passo pode ter FOTO (com o texto de legenda) — sem texto e sem foto = nada a fazer
-      sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null) : true;
+      sendOk = (text || cfg.image_url) ? await sendBotMsg(phone, acctId, text, botOwner, nodeAcct, cfg.image_url || null, null, { desde: run.created_at || null, runId }) : true;
+    }
+    if (sendOk && sendOk !== 'repetido') _botAnotaPasso(runId, nodeId); // 🛡️ passo enviado nesta execução
+    {
       // 📷 O passo usa {notas}: as FOTOS coladas nas Anotações do lead vão junto, depois do texto
       // (ela anexou a simulação nas Anotações e esperava que o bot mandasse)
       if (sendOk && cfg.text && new RegExp(_VAR_NOTAS_RE.source, 'i').test(String(cfg.text))) {
@@ -10671,7 +10771,18 @@ app.put('/bots/:id', async (req,res) => {
   if (active!==undefined) upd.active=active;
   const { data,error } = await supabase.from('bots').update(upd).eq('id',req.params.id).eq('owner', req.owner || ' ').select().single();
   if (error) return res.status(500).json({error:error.message});
-  res.json(data);
+  _botAtivoCache.delete(String(req.params.id));
+  // 🔌 (v408) desligar o bot ENCERRA o que ele estava fazendo (execuções rodando, esperando resposta ou pausadas)
+  // — antes só impedia disparos novos e ela via o bot "continuar" (ela: "cliquei no botão que desliga e não desligou nada")
+  let encerradas = 0;
+  if (active === false) {
+    try {
+      const { data: rs } = await supabase.from('bot_runs').update({ status: 'stopped', pause_until: null, updated_at: new Date().toISOString() }).eq('bot_id', req.params.id).in('status', ['running', 'paused', 'waiting_reply']).select('id');
+      encerradas = (rs || []).length;
+    } catch (e) { console.error('desligar bot — encerrar execuções:', e.message); }
+    try { _audita(req, 'Bot desligado', (data && data.name) + ' — ' + encerradas + ' execução(ões) encerrada(s)'); } catch (_) {}
+  }
+  res.json(Object.assign({}, data, { encerradas }));
 });
 app.delete('/bots/:id', async (req,res) => {
   if (!_exigeAdmin(req, res, 'apagar um bot')) return;
@@ -11084,6 +11195,7 @@ const CHAVES_POR_CONTA = new Set([
   'drip_rules',  // gotejamento: mover leads aos poucos de uma etapa para outra
   'drip_hist',   // histórico do gotejamento: os últimos 200 leads movidos (hora, lead, regra)
   'silencio',    // 🌙 não perturbe por número: horário/dias em que o número não envia nada
+  'parada_geral', // ⛔ botão PARAR TUDO: bots e gotejamento parados até ela retomar
   'stage_trash', // lixeira de colunas do pipeline (desfazer exclusão)
   'lead_trash',  // lixeira de leads excluídos (30 dias)
   'empresa_dados', // razão social/CNPJ/contato que aparecem nos Termos e na Privacidade
@@ -13975,4 +14087,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
