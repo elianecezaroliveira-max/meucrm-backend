@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 408;
+const SERVER_VER = 409;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -3680,6 +3680,61 @@ app.get('/exportar/resumo', async (req, res) => {
   } catch (e) { res.json({}); }
 });
 
+// 📐 TAMANHO DAS FOTOS (v409) — ela: "arquivos e fotos mudam de tamanho antes de carregar no chat". O app
+// reservava 240×320 para toda foto nunca vista e, quando ela chegava, o balão pulava para o tamanho certo.
+// Agora o servidor lê largura×altura do cabeçalho do arquivo (JPEG/PNG/GIF/WebP — só os primeiros bytes) na
+// primeira vez que a foto passa por aqui (proxy ou cópia no cofre) e manda junto com a mensagem
+// (media_w/media_h): o balão já nasce no tamanho final, em qualquer aparelho.
+const _midiaDims = new Map(); // media_id → [w, h]
+let _midiaDimsSalvar = null;
+function _dimsDaImagem(buf) {
+  try {
+    if (!buf || buf.length < 24) return null;
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return [buf.readUInt32BE(16), buf.readUInt32BE(20)]; // PNG
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return [buf.readUInt16LE(6), buf.readUInt16LE(8)]; // GIF
+    if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') { // WebP
+      const ck = buf.toString('ascii', 12, 16);
+      if (ck === 'VP8 ' && buf.length >= 30) return [buf.readUInt16LE(26) & 0x3fff, buf.readUInt16LE(28) & 0x3fff];
+      if (ck === 'VP8L' && buf.length >= 25) { const b = buf.readUInt32LE(21); return [(b & 0x3fff) + 1, ((b >> 14) & 0x3fff) + 1]; }
+      if (ck === 'VP8X' && buf.length >= 30) return [1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16)), 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16))];
+      return null;
+    }
+    if (buf[0] === 0xFF && buf[1] === 0xD8) { // JPEG: anda pelos marcadores até o SOF
+      let i = 2;
+      while (i + 9 < buf.length) {
+        if (buf[i] !== 0xFF) { i++; continue; }
+        const m = buf[i + 1];
+        if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }
+        const len = buf.readUInt16BE(i + 2);
+        if ((m >= 0xC0 && m <= 0xC3) || (m >= 0xC5 && m <= 0xC7) || (m >= 0xC9 && m <= 0xCB) || (m >= 0xCD && m <= 0xCF)) return [buf.readUInt16BE(i + 7), buf.readUInt16BE(i + 5)];
+        i += 2 + len;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+function _midiaDimAnota(mediaId, buf) {
+  try {
+    if (!mediaId || _midiaDims.has(String(mediaId))) return;
+    const d = _dimsDaImagem(buf);
+    if (!d || !(d[0] > 0) || !(d[1] > 0)) return;
+    _midiaDims.set(String(mediaId), d);
+    if (_midiaDims.size > 4000) { const k = _midiaDims.keys().next().value; _midiaDims.delete(k); }
+    // (não invalida as conversas guardadas: o tamanho é anexado na hora da resposta, depois do cache)
+    clearTimeout(_midiaDimsSalvar);
+    _midiaDimsSalvar = setTimeout(() => { if (!supabase) return; const v = JSON.stringify([..._midiaDims.entries()]); supabase.from('settings').upsert({ key: 'midia_dims', value: v, updated_at: new Date().toISOString() }, { onConflict: 'key' }).then(() => { _settings['midia_dims'] = v; }, () => {}); }, 15000);
+  } catch (_) {}
+}
+function _midiaDimsCarrega() { try { const a = JSON.parse(_settings['midia_dims'] || '[]'); if (Array.isArray(a)) for (const [k, v] of a) if (Array.isArray(v)) _midiaDims.set(String(k), v); } catch (_) {} }
+// Lê o começo de um stream (até 64 KB) para achar o tamanho, sem atrapalhar o envio ao app
+function _midiaDimDoStream(mediaId, stream) {
+  try {
+    if (!mediaId || _midiaDims.has(String(mediaId))) return;
+    let acc = Buffer.alloc(0), feito = false;
+    const ouve = (ch) => { if (feito) return; acc = Buffer.concat([acc, ch]); const d = _dimsDaImagem(acc); if (d || acc.length > 65536) { feito = true; stream.removeListener('data', ouve); if (d) _midiaDimAnota(mediaId, acc); } };
+    stream.on('data', ouve);
+  } catch (_) {}
+}
 app.get("/media-proxy/:mediaId", async (req, res) => {
   const { account_id, download, filename } = req.query;
   const { mediaId } = req.params;
@@ -3742,6 +3797,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
       const buf = Buffer.from(await blob.arrayBuffer());
       const total = buf.length;
       const ctype = req.query.mime || blob.type || 'application/octet-stream';
+      if (/^image\//.test(String(ctype))) _midiaDimAnota(req.params.mediaId, buf); // 📐 (chave = o media_id da mensagem, sem o "api/")
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Content-Type', ctype);
@@ -3843,6 +3899,7 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
       res.setHeader("Cache-Control", "public, max-age=604800, immutable");
     }
 
+    if (/^image\//.test(String(res.getHeader('Content-Type') || req.query.mime || ''))) _midiaDimDoStream(mediaId, up.data); // 📐
     up.data.pipe(res);
     up.data.on("error", (e) => {
       console.error("Stream de mídia interrompido:", e.message);
@@ -5634,6 +5691,7 @@ app.post('/bot-media', async (req, res) => {
     if (!/^(image\/(jpeg|jpg|png|webp|gif)|video\/(mp4|3gpp|quicktime))$/.test(tipo)) tipo = 'image/jpeg';
     const ext = (tipo.split('/')[1] || 'jpg').replace(/[^a-z0-9]/gi, '') || 'jpg';
     const nome = `bot/${Date.now()}_${String(filename || 'foto').replace(/[^\w.-]/g, '').slice(-40) || 'foto'}.${ext}`;
+    if (/^image\//.test(String(tipo || ''))) _midiaDimAnota(nome, buf); // 📐 tamanho da foto ao guardar no cofre
     const { error } = await supabase.storage.from('wa-media').upload(nome, buf, { contentType: tipo, upsert: true });
     if (error) return res.status(500).json({ error: error.message });
     const base = process.env.BACKEND_URL || `https://${req.headers.host}`;
@@ -5776,7 +5834,8 @@ app.get("/messages/:phone", async (req, res) => {
     });
   } catch (e) { return res.status(500).json({ error: e.message }); }
   if (corpo.mais != null) { res.set('Access-Control-Expose-Headers', 'X-Mais-Antigas'); res.set('X-Mais-Antigas', String(corpo.mais)); }
-  res.json(corpo.data);
+  // 📐 largura×altura das fotos já conhecidas vão junto (o balão nasce no tamanho certo)
+  res.json(_midiaDims.size ? corpo.data.map(m => { const d = m && m.media_id ? _midiaDims.get(String(m.media_id)) : null; return d ? Object.assign({}, m, { media_w: d[0], media_h: d[1] }) : m; }) : corpo.data);
   if (!_euBusquei) return; // resposta da memória: nada de faxina nem cura de novo
   const _sobras = corpo.sobras || [];
   if (_sobras.length) {
@@ -11167,6 +11226,7 @@ async function loadSettings() {
       }
       if (data.length < 1000) break;
     }
+    _midiaDimsCarrega(); // 📐
     console.log('Settings carregados: ' + n + ' chave(s)');
   } catch(e) { console.error('Settings load error:', e.message); }
 }
@@ -14087,4 +14147,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
