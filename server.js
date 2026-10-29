@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 405;
+const SERVER_VER = 406;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -8713,7 +8713,11 @@ async function _retomaUma(run, conferir) {
     // Se o nó atual é "Horário comercial" ou "Aguardar até um horário", re-avalia
     // o próprio nó (não avança às cegas: ele mesmo decide se já é hora)
     const curNode = await _nodeById(run.current_node_id);
-    if (curNode?.type === 'business_hours' || curNode?.type === 'wait_until' || curNode?.type === 'message') { // (message: pausado pelo "não perturbe")
+    // 🚨 (v406) SÓ execução PAUSADA (status 'paused') num passo "Enviar" é a do "não perturbe". Uma execução
+    // ESPERANDO RESPOSTA (status 'waiting_reply') também fica no passo "Enviar": re-avaliar esse passo quando o
+    // prazo vencia REENVIAVA a mensagem — foi o que disparou tudo de novo em 29/10. Esperando resposta → segue
+    // pelo "sem resposta" (como sempre foi).
+    if (curNode?.type === 'business_hours' || curNode?.type === 'wait_until' || (curNode?.type === 'message' && run.status === 'paused')) {
       await supabase.from('bot_runs').update({ status:'running', pause_until:null, updated_at:now }).eq('id',run.id);
       await processNode({...run, status:'running'});
       return;
