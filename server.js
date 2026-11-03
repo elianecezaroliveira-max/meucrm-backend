@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 410;
+const SERVER_VER = 411;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9596,6 +9596,13 @@ function _iaViradaDoDia(agora) {
   catch (_) { const u = new Date(t); h = (u.getUTCHours() + 17) % 24; mi = u.getUTCMinutes(); }
   return t + ((24 * 60 - (h * 60 + mi)) * 60000) + 60000; // (+1 min de folga)
 }
+// 🐢 (v411) modelo que acabou de dar 503 "alta demanda" ou estourar o prazo vai para o FIM da fila por
+// 10 min: a próxima sugestão já sai pelo outro modelo (3.5), em vez de esperar os 12 s da corrida de novo
+// ("apareceu, mas demorou": 3.8 em alta demanda levou 17 s para dizer 503; a sugestão saiu em 15 s)
+const _iaLentos = new Map(); // 'provedor:modelo' → até (ms)
+const IA_LENTO_MIN = Math.max(1, Number(process.env.IA_LENTO_MIN) || 10);
+const _iaLentoAgora = (prov, model) => { const k = prov + ':' + model; const ate = _iaLentos.get(k); if (!ate) return false; if (ate > Date.now()) return true; _iaLentos.delete(k); return false; };
+function _iaMarcaLento(prov, model, motivo) { _iaLentos.set(prov + ':' + model, Date.now() + IA_LENTO_MIN * 60000); console.log('IA ' + prov + ' (' + model + '): ' + motivo + ' — vai para o fim da fila por ' + IA_LENTO_MIN + ' min'); }
 const _iaEsgotadoAgora = (prov, model) => { const k = prov + ':' + model; const x = _iaEsgotados.get(k); if (!x) return false; if (x.ate > Date.now()) return true; _iaEsgotados.delete(k); return false; };
 function _iaEsgotaModelo(prov, model, ate, motivo) { _iaEsgotados.set(prov + ':' + model, { ate, motivo: motivo || 'cota do dia' }); console.error('IA ' + prov + ' (' + model + '): cota do dia esgotada — fica de fora até ' + new Date(ate).toISOString()); }
 function _iaCotaResumo() { const agora = Date.now(); const lista = []; _iaEsgotados.forEach((x, k) => { if (x.ate > agora) lista.push({ provedor: k.split(':')[0], modelo: k.slice(k.indexOf(':') + 1), ate: new Date(x.ate).toISOString(), motivo: x.motivo }); }); return lista; }
@@ -9617,7 +9624,7 @@ function _iaEncurtaParaGroq(sys, usr) {
   return { usr: u, nivel };
 }
 async function _iaCorrida(prov, pede, anota) {
-  const espera = Math.max(1000, Number(process.env.IA_ESPERA_MS) || 12000);
+  const espera = Math.max(1000, Number(process.env.IA_ESPERA_MS) || 8000); // (v411: 12 → 8 s)
   const vivos = new Map(); let i = 0, chaveRecusada = false;
   const lanca = () => { const model = prov.modelos[i++]; const ctrl = new AbortController();
     const p = pede(prov, model, ctrl.signal).then(r => ({ ok: true, model, r }), e => ({ ok: false, model, e }));
@@ -9675,12 +9682,12 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
     console.error('IA ' + prov.nome + ' (' + model + ') falhou: ' + (st || e.code || '') + ' ' + em.slice(0, 200));
     // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
     // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
-    if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e) || e.code === 'ECONNABORTED' || /timeout/i.test(em)) { const c = _iaCota429(e); if (!(c && c.porDia) && st !== 404) transitorio = true; return 'proximo'; } // (demorou demais: tenta o próximo)
+    if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e) || e.code === 'ECONNABORTED' || /timeout/i.test(em)) { const c = _iaCota429(e); if (!(c && c.porDia) && st !== 404) transitorio = true; if (st === 503 || e.code === 'ECONNABORTED' || /timeout/i.test(em)) _iaMarcaLento(prov.nome, model, st === 503 ? '503 alta demanda' : 'estourou o prazo'); return 'proximo'; } // (demorou demais: tenta o próximo)
     if (st === 401 || st === 403) { console.error('IA ' + prov.nome + ': chave recusada — ' + em.slice(0, 120)); return 'provedor'; } // chave inválida: pula para o próximo provedor
     throw e;
   };
   for (const prov0 of provs) {
-    const vivos = prov0.modelos.filter(m => !_iaEsgotadoAgora(prov0.nome, m));
+    const vivos = prov0.modelos.filter(m => !_iaEsgotadoAgora(prov0.nome, m)).sort((x, y) => (_iaLentoAgora(prov0.nome, x) ? 1 : 0) - (_iaLentoAgora(prov0.nome, y) ? 1 : 0)); // (lentos por último, ordem original entre iguais)
     if (!vivos.length) { falhas.push(prov0.nome + ' → cota do dia esgotada (fica de fora até a virada)'); continue; } // (não gasta pedido à toa)
     const prov = Object.assign({}, prov0, { modelos: vivos });
     if (prov.corrida && prov.modelos.length > 1) { // 🏁 corrida (ver _iaCorrida)
@@ -14230,4 +14237,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
