@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 409;
+const SERVER_VER = 410;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -9565,6 +9565,57 @@ const _iaTemChave = () => _iaProvedores().length > 0;
 // e vale a primeira resposta boa (o outro pedido é cancelado). Se um falha na hora (503/429),
 // o próximo entra imediatamente. Devolve { model, r } ou null (todos falharam → anota já
 // registrou cada falha; 'provedor' = chave recusada, pula o provedor).
+// 📅 COTA DO DIA (30/10/2026): o plano grátis do Gemini dá só 20 PEDIDOS POR DIA por modelo (e 5 por
+// minuto). De manhã, abrindo as conversas, os 20 do 3.8 e os 20 do 3.5 acabavam em minutos — e daí o
+// servidor continuava batendo no Google a cada 20 s em cada conversa (milhares de 429 por dia) e a tela
+// dizia "IA ocupada — tento de novo em 20 s" o dia inteiro. Agora:
+//   • o 429 é LIDO: "PerDay" = cota do dia → o modelo fica de fora até a virada (meia-noite na
+//     Califórnia = 4h/5h aqui) sem gastar mais nenhum pedido; "PerMinute" com retryDelay curto →
+//     espera e tenta de novo UMA vez no mesmo modelo;
+//   • o pedido ao Groq é encurtado ANTES de ir (limite 8 mil tokens/min): evita o 413 → encurta →
+//     roda tudo de novo (eram 12 chamadas por sugestão);
+//   • quando só sobrou a cota do dia esgotada, a resposta é DEFINITIVA e explica (a tela para de
+//     repetir); /ia/status conta o que está esgotado e até quando.
+const _iaEsgotados = new Map(); // 'provedor:modelo' → { ate: ms, motivo }
+function _iaCota429(e) {
+  const st = e && e.response && e.response.status;
+  if (st !== 429) return null;
+  let d = e.response.data; if (Array.isArray(d)) d = d[0];
+  let txt = ''; try { txt = JSON.stringify(d || {}); } catch (_) { txt = String(d || ''); }
+  const porDia = /PerDay|per day|daily|RequestsPerDay/i.test(txt);
+  const porMinuto = /PerMinute|per minute|RPM|TPM/i.test(txt) && !porDia;
+  const m = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(txt);
+  const v = /"quotaValue"\s*:\s*"?(\d+)/.exec(txt);
+  return { porDia, porMinuto, retryMs: m ? Math.ceil(Number(m[1]) * 1000) : null, valor: v ? Number(v[1]) : null, gratis: /free_tier|FreeTier/i.test(txt) };
+}
+// próxima meia-noite na Califórnia (é quando o Google zera a cota do dia)
+function _iaViradaDoDia(agora) {
+  const t = agora || Date.now();
+  let h = 0, mi = 0;
+  try { const p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour12: false, hour: '2-digit', minute: '2-digit' }).formatToParts(new Date(t)); h = Number((p.find(x => x.type === 'hour') || {}).value) % 24; mi = Number((p.find(x => x.type === 'minute') || {}).value); }
+  catch (_) { const u = new Date(t); h = (u.getUTCHours() + 17) % 24; mi = u.getUTCMinutes(); }
+  return t + ((24 * 60 - (h * 60 + mi)) * 60000) + 60000; // (+1 min de folga)
+}
+const _iaEsgotadoAgora = (prov, model) => { const k = prov + ':' + model; const x = _iaEsgotados.get(k); if (!x) return false; if (x.ate > Date.now()) return true; _iaEsgotados.delete(k); return false; };
+function _iaEsgotaModelo(prov, model, ate, motivo) { _iaEsgotados.set(prov + ':' + model, { ate, motivo: motivo || 'cota do dia' }); console.error('IA ' + prov + ' (' + model + '): cota do dia esgotada — fica de fora até ' + new Date(ate).toISOString()); }
+function _iaCotaResumo() { const agora = Date.now(); const lista = []; _iaEsgotados.forEach((x, k) => { if (x.ate > agora) lista.push({ provedor: k.split(':')[0], modelo: k.slice(k.indexOf(':') + 1), ate: new Date(x.ate).toISOString(), motivo: x.motivo }); }); return lista; }
+const _iaHoraLocal = (ms) => { try { return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }).format(new Date(ms)).replace(':', 'h'); } catch (_) { return ''; } };
+// texto para a tela quando a cota grátis do Gemini acabou (resposta DEFINITIVA: a tela não repete)
+function _iaMotivoCotaDia() {
+  const g = _iaCotaResumo().filter(x => x.provedor === 'gemini'); if (!g.length) return null;
+  const ate = Math.min.apply(null, g.map(x => new Date(x.ate).getTime()));
+  return 'cota grátis do Gemini acabou por hoje (20 pedidos por dia por modelo) — volta às ' + _iaHoraLocal(ate) + '. Para não acabar mais, ative o faturamento do projeto no Google AI Studio (custa centavos por dia).';
+}
+// estimativa de tokens (português ≈ 3,2 caracteres por token) e pré-encurtamento para o limite do Groq
+const _iaTokensEstim = (t) => Math.ceil(String(t || '').length / 3.2);
+const IA_GROQ_TPM = Math.max(2000, Number(process.env.IA_GROQ_TPM) || 8000);
+function _iaEncurtaParaGroq(sys, usr) {
+  const teto = Math.floor(IA_GROQ_TPM * 0.9);
+  let u = usr, nivel = 0;
+  if (_iaTokensEstim(sys) + _iaTokensEstim(u) > teto) { u = _iaEncurta(u, 1); nivel = 1; }
+  if (_iaTokensEstim(sys) + _iaTokensEstim(u) > teto) { u = _iaEncurta(u, 2); nivel = 2; }
+  return { usr: u, nivel };
+}
 async function _iaCorrida(prov, pede, anota) {
   const espera = Math.max(1000, Number(process.env.IA_ESPERA_MS) || 12000);
   const vivos = new Map(); let i = 0, chaveRecusada = false;
@@ -9590,11 +9641,29 @@ async function _iaCorrida(prov, pede, anota) {
 async function _iaChamaGroq(sys, usr, owner, _nivel) {
   const provs = _iaProvedores(owner);
   if (!provs.length) throw new Error('sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)');
-  let ultimoErro = null; const falhas = []; // 🔎 cada provedor/modelo que falhou e por quê (vai no log e no aviso)
-  const pede = (prov, model, signal) => {
-    const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }], temperature: 0.4, max_tokens: 3000 }; // (3000: o Gemini "pensa" antes de responder e o JSON vinha cortado no meio do "porque")
+  let ultimoErro = null; const falhas = []; let transitorio = false; // 🔎 cada provedor/modelo que falhou e por quê (vai no log e no aviso); transitorio = alguma falha passageira (limite por minuto, 503, prazo) — vale tentar de novo daqui a pouco
+  const pedeUma = (prov, model, signal) => {
+    let u = usr;
+    if (prov.nome === 'groq') { const enc = _iaEncurtaParaGroq(sys, u); if (enc.nivel) { u = enc.usr; console.log('IA groq (' + model + '): pedido encurtado antes de ir (nível ' + enc.nivel + ', ~' + (_iaTokensEstim(sys) + _iaTokensEstim(u)) + ' tokens; limite ' + IA_GROQ_TPM + '/min)'); } }
+    const body = { model, messages: [{ role: 'system', content: sys }, { role: 'user', content: u }], temperature: 0.4, max_tokens: 3000 }; // (3000: o Gemini "pensa" antes de responder e o JSON vinha cortado no meio do "porque")
     if (/gpt-oss|gemini/i.test(model)) body.reasoning_effort = 'low'; // Gemini "pensa" demais: estourava 25 s e vinha cortado
     return axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.key, 'Content-Type': 'application/json' }, timeout: prov.nome === 'gemini' ? 55000 : 25000, signal });
+  };
+  // 429 "por minuto" com retryDelay curto → espera e tenta UMA vez de novo no mesmo modelo (em vez de
+  // gastar o pedido do outro modelo); 429 "do dia" → o modelo sai da lista até a virada
+  const pede = async (prov, model, signal) => {
+    try { return await pedeUma(prov, model, signal); }
+    catch (e) {
+      const c = _iaCota429(e);
+      if (c && c.porDia) { _iaEsgotaModelo(prov.nome, model, _iaViradaDoDia(), 'cota do dia (' + (c.valor || '?') + ' pedidos' + (c.gratis ? ', plano grátis' : '') + ')'); throw e; }
+      if (c && c.porMinuto && c.retryMs && c.retryMs <= 30000 && !(signal && signal.aborted)) {
+        console.log('IA ' + prov.nome + ' (' + model + '): limite por minuto — espero ' + Math.ceil(c.retryMs / 1000) + ' s e tento de novo');
+        await new Promise(r => setTimeout(r, c.retryMs + 300));
+        if (signal && signal.aborted) throw e;
+        return pedeUma(prov, model, signal);
+      }
+      throw e;
+    }
   };
   const pronto = (prov, model, r) => { const msg = (r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message) || {}; return { texto: String(msg.content || ''), model: prov.nome + ':' + model, encurtado: _nivel || 0 }; };
   // devolve 'proximo' (tenta outro modelo), 'provedor' (chave recusada: pula o provedor) ou lança
@@ -9606,11 +9675,14 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
     console.error('IA ' + prov.nome + ' (' + model + ') falhou: ' + (st || e.code || '') + ' ' + em.slice(0, 200));
     // modelo desligado/fora do ar, no limite de uso por minuto (429) OU pedido grande demais
     // para o limite desse modelo (413) → tenta o próximo; outro erro (chave inválida) → para
-    if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e) || e.code === 'ECONNABORTED' || /timeout/i.test(em)) return 'proximo'; // (demorou demais: tenta o próximo)
+    if (st === 404 || st === 400 && /model/i.test(em) || st === 503 || st === 429 || _iaErroGrande(e) || e.code === 'ECONNABORTED' || /timeout/i.test(em)) { const c = _iaCota429(e); if (!(c && c.porDia) && st !== 404) transitorio = true; return 'proximo'; } // (demorou demais: tenta o próximo)
     if (st === 401 || st === 403) { console.error('IA ' + prov.nome + ': chave recusada — ' + em.slice(0, 120)); return 'provedor'; } // chave inválida: pula para o próximo provedor
     throw e;
   };
-  for (const prov of provs) {
+  for (const prov0 of provs) {
+    const vivos = prov0.modelos.filter(m => !_iaEsgotadoAgora(prov0.nome, m));
+    if (!vivos.length) { falhas.push(prov0.nome + ' → cota do dia esgotada (fica de fora até a virada)'); continue; } // (não gasta pedido à toa)
+    const prov = Object.assign({}, prov0, { modelos: vivos });
     if (prov.corrida && prov.modelos.length > 1) { // 🏁 corrida (ver _iaCorrida)
       const v = await _iaCorrida(prov, pede, anota);
       if (v) return pronto(prov, v.model, v.r);
@@ -9627,7 +9699,8 @@ async function _iaChamaGroq(sys, usr, owner, _nivel) {
     console.log('IA: pedido grande demais (' + usr.length + ' → ' + menor.length + ' caracteres), tentando de novo encurtado, nível ' + ((_nivel || 0) + 1));
     return _iaChamaGroq(sys, menor, owner, (_nivel || 0) + 1);
   }
-  if (ultimoErro && falhas.length > 1) { try { const e2 = new Error(String(ultimoErro.message || 'falha') + ' | tentativas: ' + falhas.join(' ; ')); e2.response = ultimoErro.response; throw e2; } catch (e3) { if (e3.message && /tentativas:/.test(e3.message)) throw e3; } }
+  if (ultimoErro && falhas.length > 1) { try { const e2 = new Error(String(ultimoErro.message || 'falha') + ' | tentativas: ' + falhas.join(' ; ')); e2.response = ultimoErro.response; e2.cotaDia = _iaMotivoCotaDia(); e2.transitorio = transitorio; throw e2; } catch (e3) { if (e3.message && /tentativas:/.test(e3.message)) throw e3; } }
+  if (ultimoErro) { try { ultimoErro.cotaDia = _iaMotivoCotaDia(); ultimoErro.transitorio = transitorio; } catch (_) {} }
   throw ultimoErro || new Error('sem modelo');
 }
 // Marcador de mídia copiado dos exemplos ("[image] [Imagem]", "[document] …"): não é texto
@@ -10111,7 +10184,7 @@ app.get('/ia/status', async (req, res) => {
   try {
     const m = await _iaMemoria(req.owner);
     const nov = await _iaNovidades(req.owner);
-    res.json({ ligada: await _iaSugLigada(req.owner), chave: _iaTemChave(), provedores: _iaProvedores(req.owner).map(p => p.nome), model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0],
+    res.json({ ligada: await _iaSugLigada(req.owner), chave: _iaTemChave(), provedores: _iaProvedores(req.owner).map(p => p.nome), model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0], cota: _iaCotaResumo(),
       memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length, novidades: nov.length },
       placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) }, bancos: _iaBancosAtuais(req.owner), fones_ignorados: String(_cfg('ia_fones_teste', req.owner) || '') });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -10213,6 +10286,16 @@ app.put('/ia/memoria', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // POST /ia/sugerir { phone, forcar? } — devolve a sugestão; NUNCA envia
+// resposta de erro da sugestão: com a cota do dia do Gemini esgotada (e nenhum outro provedor
+// conseguindo), é DEFINITIVA — a tela mostra o motivo e para de pedir a cada 20 s
+function _iaRespostaErro(e) {
+  const motivo = (e.message && /tentativas:/.test(e.message)) ? e.message : ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message);
+  const cota = e.cotaDia || _iaMotivoCotaDia();
+  // definitiva só quando NADA mais vale a pena tentar agora; se outro provedor falhou de passagem
+  // (Groq no limite por minuto, 503), a tela ainda tenta de novo em 20 s
+  if (cota) return { mensagens: [], motivo: cota + (e.transitorio ? ' O outro provedor está no limite por minuto.' : ''), detalhe: String(motivo || '').slice(0, 400), definitivo: !e.transitorio, cota_dia: true, cota: _iaCotaResumo() };
+  return { mensagens: [], motivo };
+}
 app.post('/ia/sugerir', async (req, res) => {
   if (!_soContaIA(req, res)) return;
   if (!_exigeLogin(req, res)) return;
@@ -10222,7 +10305,7 @@ app.post('/ia/sugerir', async (req, res) => {
   if (!phone) return res.status(400).json({ error: 'phone' });
   if (!(await _iaSugLigada(req.owner))) return res.json({ mensagens: [], motivo: 'desligada' });
   try { res.json(await _iaSugere(req.owner, phone, !!(req.body && req.body.forcar))); }
-  catch (e) { res.json({ mensagens: [], motivo: (e.message && /tentativas:/.test(e.message)) ? e.message : ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) }); }
+  catch (e) { res.json(_iaRespostaErro(e)); }
 });
 // 🎓 TREINO (IA ▸ Treinar): conversa de mentira com "Cliente 1/2/3". Ela escreve como o cliente, a IA
 // responde como responderia de verdade, ela corrige e diz o porquê — o par vira exemplo ENSINADO
@@ -10236,7 +10319,7 @@ app.post('/ia/treino/sugerir', async (req, res) => {
   if (!conversa.length) return res.status(400).json({ error: 'conversa' });
   const cli = String(b.cliente || 'c1').replace(/[^a-z0-9]/gi, '').slice(0, 10) || 'c1';
   try { res.json(await _iaSugere(req.owner, 'treino-' + cli, true, { conversa, nome: String(b.nome || ('Cliente ' + cli.replace(/^c/, ''))), notas: b.notas })); }
-  catch (e) { res.json({ mensagens: [], motivo: (e.message && /tentativas:/.test(e.message)) ? e.message : ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) }); }
+  catch (e) { res.json(_iaRespostaErro(e)); }
 });
 app.post('/ia/treino/ensinar', async (req, res) => {
   if (!_soContaIA(req, res)) return;
@@ -14147,4 +14230,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
