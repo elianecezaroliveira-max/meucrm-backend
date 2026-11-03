@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 411;
+const SERVER_VER = 412;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6207,7 +6207,7 @@ app.post("/send-template", async (req, res) => {
   const _falhou = () => { if (_ant) _tmplEnvios.set(_tk, _ant); else _tmplEnvios.delete(_tk); };
   const [_proprio, _acc] = await Promise.all([
     _isSelfSend(to, account_id),
-    supabase.from("accounts").select("phone_number_id, token").eq("id", account_id).eq("owner", req.owner || ' ').single(),
+    supabase.from("accounts").select("id, name, phone_number_id, token, waba_id").eq("id", account_id).eq("owner", req.owner || ' ').single(),
   ]);
   if (_proprio) { _falhou(); return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta.' }); }
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
@@ -6219,13 +6219,41 @@ app.post("/send-template", async (req, res) => {
       template: { name: template_name, language: { code: language_code || "pt_BR" } },
     };
     if (components && components.length > 0) templateMsg.template.components = components;
-    const response = await axios.post(
+    // 📐 (v412) ENVIO À MÃO sem as variáveis (print do Marcio, 27/10, conta 101: a tela não conhecia o corpo
+    // do modelo porque o número está em OUTRO WABA na Meta — mandou 0 variáveis e a Meta recusou com 132000).
+    // Agora: sem variáveis na chamada, o servidor busca o corpo (inclusive nos outros WABAs dela) e preenche
+    // {{1}} = nome do lead; e se a Meta ainda responder 132000 "expected number of params (M)", refaz na hora
+    // com M variáveis — igual ao bot. Em paralelo confere/corrige o WABA da conta no cadastro.
+    const _lang = language_code || 'pt_BR';
+    let _corpo = null, _vars = null;
+    const _nomeLead = async () => { try { const { data: c } = await supabase.from('contacts').select('name').eq('phone', to).eq('owner', req.owner || ' ').maybeSingle(); return (c && c.name) || to; } catch (_) { return to; } };
+    const _montaVars = async (n) => { const v = []; const nome = await _nomeLead(); for (let i = 0; i < n; i++) v.push(i === 0 ? nome : ' '); return v; };
+    const _poeVars = (v) => { templateMsg.template.components = [{ type: 'body', parameters: v.map(x => ({ type: 'text', text: x })) }]; };
+    const _semVars = !(components && components.length > 0 && components.some(c => c && c.parameters && c.parameters.length));
+    if (_semVars) {
+      try { _corpo = await getTemplateBodyText(account.token, account.waba_id, template_name, _lang, req.owner, account); } catch (_) {}
+      const n = _corpo ? new Set(_corpo.match(/\{\{\d+\}\}/g) || []).size : 0;
+      if (n) { _vars = await _montaVars(n); _poeVars(_vars); }
+    }
+    const _posta = () => axios.post(
       `https://graph.facebook.com/v23.0/${account.phone_number_id}/messages`,
       templateMsg,
       { headers: { Authorization: `Bearer ${account.token}`, "Content-Type": "application/json" } }
     );
+    let response;
+    try { response = await _posta(); }
+    catch (e1) {
+      const det = String(e1.response?.data?.error?.error_data?.details || e1.response?.data?.error?.message || '');
+      const m = e1.response?.data?.error?.code === 132000 ? /expected number of params \((\d+)\)/i.exec(det) : null;
+      if (!m) throw e1;
+      _vars = await _montaVars(parseInt(m[1], 10) || 0); _poeVars(_vars);
+      console.warn('Modelo ' + template_name + ' (conta "' + (account.name || account_id) + '"): a Meta pediu ' + m[1] + ' variável(is) — refeito na hora');
+      if (!_corpo) { try { _corpo = await getTemplateBodyText(account.token, account.waba_id, template_name, _lang, req.owner, account); } catch (_) {} }
+      setTimeout(() => { _wabaConferir(account).then(r => { if (r && r.mudou) console.warn('Conta "' + (account.name || account_id) + '": WABA corrigido de ' + r.antes + ' para ' + r.agora); }).catch(() => {}); }, 10);
+      response = await _posta();
+    }
     const safeAccountId = account_id || null;
-    const shownText = (body_text && String(body_text).trim()) ? String(body_text).trim() : `[Template: ${template_name}]`;
+    const shownText = (body_text && String(body_text).trim()) ? String(body_text).trim() : (_corpo ? renderTemplateBody(_corpo, _vars || []) : `[Template: ${template_name}]`);
     const preview = shownText.length > 80 ? shownText.substring(0, 80) + '…' : shownText;
     _reg.emVoo = false; _reg.quando = Date.now(); // saiu para a Meta: daqui em diante conta a janela
     const tplWamid = response.data?.messages?.[0]?.id || null;
