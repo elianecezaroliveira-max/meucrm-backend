@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 412;
+const SERVER_VER = 413;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6463,6 +6463,7 @@ app.post('/pipeline/stages/recover', async (req, res) => {
 });
 
 // Listar contatos (com stage_id, unread_count e prévia)
+const CONTATOS_PAGINA = 1000, CONTATOS_TETO = Math.max(1000, Number(process.env.CONTATOS_TETO) || 5000);
 app.get("/contacts", async (req, res) => {
   if (!supabase) return res.json([]);
   const { account_id, with_messages } = req.query;
@@ -6470,21 +6471,37 @@ app.get("/contacts", async (req, res) => {
   // seleção sem ela (não quebra o carregamento dos leads/conversas)
   _subscribeRecentPresence(req.owner); // presença dos recentes (não bloqueia a resposta)
   const COLS_BASE = "phone, name, account_id, stage_id, tags, unread_count, first_unread_at, last_message_at, last_message_preview, last_message_direction, favorite, avatar";
-  const build = (cols, soFones) => {
+  const build = (cols, soFones, pagina) => {
     let q = supabase.from("contacts").select(cols).eq("owner", req.owner || ' ').order("last_message_at", { ascending: false });
     if (account_id) q = q.eq("account_id", account_id);
     if (with_messages) q = q.not("last_message_preview", "is", null);
     if (soFones) q = q.in("phone", soFones); // releitura incremental: só quem mudou
+    else q = q.range(pagina * CONTATOS_PAGINA, pagina * CONTATOS_PAGINA + CONTATOS_PAGINA - 1); // (v413) página por página
     return q;
   };
   const chave = 'contacts|' + (req.owner || ' ') + '|' + (account_id || '') + '|' + (with_messages ? 1 : 0);
+  // 📄 (v413) O Supabase devolve NO MÁXIMO 1000 linhas por pedido. Ela tem 1938 leads: os 938 mais antigos
+  // não vinham — não apareciam no funil nem na busca por nome/número ("Sueli 5547984475771", 04/11).
+  // Agora lê página a página (1000 por vez) até o fim ou até CONTATOS_TETO (padrão 5000). A releitura
+  // incremental (só quem mudou) continua igual.
   const buscaTudo = async (extra) => {
-    let { data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted, archived, blocked", extra);
-    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned, muted", extra)); } // fallback sem archived/blocked
-    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status, pinned", extra)); } // fallback sem muted
-    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at, last_message_status", extra)); } // fallback sem pinned
-    if (error) { ({ data, error } = await build(COLS_BASE + ", created_at", extra)); } // fallback sem last_message_status
-    if (error) { ({ data, error } = await build(COLS_BASE, extra)); } // fallback sem created_at
+    const tenta = async (cols) => {
+      if (extra) return build(cols, extra, 0);
+      const tudo = []; const maxPag = Math.ceil(CONTATOS_TETO / CONTATOS_PAGINA);
+      for (let p = 0; p < maxPag; p++) {
+        const r = await build(cols, null, p);
+        if (r.error) return r;
+        tudo.push(...(r.data || []));
+        if (!r.data || r.data.length < CONTATOS_PAGINA) break;
+      }
+      return { data: tudo, error: null };
+    };
+    let { data, error } = await tenta(COLS_BASE + ", created_at, last_message_status, pinned, muted, archived, blocked");
+    if (error) { ({ data, error } = await tenta(COLS_BASE + ", created_at, last_message_status, pinned, muted")); } // fallback sem archived/blocked
+    if (error) { ({ data, error } = await tenta(COLS_BASE + ", created_at, last_message_status, pinned")); } // fallback sem muted
+    if (error) { ({ data, error } = await tenta(COLS_BASE + ", created_at, last_message_status")); } // fallback sem pinned
+    if (error) { ({ data, error } = await tenta(COLS_BASE + ", created_at")); } // fallback sem last_message_status
+    if (error) { ({ data, error } = await tenta(COLS_BASE)); } // fallback sem created_at
     if (error) throw new Error(error.message);
     return data || [];
   };
