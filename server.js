@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 413;
+const SERVER_VER = 414;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -7543,8 +7543,9 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, 
   if (await _estaBloqueado(phone, owner)) { await _recordBotFail(phone, text || '[Imagem]', 'Contato bloqueado — o bot não envia para ele.', nodeAccountId || accountId || null, owner, 'text'); return null; }
   if (nodeAccountId) {
     // Nó com número CONFIGURADO: obedece exatamente — sem troca automática
-    acct = await botGetAcctStrict(nodeAccountId);
+    acct = await botGetAcctStrict(nodeAccountId, owner);
     usedAcctId = nodeAccountId;
+    if (acct && acct.outraConta) { await _recordBotFail(phone, text || '[Imagem]', _msgOutraConta(acct.name), usedAcctId, owner, 'text'); return null; }
     if (!acct) {
       await _recordBotFail(phone, text, 'O número configurado neste passo do bot não existe mais. Edite o nó "Enviar mensagem" e escolha outro número.', usedAcctId, owner, 'text');
       return null;
@@ -7617,15 +7618,26 @@ async function sendBotMsg(phone, accountId, text, owner, nodeAccountId, imgUrl, 
 
 // ESTRITO: devolve EXATAMENTE a conta pedida (ou null) — sem nenhum fallback.
 // Usado quando o nó do bot tem um número configurado: ou envia por ele, ou falha.
-async function botGetAcctStrict(accountId) {
+// 🔒 (v414) O número configurado no passo do bot tem de ser DA DONA DO BOT. Em 04/11 o bot SIAPE2 dela estava
+// com o número "63" — conta de OUTRO cliente do FILAZ (o fluxo veio copiado com o id do número dele): os
+// modelos saíam pelo número dele e as respostas dos leads caíam na conta dele. Agora: número de outra conta
+// = envio BLOQUEADO com aviso (e o editor nem deixa salvar). A lista de equipe (owner_aliases) não entra aqui:
+// equipe entra na conta da dona e os números são os dela.
+const _ACCT_COLS_BOT = 'id,phone_number_id,token,waba_id,type,evolution_instance,owner,name';
+async function botGetAcctStrict(accountId, owner) {
   if (!supabase || !accountId) return null;
-  const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance').eq('id', accountId).maybeSingle();
-  return data || null;
+  const { data } = await supabase.from('accounts').select(_ACCT_COLS_BOT).eq('id', accountId).maybeSingle();
+  if (!data) return null;
+  if (owner && String(data.owner || '').toLowerCase() !== String(owner).toLowerCase()) { console.error('🔒 bot: o número "' + (data.name || accountId) + '" é de OUTRA conta (' + String(data.owner || '?').replace(/(.{3}).*(@.*)/, '$1…$2') + ') — envio bloqueado'); return { outraConta: true, name: data.name || accountId }; }
+  return data;
 }
+const _msgOutraConta = (nome) => 'Envio BLOQUEADO: o número "' + nome + '" configurado neste passo pertence a OUTRA conta do FILAZ (não é seu). Abra o bot, clique no nó "Enviar mensagem" e escolha um número seu.';
 
 async function botGetAcct(accountId, owner) {
   if (supabase && accountId) {
-    const { data } = await supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance').eq('id', accountId).maybeSingle();
+    let q0 = supabase.from('accounts').select('id,phone_number_id,token,waba_id,type,evolution_instance').eq('id', accountId);
+    if (owner !== undefined) q0 = q0.eq('owner', owner || ' '); // (v414) nunca o número de outra conta
+    const { data } = await q0.maybeSingle();
     // Conta QR Code escolhida → respeita a escolha (o bot envia pelo próprio QR,
     // sem desviar para a conta da API oficial)
     if (data && data.evolution_instance) return data;
@@ -7813,8 +7825,9 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
   if (cfg.account_id) {
     // Nó com número CONFIGURADO: obedece exatamente — ou envia por ele, ou FALHA.
     // Nunca troca de número sozinho.
-    acct = await botGetAcctStrict(cfg.account_id);
+    acct = await botGetAcctStrict(cfg.account_id, owner);
     usedAcctId = cfg.account_id;
+    if (acct && acct.outraConta) { await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, _msgOutraConta(acct.name), usedAcctId, owner, 'template'); return null; }
     if (!acct) {
       await _recordBotFail(phone, `[Modelo: ${cfg.template_name}]`, 'O número configurado neste passo do bot não existe mais. Edite o nó "Enviar mensagem" e escolha outro número.', usedAcctId, owner, 'template');
       return null;
@@ -11045,6 +11058,20 @@ app.put('/bots/:id/flow', async (req,res) => {
       vazio: true, passos_salvos: tinha
     });
   }
+  // TRAVA 1b (v414): nenhum passo pode apontar para um número que não seja desta conta
+  try {
+    const idsNos = [...new Set((nodes || []).map(n => n && n.config && n.config.account_id).filter(Boolean).map(String))];
+    if (idsNos.length) {
+      const { data: minhas } = await supabase.from('accounts').select('id').eq('owner', req.owner || ' ').in('id', idsNos);
+      const ok = new Set((minhas || []).map(a => String(a.id)));
+      const estranhos = idsNos.filter(id => !ok.has(id));
+      if (estranhos.length) {
+        const { data: deQuem } = await supabase.from('accounts').select('id, name').in('id', estranhos);
+        const nomes = (deQuem || []).map(a => '"' + (a.name || a.id) + '"');
+        return res.status(400).json({ error: 'Gravação recusada: ' + (nomes.length ? 'o número ' + nomes.join(', ') : 'um número') + ' escolhido em "Enviar pelo número" não é desta conta do FILAZ. Escolha um número seu nesse passo.', numeros_estranhos: estranhos });
+      }
+    }
+  } catch (e) { console.error('conferência dos números do fluxo:', e.message); }
   // TRAVA 2: guarda o fluxo atual antes de encostar em qualquer coisa
   if (tinha > 0) await _botSnapSalvar(req.owner, botId, nosAntes || [], ligAntes || []);
 
