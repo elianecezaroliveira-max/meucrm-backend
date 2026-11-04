@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 414;
+const SERVER_VER = 415;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -6207,7 +6207,7 @@ app.post("/send-template", async (req, res) => {
   const _falhou = () => { if (_ant) _tmplEnvios.set(_tk, _ant); else _tmplEnvios.delete(_tk); };
   const [_proprio, _acc] = await Promise.all([
     _isSelfSend(to, account_id),
-    supabase.from("accounts").select("id, name, phone_number_id, token, waba_id").eq("id", account_id).eq("owner", req.owner || ' ').single(),
+    supabase.from("accounts").select("id, name, phone_number_id, token, waba_id, owner").eq("id", account_id).eq("owner", req.owner || ' ').single(),
   ]);
   if (_proprio) { _falhou(); return res.status(400).json({ error: 'Bloqueado: o destino é o PRÓPRIO número desta conta.' }); }
   stopBotRunsForPhone(to, req.owner); // você assumiu a conversa — bot deste lead para
@@ -7708,6 +7708,34 @@ async function _wabaDescobrir(acct) {
       }
     }
   } catch (e) { console.warn('descobrir WABA da conta ' + (acct.name || acct.id) + ':', (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message); }
+  // 🔎 (v415) O token NÃO enxerga o portfólio ("A Meta não disse em qual WABA o número está" — caso do 101, 04/11).
+  // Dois outros caminhos, sem precisar de permissão nova:
+  //  B) os WABAs das OUTRAS contas da dona, com o token de cada uma: GET /{waba}/phone_numbers — qual tem o número?
+  //  A) debug_token do próprio token: a Meta lista os WABAs que ele alcança (granular_scopes) → confere cada um
+  const temONumero = async (wabaId, token) => {
+    try {
+      let url = `https://graph.facebook.com/v23.0/${wabaId}/phone_numbers`, params = { access_token: token, fields: 'id,display_phone_number', limit: 100 };
+      for (let p = 0; p < 5 && url; p++) { const r = await axios.get(url, { params, timeout: 12000 }); if (((r.data && r.data.data) || []).some(n => String(n.id) === String(acct.phone_number_id))) return true; url = (r.data && r.data.paging && r.data.paging.next) || null; params = undefined; }
+    } catch (_) {}
+    return false;
+  };
+  const vistos = new Set([String(acct.waba_id || '')]);
+  if (!waba && supabase) {
+    try {
+      let q = supabase.from('accounts').select('id, name, token, waba_id').neq('id', acct.id).not('waba_id', 'is', null).not('token', 'is', null);
+      if (acct.owner) q = q.eq('owner', acct.owner);
+      const { data: outras } = await q.limit(50);
+      for (const o of (outras || [])) { if (!o.waba_id || !o.token || vistos.has(String(o.waba_id))) continue; vistos.add(String(o.waba_id)); if (await temONumero(o.waba_id, o.token) || await temONumero(o.waba_id, acct.token)) { waba = String(o.waba_id); console.log('WABA da conta "' + (acct.name || acct.id) + '" achado pelo WABA da conta "' + o.name + '": ' + waba); break; } }
+    } catch (e) { console.warn('descobrir WABA (outras contas):', e.message); }
+  }
+  if (!waba) {
+    try {
+      const r = await axios.get('https://graph.facebook.com/v23.0/debug_token', { params: { input_token: acct.token, access_token: acct.token }, timeout: 12000 });
+      const gs = (r.data && r.data.data && r.data.data.granular_scopes) || [];
+      const ids = new Set(); gs.forEach(g => { if (/whatsapp_business/.test(String(g.scope || ''))) (g.target_ids || []).forEach(i => ids.add(String(i))); });
+      for (const id of ids) { if (vistos.has(id)) continue; vistos.add(id); if (await temONumero(id, acct.token)) { waba = id; console.log('WABA da conta "' + (acct.name || acct.id) + '" achado pelo debug_token: ' + waba); break; } }
+    } catch (e) { console.warn('descobrir WABA (debug_token):', (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message); }
+  }
   _wabaDescCache.set(acct.id, { t: Date.now(), waba });
   return waba;
 }
@@ -7722,9 +7750,10 @@ async function _wabaConferir(acct) {
 app.post('/accounts/:id/waba-conferir', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
-  const { data: a } = await supabase.from('accounts').select('id, name, phone_number_id, token, waba_id, evolution_instance').eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  const { data: a } = await supabase.from('accounts').select('id, name, phone_number_id, token, waba_id, evolution_instance, owner').eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
   if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
   if (a.evolution_instance || !a.token) return res.status(400).json({ error: 'Só contas da API oficial têm WABA.' });
+  _wabaDescCache.delete(a.id); // (v415) clique dela = conferir AGORA, não a resposta guardada de até 6 h
   _wabaDescCache.delete(a.id);
   res.json(await _wabaConferir(a));
 });
