@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 418;
+const SERVER_VER = 419;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -10431,6 +10431,20 @@ app.post('/ia/treino/sugerir', async (req, res) => {
   if (!conversa.length) return res.status(400).json({ error: 'conversa' });
   const cli = String(b.cliente || 'c1').replace(/[^a-z0-9]/gi, '').slice(0, 10) || 'c1';
   try { res.json(await _iaSugere(req.owner, 'treino-' + cli, true, { conversa, nome: String(b.nome || ('Cliente ' + cli.replace(/^c/, ''))), notas: b.notas })); }
+  catch (e) { res.json(_iaRespostaErro(e)); }
+});
+// 🖥️ FILAZ Assistente (WhatsApp instalado no Windows, número pessoal): a conversa NÃO passa pelo FILAZ —
+// o assistente lê as mensagens na tela do WhatsApp e manda aqui; a IA sugere com a mesma memória/estilo
+// (modo "conversa fornecida", igual ao treino, sem gravar nada no banco de mensagens e sem cache).
+app.post('/ia/sugerir-pc', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  if (!_iaTemChave()) return res.json({ mensagens: [], motivo: 'sem chave de IA no servidor (GEMINI_API_KEY, OPENAI_API_KEY ou GROQ_API_KEY)' });
+  const b = req.body || {};
+  const conversa = [].concat(b.conversa || []).filter(m => m && typeof m.texto === 'string' && m.texto.trim()).slice(-60).map(m => ({ quem: m.quem === 'eu' ? 'eu' : 'lead', texto: String(m.texto).trim() }));
+  if (!conversa.length) return res.status(400).json({ error: 'conversa' });
+  const nome = String(b.nome || 'Cliente').replace(/[\r\n]/g, ' ').trim().slice(0, 60) || 'Cliente';
+  try { res.json(await _iaSugere(req.owner, 'pc-' + nome.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20), true, { conversa, nome, notas: String(b.notas || '').slice(0, 400) })); }
   catch (e) { res.json(_iaRespostaErro(e)); }
 });
 app.post('/ia/treino/ensinar', async (req, res) => {
