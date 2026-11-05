@@ -646,7 +646,20 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 417;
+const SERVER_VER = 418;
+// 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
+// ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
+// e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
+// Só vale na CRIAÇÃO do contato (nome editado por ela nunca é tocado).
+function _primeiroNome(nome, fallback) {
+  const limpo = String(nome || '').replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, ' ').replace(/[^\p{L}\p{N}\s'.-]/gu, ' ').trim();
+  const partes = limpo.split(/\s+/).filter(Boolean);
+  const titulo = /^(dr|dra|sr|sra|srta|prof|profa|pr|pra|eng|adv|dom|frei|pe)\.?$/i;
+  const letras = p => (p.match(/\p{L}/gu) || []).length;
+  const esc = partes.find(p => letras(p) >= 2 && !titulo.test(p)) || partes.find(p => letras(p) >= 1 && !titulo.test(p)) || partes.find(p => letras(p) >= 1); // ("J. Carlos" → Carlos)
+  if (!esc) return fallback || '';
+  return esc.replace(/^[.'-]+|[.'-]+$/g, '') || fallback || '';
+}
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1435,7 +1448,7 @@ app.post("/webhook", async (req, res) => {
         const _maisNova = !(existing && existing.last_message_at && new Date(existing.last_message_at).getTime() > new Date(timestamp).getTime());
         if (_maisNova) Object.assign(contactData, { last_message_at: timestamp, last_message_preview: preview, last_message_direction: 'inbound' });
         else console.log('↩️ prévia mantida (mensagem recebida mais antiga que a última da conversa):', from, timestamp);
-        if (!existing) contactData.name = name; // só define o nome do WhatsApp na CRIAÇÃO; depois respeita o editado
+        if (!existing) contactData.name = _primeiroNome(name, from); // só define o nome do WhatsApp na CRIAÇÃO (só o primeiro nome, v418); depois respeita o editado
         // NÚMERO da conversa: mantém o número do ÚLTIMO ENVIO seu. Mensagem recebida
         // NÃO troca o número; só define quando o contato é novo ou ainda não tem número.
         if (accountId && (!existing || existing.account_id == null)) contactData.account_id = accountId;
@@ -14268,11 +14281,11 @@ app.post('/evolution-webhook', async (req, res) => {
         // Exceção: se o nome atual é só o número/id (nunca foi personalizado), adota o
         // nome público do WhatsApp (pushName) quando a pessoa escreve.
         if (!existC) {
-          contactData.name = !fromMe ? name : (isLid ? 'Contato (número oculto)' : phone);
+          contactData.name = !fromMe ? _primeiroNome(name, phone) : (isLid ? 'Contato (número oculto)' : phone); // (v418: só o primeiro nome)
         } else if (!fromMe && data.pushName) {
           const atual = String(existC.name || '');
           // Só adota o pushName se o nome atual nunca foi personalizado
-          if (!atual || atual === phone || atual === 'Contato (número oculto)') contactData.name = name;
+          if (!atual || atual === phone || atual === 'Contato (número oculto)') contactData.name = _primeiroNome(name, phone);
         }
         // NÚMERO da conversa: seu envio (fromMe) fixa no número usado; recebida só define se ainda não houver.
         if (accountId && (fromMe || !existC || existC.account_id == null)) contactData.account_id = accountId;
@@ -14346,4 +14359,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
