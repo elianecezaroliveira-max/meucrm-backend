@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 415;
+const SERVER_VER = 417;
 // Diagnóstico de CONTAS: diz (sem expor e-mails) se este servidor está com o
 // "login compartilhado" ligado — nesse modo TODOS que entram viram a MESMA conta
 function _contasCompartilhadas() {
@@ -1415,7 +1415,7 @@ app.post("/webhook", async (req, res) => {
       if (supabase) {
         // Já existe? (para NÃO sobrescrever o nome que o usuário editou manualmente)
         const { data: existing } = await supabase
-          .from("contacts").select("name, unread_count, first_unread_at, account_id").eq("phone", from).eq("owner", ownerEmail || ' ').maybeSingle();
+          .from("contacts").select("name, unread_count, first_unread_at, account_id, last_message_at").eq("phone", from).eq("owner", ownerEmail || ' ').maybeSingle();
 
         // Salva contato com prévia da última mensagem
         const preview = content.length > 80 ? content.substring(0, 80) + '…' : content;
@@ -1428,11 +1428,13 @@ app.post("/webhook", async (req, res) => {
             await sendPushToOwner(ownerEmail, { title: existing?.name || name || from, body: preview, phone: from, tag: 'chat-' + from }, { naoLidaMais: 1 });
           } catch (_) {}
         })();
-        const contactData = {
-          phone: from, last_message_at: timestamp,
-          last_message_preview: preview,
-          last_message_direction: 'inbound',
-        };
+        const contactData = { phone: from };
+        // 🕰️ (v416) A Meta REENTREGA webhooks (ex.: servidor reiniciando no deploy): a mensagem do lead das 13:17
+        // chegava de novo depois da sua resposta das 13:20 e a prévia da lista voltava a ser a dele ("Feito").
+        // A prévia só muda se esta mensagem é MAIS NOVA que a última guardada no contato.
+        const _maisNova = !(existing && existing.last_message_at && new Date(existing.last_message_at).getTime() > new Date(timestamp).getTime());
+        if (_maisNova) Object.assign(contactData, { last_message_at: timestamp, last_message_preview: preview, last_message_direction: 'inbound' });
+        else console.log('↩️ prévia mantida (mensagem recebida mais antiga que a última da conversa):', from, timestamp);
         if (!existing) contactData.name = name; // só define o nome do WhatsApp na CRIAÇÃO; depois respeita o editado
         // NÚMERO da conversa: mantém o número do ÚLTIMO ENVIO seu. Mensagem recebida
         // NÃO troca o número; só define quando o contato é novo ou ainda não tem número.
@@ -5339,8 +5341,11 @@ app.get('/sheets/preview', async (req, res) => {
       vistos.add(phone);
       if (!st && phone.length >= 8) semEtapa++;
       const ex = existentes.get(phone);
+      // (v417) nome de hoje no FILAZ quando a planilha traz outro (a importação ATUALIZA o nome junto com a etapa:
+      // "Sueli" virou "Suely" sem ela saber — agora a prévia mostra "hoje: Sueli → vai mudar")
+      const nomeHoje = ex && String(ex.name || '').trim() && String(ex.name || '').trim() !== String(l.name || '').trim() ? String(ex.name).trim() : '';
       return { linha: i + 2, name: l.name || '', phone, id: extId, etapa: st ? st.name : (extId ? 'ID não encontrado' : '(sem etapa)'),
-        situacao, etapa_atual: ex ? (stNome[ex.stage_id] || '') : '' };
+        situacao, etapa_atual: ex ? (stNome[ex.stage_id] || '') : '', nome_atual: nomeHoje };
     });
     res.json({ total: linhas.length, novos, ja_existem: jaExistem, invalidos, sem_etapa: semEtapa,
       atualizar_etapa: !!cfg.atualizar_etapa, itens: itens.slice(0, 500), truncado: itens.length > 500 });
@@ -14252,10 +14257,13 @@ app.post('/evolution-webhook', async (req, res) => {
         }
 
         const preview = _previaCurta(_previaMidia(type, content));
-        const contactData = { phone, last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction };
+        const contactData = { phone };
         if (ownerEmail) contactData.owner = ownerEmail;
         // Estado atual do contato (para decidir NOME e NÚMERO sem sobrescrever indevidamente)
-        const { data: existC } = await supabase.from('contacts').select('id, account_id, name').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
+        const { data: existC } = await supabase.from('contacts').select('id, account_id, name, last_message_at').eq('phone', phone).eq('owner', ownerEmail || ' ').maybeSingle();
+        // (v416) prévia só se esta mensagem é MAIS NOVA que a última guardada (reentrega atrasada não volta a prévia)
+        if (!(existC && existC.last_message_at && new Date(existC.last_message_at).getTime() > new Date(timestamp).getTime())) Object.assign(contactData, { last_message_at: timestamp, last_message_preview: preview, last_message_direction: direction });
+        else console.log('↩️ prévia mantida (mensagem mais antiga que a última da conversa):', phone, timestamp);
         // NOME: só define na CRIAÇÃO do contato — depois RESPEITA o nome editado no CRM.
         // Exceção: se o nome atual é só o número/id (nunca foi personalizado), adota o
         // nome público do WhatsApp (pushName) quando a pessoa escreve.
