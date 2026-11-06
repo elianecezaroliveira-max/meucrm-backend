@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 419;
+const SERVER_VER = 420;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -6124,6 +6124,96 @@ app.post("/templates", async (req, res) => {
     console.error("Erro ao criar template:", err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao criar template" });
   }
+});
+
+// ── (v420) Copiar modelos de OUTRA conta ──
+// Ela (06/11): o número 10 mudou de WABA e os modelos aprovados ficaram na WABA antiga — a Meta não leva
+// modelos junto. Em vez de recriar um por um: escolhe a conta de origem, marca os modelos, e o FILAZ cria
+// todos na conta de destino (mesmo nome, categoria, idioma, texto, rodapé e botões). Cabeçalho com
+// FOTO/VÍDEO/DOCUMENTO não dá para copiar (a Meta exige subir a mídia de novo) — esse fica para criar à mão.
+// O apelido do CRM (tmpl_alias) acompanha. Quem já existe no destino com o mesmo nome não é criado de novo.
+function _tmplCopiaComponentes(components) {
+  const out = []; const avisos = [];
+  for (const c of (components || [])) {
+    const tipo = String(c.type || '').toUpperCase();
+    if (tipo === 'HEADER') {
+      const fmt = String(c.format || 'TEXT').toUpperCase();
+      if (fmt !== 'TEXT') return { erro: 'cabeçalho com ' + (fmt === 'IMAGE' ? 'foto' : fmt === 'VIDEO' ? 'vídeo' : fmt === 'DOCUMENT' ? 'documento' : fmt.toLowerCase()) + ' — a Meta exige subir a mídia de novo; crie esse à mão' };
+      const h = { type: 'HEADER', format: 'TEXT', text: String(c.text || '') };
+      if (/\{\{\d+\}\}/.test(h.text)) h.example = (c.example && c.example.header_text) ? { header_text: c.example.header_text } : { header_text: ['Maria'] };
+      out.push(h);
+    } else if (tipo === 'BODY') {
+      const b = { type: 'BODY', text: String(c.text || '') };
+      const vars = [...new Set(b.text.match(/\{\{\d+\}\}/g) || [])];
+      if (vars.length) b.example = (c.example && c.example.body_text) ? { body_text: c.example.body_text } : { body_text: [vars.map((_, i) => i === 0 ? 'Maria' : 'exemplo ' + (i + 1))] };
+      out.push(b);
+    } else if (tipo === 'FOOTER') {
+      out.push({ type: 'FOOTER', text: String(c.text || '') });
+    } else if (tipo === 'BUTTONS') {
+      const bts = [];
+      for (const b of (c.buttons || [])) {
+        const bt = String(b.type || '').toUpperCase();
+        if (bt === 'QUICK_REPLY') bts.push({ type: 'QUICK_REPLY', text: String(b.text || '') });
+        else if (bt === 'URL') { const u = { type: 'URL', text: String(b.text || ''), url: String(b.url || '') }; if (/\{\{\d+\}\}/.test(u.url)) u.example = Array.isArray(b.example) ? b.example : ['exemplo']; bts.push(u); }
+        else if (bt === 'PHONE_NUMBER') bts.push({ type: 'PHONE_NUMBER', text: String(b.text || ''), phone_number: String(b.phone_number || '') });
+        else if (bt === 'COPY_CODE') bts.push({ type: 'COPY_CODE', example: Array.isArray(b.example) ? b.example[0] : (b.example || 'CODIGO') });
+        else return { erro: 'botão do tipo ' + bt + ' não dá para copiar; crie esse à mão' };
+      }
+      if (bts.length) out.push({ type: 'BUTTONS', buttons: bts });
+    }
+    // (outros tipos — CAROUSEL, LIMITED_TIME_OFFER… — ficam de fora)
+  }
+  if (!out.some(c => c.type === 'BODY')) return { erro: 'modelo sem corpo de texto' };
+  return { components: out, avisos };
+}
+app.post('/templates/copiar', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const b = req.body || {};
+  const de = String(b.de || ''), para = String(b.para || '');
+  const nomes = [].concat(b.nomes || []).map(x => String(x || '').trim()).filter(Boolean);
+  if (!de || !para || !nomes.length) return res.status(400).json({ error: 'Informe a conta de origem (de), a de destino (para) e os modelos (nomes).' });
+  if (de === para) return res.status(400).json({ error: 'A conta de origem e a de destino são a mesma.' });
+  const { data: contas } = await supabase.from('accounts').select('id, name, token, waba_id').in('id', [de, para]).eq('owner', req.owner || ' ');
+  const origem = (contas || []).find(c => String(c.id) === de), destino = (contas || []).find(c => String(c.id) === para);
+  if (!origem || !destino) return res.status(404).json({ error: 'Conta não encontrada' });
+  if (!origem.waba_id || !destino.waba_id || !origem.token || !destino.token) return res.status(400).json({ error: 'As duas contas precisam ser da API oficial, com WABA e token.' });
+  const lista = async (acct) => {
+    let url = `https://graph.facebook.com/v23.0/${acct.waba_id}/message_templates`, params = { access_token: acct.token, fields: 'id,name,status,category,language,components', limit: 100 }, out = [];
+    for (let p = 0; p < 10 && url; p++) { const r = await axios.get(url, { params, timeout: 20000 }); out = out.concat((r.data && r.data.data) || []); url = (r.data && r.data.paging && r.data.paging.next) || null; params = undefined; }
+    return out;
+  };
+  let deOrigem, noDestino;
+  try { deOrigem = await lista(origem); } catch (e) { return res.status(500).json({ error: 'Não consegui ler os modelos da conta de origem: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) }); }
+  try { noDestino = await lista(destino); } catch (e) { return res.status(500).json({ error: 'Não consegui ler os modelos da conta de destino: ' + ((e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message) }); }
+  const jaTem = new Set(noDestino.map(t => String(t.name || '').toLowerCase() + '|' + String(t.language || '').toLowerCase()));
+  const K = 'tmpl_alias::' + (req.owner || ' ');
+  let alias = {}; try { alias = JSON.parse(_cfg('tmpl_alias', req.owner) || '{}') || {}; } catch (_) { alias = {}; }
+  let aliasMudou = false;
+  const resultados = [];
+  for (const nome of nomes) {
+    const t = deOrigem.find(x => String(x.name || '') === nome) || deOrigem.find(x => String(x.name || '').toLowerCase() === nome.toLowerCase());
+    if (!t) { resultados.push({ nome, ok: false, erro: 'não achei esse modelo na conta de origem' }); continue; }
+    if (jaTem.has(String(t.name).toLowerCase() + '|' + String(t.language || '').toLowerCase())) { resultados.push({ nome, ok: false, jaExiste: true, erro: 'já existe na conta de destino' }); continue; }
+    const comp = _tmplCopiaComponentes(t.components);
+    if (comp.erro) { resultados.push({ nome, ok: false, erro: comp.erro }); continue; }
+    try {
+      const r = await axios.post(`https://graph.facebook.com/v23.0/${destino.waba_id}/message_templates`,
+        { name: t.name, category: t.category || 'UTILITY', language: t.language || 'pt_BR', components: comp.components },
+        { headers: { Authorization: `Bearer ${destino.token}`, 'Content-Type': 'application/json' }, timeout: 30000 });
+      const novoId = r.data && r.data.id ? String(r.data.id) : null;
+      if (novoId && alias[String(t.id)] && !alias[novoId]) { alias[novoId] = alias[String(t.id)]; aliasMudou = true; }
+      jaTem.add(String(t.name).toLowerCase() + '|' + String(t.language || '').toLowerCase());
+      resultados.push({ nome, ok: true, id: novoId, status: (r.data && r.data.status) || 'PENDING', apelido: alias[String(t.id)] || null });
+      console.log('Modelo copiado ' + (origem.name || de) + ' → ' + (destino.name || para) + ': ' + t.name);
+    } catch (e) {
+      const me = e.response && e.response.data && e.response.data.error;
+      resultados.push({ nome, ok: false, erro: (me && (me.error_user_msg || me.message)) || e.message });
+    }
+  }
+  if (aliasMudou) { try { const txt = JSON.stringify(alias); await supabase.from('settings').upsert({ key: K, value: txt, updated_at: new Date().toISOString() }); _settings[K] = txt; } catch (_) {} }
+  _audita(req, 'Modelos copiados', (origem.name || de) + ' → ' + (destino.name || para) + ': ' + resultados.filter(r => r.ok).length + '/' + nomes.length);
+  res.json({ de: origem.name || de, para: destino.name || para, copiados: resultados.filter(r => r.ok).length, resultados });
 });
 
 // ── Deletar template ──
