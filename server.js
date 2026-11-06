@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 420;
+const SERVER_VER = 422;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -2304,8 +2304,57 @@ app.post('/accounts/:id/ativar', async (req, res) => {
     else if (cod === 133010) dica = 'O número ainda NÃO foi verificado na Meta. Conclua a verificação por SMS/ligação no Gerenciador antes de ativar.';
     else if (cod === 133006) dica = 'O número precisa ser verificado novamente na Meta (SMS ou ligação) antes do registro.';
     else if (cod === 100) dica = 'A Meta recusou o registro: ' + dica + ' — confira se o token tem permissão sobre este número.';
-    res.status(400).json({ error: dica, codigo: cod || null });
+    // (v422) a verificação por SMS/ligação dá para fazer pelo próprio FILAZ: a tela oferece
+    res.status(400).json({ error: dica, codigo: cod || null, precisa_verificar: (cod === 133006 || cod === 133010) });
   }
+});
+// 📲 (v422) VERIFICAR O NÚMERO DE NOVO pelo FILAZ. Ela (06/11): o Kommo, ao ser desconectado, desregistrou o
+// 71 e o 10 na API; "Ativar na Meta" voltou "precisa ser verificado novamente (SMS ou ligação)". Em vez de ir
+// ao Gerenciador da Meta: pede o código (SMS ou ligação) → ela digita → confere → registra o número.
+async function _contaApi(req, res) {
+  if (!supabase) { res.status(500).json({ error: 'Supabase não configurado' }); return null; }
+  const { data: a } = await supabase.from('accounts').select('id, name, phone_number_id, token, waba_id, evolution_instance')
+    .eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!a) { res.status(404).json({ error: 'Conta não encontrada' }); return null; }
+  if (a.evolution_instance) { res.status(400).json({ error: 'Conta QR Code não passa pela Meta.' }); return null; }
+  if (!a.phone_number_id || !a.token) { res.status(400).json({ error: 'Faltam Phone Number ID/Token nesta conta.' }); return null; }
+  return a;
+}
+const _metaErro = e => { const err = (e.response && e.response.data && e.response.data.error) || {}; return (err.error_user_msg || err.message || e.message) + (err.code ? ' (código ' + err.code + ')' : ''); };
+app.post('/accounts/:id/pedir-codigo', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const a = await _contaApi(req, res); if (!a) return;
+  const metodo = String(req.body?.metodo || 'SMS').toUpperCase() === 'VOICE' ? 'VOICE' : 'SMS';
+  try {
+    await axios.post(`https://graph.facebook.com/v23.0/${a.phone_number_id}/request_code`, { code_method: metodo, language: 'pt_BR' },
+      { headers: { Authorization: `Bearer ${a.token}`, 'Content-Type': 'application/json' }, timeout: 15000 });
+    _audita(req, 'Código de verificação pedido', (a.name || a.id) + ' por ' + metodo);
+    res.json({ success: true, metodo });
+  } catch (e) { res.status(400).json({ error: 'A Meta não mandou o código: ' + _metaErro(e) }); }
+});
+app.post('/accounts/:id/verificar-codigo', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const a = await _contaApi(req, res); if (!a) return;
+  const code = String(req.body?.code || '').replace(/\D/g, '');
+  if (code.length < 4) return res.status(400).json({ error: 'Digite o código recebido (6 dígitos).' });
+  try {
+    await axios.post(`https://graph.facebook.com/v23.0/${a.phone_number_id}/verify_code`, { code },
+      { headers: { Authorization: `Bearer ${a.token}`, 'Content-Type': 'application/json' }, timeout: 15000 });
+  } catch (e) { return res.status(400).json({ error: 'A Meta não aceitou o código: ' + _metaErro(e) }); }
+  // verificado → registra na Cloud API (o mesmo que o "Ativar na Meta" faz) e reinscreve a WABA no webhook
+  const pin = String(req.body?.pin || process.env.WHATSAPP_PIN || '123456').replace(/\D/g, '');
+  let registrado = false, erroReg = '';
+  try {
+    await axios.post(`https://graph.facebook.com/v23.0/${a.phone_number_id}/register`, { messaging_product: 'whatsapp', pin },
+      { headers: { Authorization: `Bearer ${a.token}`, 'Content-Type': 'application/json' }, timeout: 15000 });
+    registrado = true;
+    if (a.waba_id) { try { await axios.post(`https://graph.facebook.com/v23.0/${a.waba_id}/subscribed_apps`, {}, { params: { access_token: a.token } }); } catch (_) {} }
+  } catch (e) { erroReg = _metaErro(e); }
+  delete _acctStatusCache[a.id];
+  let st = null;
+  try { const r = await axios.get(`https://graph.facebook.com/v23.0/${a.phone_number_id}`, { params: { access_token: a.token, fields: 'status' }, timeout: 8000 }); st = String(r.data?.status || '').toUpperCase() || null; } catch (_) {}
+  _audita(req, 'Número verificado na Meta', (a.name || a.id) + (registrado ? ' e registrado' : ' (registro falhou: ' + erroReg + ')'));
+  res.json({ success: true, verificado: true, registrado, status: st, erro_registro: erroReg || null });
 });
 
 // ── Renomear conta (API oficial ou QR Code) ──
@@ -10094,6 +10143,41 @@ function _iaBancoDaConversa(msgs) {
   }
   return achados;
 }
+// 🪪 (v421) CONVÊNIO do lead (SIAPE × INSS) e FICHAS DE FORMALIZAÇÃO por banco × convênio.
+// Ela (06/11): "As sugestões da IA tem que ser de acordo com o banco portado e se é SIAPE ou INSS, pois a
+// formalização muda (autorização no Sou Gov)". O convênio sai da etiqueta, do nome do lead ("Kedley SIAPE"),
+// das notas ou da conversa; a ficha (IA ▸ Formalização) diz como formaliza naquele banco e convênio.
+const _IA_SIAPE_RE = /\b(siape|sou\s*gov|sougov|servidor(a)?\s+(p[úu]blic[oa]\s+)?federal|servidor(a)?\s+do\s+siape)\b/i;
+const _IA_INSS_RE = /\b(inss|meu\s*inss|aposentad[oa]|pensionista|benef[ií]cio\s+do\s+inss|n[úu]mero\s+do\s+benef[ií]cio|\bnb\b)\b/i;
+function _iaConvenio(lead, msgs) {
+  const fontes = [];
+  const tags = (lead && Array.isArray(lead.tags)) ? lead.tags.join(' ') : '';
+  const nome = String((lead && lead.name) || ''), notas = String((lead && lead.notes) || '');
+  const conv = (msgs || []).map(m => String(m.type || 'text') === 'audio' ? String(m.transcript || '') : String(m.content || '')).join('\n');
+  const testa = (txt, origem) => { if (!txt) return null; if (_IA_SIAPE_RE.test(txt)) { fontes.push(origem); return 'SIAPE'; } if (_IA_INSS_RE.test(txt)) { fontes.push(origem); return 'INSS'; } return null; };
+  // etiqueta e nome do lead valem mais que a conversa (ela cadastra "Fulano SIAPE")
+  const r = testa(tags, 'etiqueta') || testa(nome, 'nome do lead') || testa(notas, 'notas') || testa(conv, 'conversa');
+  return { convenio: r || '', fonte: fontes[0] || '' };
+}
+function _iaFichas(owner) {
+  try { const v = JSON.parse(_cfg('ia_fichas', owner) || '[]'); return Array.isArray(v) ? v.filter(f => f && String(f.como || '').trim()).map(f => ({ banco: String(f.banco || '').trim(), convenio: String(f.convenio || 'TODOS').trim().toUpperCase(), como: String(f.como || '').trim().slice(0, 1200) })) : []; }
+  catch (_) { return []; }
+}
+const _iaMesmoBanco = (a, b) => { const n = x => String(x || '').toLowerCase().replace(/\bbanco\b/g, '').replace(/[^a-z0-9]/g, ''); return !!(n(a) && n(b) && (n(a) === n(b) || n(a).includes(n(b)) || n(b).includes(n(a)))); };
+function _iaFormalizacaoTxt(owner, lead, msgs, bancoDaConversa) {
+  const { convenio, fonte } = _iaConvenio(lead, msgs);
+  const fichas = _iaFichas(owner);
+  const banco = bancoDaConversa || '';
+  let txt = '### CONVÊNIO E FORMALIZAÇÃO DESTE CASO (regra fixa)\n';
+  txt += convenio ? '- Convênio: ' + convenio + ' (visto em: ' + fonte + ').\n' : '- Convênio: NÃO identificado (não é SIAPE nem INSS pelo que se vê). Não descreva passos de formalização de um convênio específico; se a conversa chegou nessa fase, pergunte se é SIAPE ou INSS.\n';
+  txt += '- A formalização MUDA conforme o banco e o convênio (ex.: no SIAPE a autorização é no Sou Gov; no INSS é outro caminho). NUNCA use o passo de um convênio no outro, nem o passo de um banco em outro.\n';
+  let usadas = fichas.filter(f => (f.convenio === 'TODOS' || !convenio || f.convenio === convenio) && (!banco || !f.banco || _iaMesmoBanco(f.banco, banco)));
+  if (banco && usadas.some(f => f.banco)) usadas = usadas.filter(f => !f.banco || _iaMesmoBanco(f.banco, banco));
+  if (!convenio) usadas = []; // sem saber o convênio, nenhuma ficha entra (a IA pergunta, em vez de chutar o caminho)
+  if (usadas.length) txt += '- Como formaliza (fichas que ELA escreveu — siga à risca; quando o cliente perguntar como fazer, explique por aqui):\n' + usadas.map(f => '  • ' + (f.banco || 'qualquer banco') + ' · ' + (f.convenio === 'TODOS' ? 'SIAPE e INSS' : f.convenio) + ': ' + f.como.replace(/\s*\n\s*/g, ' / ')).join('\n') + '\n';
+  else if (fichas.length) txt += '- Não há ficha de formalização para ' + (banco || 'este banco') + (convenio ? ' no ' + convenio : '') + ': não invente passos; use só o que os exemplos e a conversa mostram.\n';
+  return { txt: txt + '\n', convenio, fonte, fichas: usadas.length };
+}
 // Monta e pede a sugestão. Devolve { mensagens, itens, model } — nunca envia nada.
 // 🎓 opts.conversa: TREINO — conversa de mentira (IA ▸ Treinar); não lê o banco, não usa cache, não é "número de teste"
 async function _iaSugere(owner, phone, forcar, opts) {
@@ -10174,6 +10258,9 @@ async function _iaSugere(owner, phone, forcar, opts) {
         + '\n';
     }
   } catch (_) {}
+  // 🪪 (v421) convênio (SIAPE/INSS) + ficha de formalização do banco desta conversa
+  let formTxt = '', formInfo = { convenio: '', fonte: '', fichas: 0 };
+  try { const naConv2 = _iaBancoDaConversa(todas); formInfo = _iaFormalizacaoTxt(owner, lead, todas, naConv2.length ? naConv2[naConv2.length - 1].banco : ''); formTxt = formInfo.txt; } catch (_) {}
   const nome = String((lead && lead.name) || '').trim();
   const primeiro = nome.split(/\s+/)[0] || '';
   // ⚡ respostas rápidas e 🤖 bots dela: a IA sugere USAR o que já existe em vez de reescrever o bloco padrão
@@ -10208,6 +10295,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
     + (novidades.length ? '### NOVIDADES RECENTES (o que mudou nos últimos dias, com data — quando bater de frente com o manual, vale a novidade)\n' + novidades.slice(-15).map(n => '[' + String(n.em || '').split('-').reverse().slice(0, 2).join('/') + '] ' + n.texto).join('\n') + '\n\n' : '')
     + bancosTxt
+    + formTxt
     + '### REGRAS DE SAÍDA\n'
     + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
     + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."],"porque":"..."}: "assunto" em 2–5 palavras; as mensagens VÊM ANTES do porquê; "porque" em 1 ou 2 frases curtas (no máximo 300 caracteres), em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
@@ -10246,7 +10334,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n(linhas "Eu: ⏳ depois: …" são passos que ela manda HORAS depois, não na resposta de agora)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
     + (exEstiloTxt ? '### EXEMPLOS SÓ DE ESTILO (assunto DIFERENTE do atual — copie o jeito de escrever, nunca o conteúdo)\n' + exEstiloTxt + '\n\n' : '')
     + (corrTxt ? '### CORREÇÕES DELA (aprenda com o erro: não repita o que ela trocou)\n' + corrTxt + '\n\n' : '')
-    + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
+    + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nConvênio: ' + (formInfo.convenio || '(não identificado)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
     + tempoTxt
     + (resumoAntigo ? '\n\n### RESUMO DA PARTE ANTIGA DA CONVERSA (' + antigas.length + ' mensagens, de ' + _iaDataHora(antigas[0].timestamp) + ' a ' + _iaDataHora(antigas[antigas.length - 1].timestamp) + ')\n' + resumoAntigo : '')
     + '\n\n### ' + (resumoAntigo ? 'ÚLTIMAS ' + msgs.length + ' MENSAGENS, por inteiro' : 'CONVERSA INTEIRA, do começo') + ' (mais antigas primeiro; [dd/mm hh:mm] é quando cada mensagem foi enviada)\n' + _iaConversaComDatas(msgs, msgs.length)
@@ -10312,6 +10400,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     exemplos: exemplos.slice(0, 4).map(_ex), so_estilo: exEstilo.length, correcoes: correcoes.slice(0, 2).map(_ex),
     novidades: novidades.slice(-3).map(n => String(n.texto || '').slice(0, 140)),
     momentos: itensSemRep.filter(it => it.tipo !== 'texto').map(it => ({ tipo: it.tipo, nome: it.tipo === 'rapida' ? '/' + it.atalho : it.nome, momento: it.tipo === 'rapida' ? _momento(String(quando.rapidas[it.atalho] || '').trim(), usos.rapidas[it.atalho]) : _momento(String(quando.bots[it.id] || '').trim(), usos.bots[it.id]) })),
+    convenio: formInfo.convenio || '', convenio_fonte: formInfo.fonte || '', fichas_usadas: formInfo.fichas || 0,
     fase: { etapa: etapa || '', dias_uteis_desde_minha: _ultMinha ? _iaDiasUteis(_ultMinha.timestamp) : null, dias_uteis_desde_inicio: _pri ? _iaDiasUteis(_pri.timestamp) : null, resumo_antigo: !!resumoAntigo, mensagens_lidas: msgs.length + antigas.length },
     modelo: model, tempo_ms: Date.now() - _t0,
   };
@@ -10388,7 +10477,7 @@ app.get('/ia/status', async (req, res) => {
     const nov = await _iaNovidades(req.owner);
     res.json({ ligada: await _iaSugLigada(req.owner), chave: _iaTemChave(), provedores: _iaProvedores(req.owner).map(p => p.nome), model: _cfg('ia_sug_model', req.owner) || IA_SUG_MODELOS[0], cota: _iaCotaResumo(),
       memoria: { estilo: !!m.estilo, fluxo: !!m.fluxo, exemplos: m.exemplos.length, aprendidos: m.exemplos.filter(e => e.origem).length, novidades: nov.length },
-      placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) }, bancos: _iaBancosAtuais(req.owner), fones_ignorados: String(_cfg('ia_fones_teste', req.owner) || '') });
+      placar: { dias7: _iaPlacar(m.exemplos, 7), dias30: _iaPlacar(m.exemplos, 30) }, bancos: _iaBancosAtuais(req.owner), fichas: _iaFichas(req.owner), fones_ignorados: String(_cfg('ia_fones_teste', req.owner) || '') });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // 🎯 Momentos: quando cada rápida/bot pode ser sugerido pela IA
@@ -11576,7 +11665,8 @@ const CHAVES_POR_CONTA = new Set([
   'bots_fav',    // bots favoritos: sobem para o topo na hora de escolher
   'bots_fav_tarefas', // bots favoritos da tela de TAREFAS (separados dos do chat)
   'ia_sug_on', 'ia_sug_model', // sugestões de resposta por IA (cartão acima do campo)
-  'ia_bancos', 'ia_fones_teste' // IA: bancos para onde ela porta hoje; números de teste
+  'ia_bancos', 'ia_fones_teste', // IA: bancos para onde ela porta hoje; números de teste
+  'ia_fichas', // (v421) IA: fichas de formalização por banco × convênio (SIAPE/INSS)
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
