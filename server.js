@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 427;
+const SERVER_VER = 428;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -12822,7 +12822,7 @@ app.get('/admin/wabas', async (req, res) => {
   const saida = [];
   for (const a of (contas || [])) {
     if (a.evolution_instance || !a.token || !a.phone_number_id) continue;
-    const item = { conta: a.name || a.id, dono: a.owner, numero: a.phone_display || '', waba_guardada: a.waba_id || null, waba_antiga: _settings['waba_antigo::' + a.id] || null, situacao: '' };
+    const item = { id: a.id, conta: a.name || a.id, dono: a.owner, numero: a.phone_display || '', waba_guardada: a.waba_id || null, waba_antiga: _settings['waba_antigo::' + a.id] || null, situacao: '' };
     if (!a.waba_id) { item.situacao = 'sem WABA no cadastro'; saida.push(item); continue; }
     try {
       let url = `https://graph.facebook.com/v23.0/${a.waba_id}/phone_numbers`, params = { access_token: a.token, fields: 'id,display_phone_number', limit: 100 }, achou = false, lidos = 0;
@@ -12846,9 +12846,15 @@ app.get('/admin/wabas', async (req, res) => {
 app.post('/admin/transferir-conta', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode transferir contas.' });
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
-  const id = String(req.body?.account_id || '').trim(), para = String(req.body?.para || '').trim().toLowerCase();
+  let id = String(req.body?.account_id || '').trim(); const para = String(req.body?.para || '').trim().toLowerCase();
   const simular = String(req.query.simular || req.body?.simular || '') === '1';
-  if (!id || !para || !para.includes('@')) return res.status(400).json({ error: 'Informe account_id e para (e-mail do login de destino).' });
+  // (v428) também aceita {conta:'35', de:'email@...'} (nome + dono), que é o que o relatório /admin/wabas mostra
+  if (!id && req.body?.conta && req.body?.de) {
+    const { data: ach } = await supabase.from('accounts').select('id').eq('name', String(req.body.conta).trim()).eq('owner', String(req.body.de).trim().toLowerCase()).limit(2);
+    if ((ach || []).length !== 1) return res.status(404).json({ error: (ach || []).length ? 'Há mais de uma conta com esse nome nesse login — informe account_id.' : 'Conta não encontrada nesse login' });
+    id = ach[0].id;
+  }
+  if (!id || !para || !para.includes('@')) return res.status(400).json({ error: 'Informe account_id (ou conta + de) e para (e-mail do login de destino).' });
   const { data: a } = await supabase.from('accounts').select('id, name, owner, phone_display').eq('id', id).maybeSingle();
   if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
   const de = String(a.owner || '').toLowerCase();
