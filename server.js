@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 424;
+const SERVER_VER = 425;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -12811,6 +12811,32 @@ function _todosOsDonos() {
   donos.add(OWNER_LEGADO);
   return donos;
 }
+// 🔎 (v425) CONFERÊNCIA DAS WABAs: para cada número da API (de TODOS os donos — só quem fornece o FILAZ vê),
+// pergunta à Meta se o número ainda está na WABA guardada (GET /{waba}/phone_numbers com o token da conta).
+// Ela (09/11): "verifica todos os meus números e quais mudaram de WABA; dos outros usuários também".
+app.get('/admin/wabas', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê esta lista.' });
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const { data: contas } = await supabase.from('accounts').select('id, name, owner, phone_number_id, phone_display, phone_number, token, waba_id, evolution_instance').order('owner').order('name');
+  const saida = [];
+  for (const a of (contas || [])) {
+    if (a.evolution_instance || !a.token || !a.phone_number_id) continue;
+    const item = { conta: a.name || a.id, dono: a.owner, numero: a.phone_display || a.phone_number || '', waba_guardada: a.waba_id || null, waba_antiga: _settings['waba_antigo::' + a.id] || null, situacao: '' };
+    if (!a.waba_id) { item.situacao = 'sem WABA no cadastro'; saida.push(item); continue; }
+    try {
+      let url = `https://graph.facebook.com/v23.0/${a.waba_id}/phone_numbers`, params = { access_token: a.token, fields: 'id,display_phone_number', limit: 100 }, achou = false, lidos = 0;
+      for (let p = 0; p < 5 && url && !achou; p++) { const r = await axios.get(url, { params, timeout: 12000 }); const lista = (r.data && r.data.data) || []; lidos += lista.length; if (lista.some(n => String(n.id) === String(a.phone_number_id))) achou = true; url = (r.data && r.data.paging && r.data.paging.next) || null; params = undefined; }
+      item.situacao = achou ? 'ok — o número está na WABA guardada' : 'MUDOU — o número não está mais na WABA guardada (' + lidos + ' número(s) lá)';
+      item.mudou = !achou;
+    } catch (e) {
+      const me = e.response && e.response.data && e.response.data.error;
+      item.situacao = 'não deu para conferir: ' + ((me && me.message) || e.message);
+      item.erro = true;
+    }
+    saida.push(item);
+  }
+  res.json({ total: saida.length, mudaram: saida.filter(x => x.mudou).length, erros: saida.filter(x => x.erro).length, contas: saida });
+});
 app.get('/admin/acesso', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê esta lista.' });
   const l = _acessoLista();
