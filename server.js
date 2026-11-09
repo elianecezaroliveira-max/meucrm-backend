@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 429;
+const SERVER_VER = 431;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -7963,10 +7963,15 @@ async function _wabaDescobrir(acct) {
 // Confere e CORRIGE o WABA da conta no banco quando a Meta diz outro. Devolve { antes, agora, mudou }.
 async function _wabaConferir(acct) {
   const real = await _wabaDescobrir(acct);
-  if (!real || real === String(acct.waba_id || '')) return { antes: acct.waba_id || null, agora: real, mudou: false };
+  // 📡 (v430) garante a inscrição do FILAZ no webhook da WABA (a de verdade, ou a guardada): quando o número muda de
+  // WABA, só o outro app (Kommo) está inscrito na nova e as mensagens chegam só lá (04 e 33 do vendetta, 09/11)
+  let inscrito = false;
+  const alvo = real || String(acct.waba_id || '');
+  if (alvo && acct.token) { try { await axios.post(`https://graph.facebook.com/v23.0/${alvo}/subscribed_apps`, {}, { params: { access_token: acct.token }, timeout: 10000 }); inscrito = true; } catch (_) {} }
+  if (!real || real === String(acct.waba_id || '')) return { antes: acct.waba_id || null, agora: real, mudou: false, inscrito };
   try { await supabase.from('accounts').update({ waba_id: real }).eq('id', acct.id); } catch (e) { return { antes: acct.waba_id, agora: real, mudou: false, erro: e.message }; }
   console.warn('Conta "' + (acct.name || acct.id) + '": o WABA no FILAZ era ' + acct.waba_id + ' e na Meta o número está no WABA ' + real + ' — corrigido no cadastro');
-  return { antes: acct.waba_id || null, agora: real, mudou: true };
+  return { antes: acct.waba_id || null, agora: real, mudou: true, inscrito };
 }
 app.get('/accounts/:id/waba-antigo', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
@@ -7975,6 +7980,36 @@ app.get('/accounts/:id/waba-antigo', async (req, res) => {
   if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
   const v = _settings['waba_antigo::' + a.id] || null;
   res.json({ waba_antigo: v && v !== String(a.waba_id || '') ? v : null, waba_atual: a.waba_id || null });
+});
+// 🩺 (v431) DIAGNÓSTICO NA META de uma conta da API: o que a chave enxerga (número, WABA guardada, WABAs que a chave
+// alcança e qual delas tem o número). Ela (09/11, 04 e 33 do vendetta): gerou chave nova e "não liberou nada" — a
+// tela só dizia "Invalid parameter"; aqui dá para ver ONDE a chave para. Nunca devolve a chave, só o que a Meta diz.
+app.get('/accounts/:id/diagnostico-meta', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const { data: a } = await supabase.from('accounts').select('id, name, phone_number_id, token, waba_id, evolution_instance, phone_display').eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
+  if (a.evolution_instance || !a.token) return res.status(400).json({ error: 'Só contas da API oficial.' });
+  const erroDe = e => (e.response && e.response.data && e.response.data.error && ((e.response.data.error.message || '') + (e.response.data.error.error_user_msg ? ' — ' + e.response.data.error.error_user_msg : ''))) || e.message;
+  const g = async (path, params) => { try { const r = await axios.get('https://graph.facebook.com/v23.0/' + path, { params: Object.assign({ access_token: a.token }, params || {}), timeout: 12000 }); return { ok: true, data: r.data }; } catch (e) { return { ok: false, erro: erroDe(e) }; } };
+  const out = { conta: a.name, numero_cadastrado: a.phone_display || null, phone_number_id: a.phone_number_id, waba_guardada: a.waba_id || null, waba_antiga: _settings['waba_antigo::' + a.id] || null };
+  out.numero = await g(a.phone_number_id, { fields: 'id,display_phone_number,verified_name,status,quality_rating,code_verification_status,platform_type,name_status' });
+  const dbg = await g('debug_token', { input_token: a.token });
+  if (dbg.ok) { const d = dbg.data && dbg.data.data || {}; out.chave = { valida: d.is_valid, tipo: d.type, app_id: d.app_id, vence: d.expires_at ? new Date(d.expires_at * 1000).toISOString() : 'nunca', permissoes: d.scopes || [], alcance: (d.granular_scopes || []).map(x => ({ permissao: x.scope, wabas: x.target_ids || 'todas da empresa' })) }; } else out.chave = dbg;
+  out.waba_guardada_na_meta = a.waba_id ? await g(a.waba_id, { fields: 'id,name,owner_business_info' }) : null;
+  const ids = new Set(); if (dbg.ok) ((dbg.data.data || {}).granular_scopes || []).forEach(x => { if (/whatsapp_business/.test(String(x.scope || ''))) (x.target_ids || []).forEach(i => ids.add(String(i))); });
+  out.wabas_que_a_chave_alcanca = [];
+  for (const id of ids) {
+    const w = await g(id, { fields: 'id,name' }), pn = await g(id + '/phone_numbers', { fields: 'id,display_phone_number', limit: 100 });
+    const nums = pn.ok ? ((pn.data && pn.data.data) || []) : [];
+    out.wabas_que_a_chave_alcanca.push({ waba: id, nome: w.ok ? (w.data && w.data.name) : ('erro: ' + w.erro), numeros: pn.ok ? nums.map(n => n.display_phone_number) : ('erro: ' + pn.erro), tem_este_numero: nums.some(n => String(n.id) === String(a.phone_number_id)) });
+  }
+  const certa = out.wabas_que_a_chave_alcanca.find(w => w.tem_este_numero);
+  out.conclusao = !out.numero.ok ? 'A chave não alcança nem o NÚMERO (' + out.numero.erro + '): o usuário do sistema que gerou a chave não tem este número/WABA como ativo.'
+    : certa ? 'A chave alcança a WABA ' + certa.waba + ' (' + certa.nome + '), que tem este número' + (String(certa.waba) !== String(a.waba_id || '') ? ' — DIFERENTE da guardada; o "Conferir na Meta" corrige.' : '.')
+    : ids.size ? 'A chave alcança ' + ids.size + ' WABA(s), mas nenhuma tem este número: no Gerenciador da Meta, dê ao usuário do sistema a WABA onde o número está hoje.'
+    : 'A chave alcança o número, mas a Meta não listou nenhuma WABA para ela (ou a chave é de "todos os ativos" da empresa). Veja no Gerenciador da Meta em qual WABA o número está e confira se esse usuário do sistema tem essa WABA como ativo.';
+  res.json(out);
 });
 app.post('/accounts/:id/waba-conferir', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
