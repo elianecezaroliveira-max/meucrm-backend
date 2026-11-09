@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 428;
+const SERVER_VER = 429;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -6117,6 +6117,22 @@ app.put('/messages/:id/pin', async (req, res) => {
   res.json({ success: true });
 });
 
+// 🔑 (v429) Qual chave alcança esta WABA? A do próprio número às vezes NÃO alcança mais a WABA antiga dele
+// (caso do 90, 09/11: "Invalid parameter" ao listar os modelos da 9279…). Tenta a chave do número, depois a
+// das OUTRAS contas do MESMO login (ficam no servidor, nada vai para a tela). Guarda por 1 h.
+// Devolve { token } ou { token: null, erro } (o erro da Meta com a chave do número).
+const _wabaTokCache = new Map();
+async function _tokenQueAlcanca(waba, tokenPreferido, owner) {
+  const c = _wabaTokCache.get(waba); if (c && Date.now() - c.t < 3600000) return { token: c.token };
+  const tenta = async (tok) => { const r = await axios.get(`https://graph.facebook.com/v23.0/${waba}/message_templates`, { params: { access_token: tok, fields: 'id', limit: 1 }, timeout: 15000 }); return r && r.data && Array.isArray(r.data.data); };
+  let erro = null;
+  try { if (tokenPreferido && await tenta(tokenPreferido)) { _wabaTokCache.set(waba, { token: tokenPreferido, t: Date.now() }); return { token: tokenPreferido }; } }
+  catch (e) { erro = (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message; }
+  const outros = [];
+  try { const { data } = await supabase.from('accounts').select('token').eq('owner', owner || ' ').limit(100); (data || []).forEach(a => { if (a.token && a.token !== tokenPreferido && !outros.includes(a.token)) outros.push(a.token); }); } catch (_) {}
+  for (const tok of outros) { try { if (await tenta(tok)) { _wabaTokCache.set(waba, { token: tok, t: Date.now() }); return { token: tok }; } } catch (_) {} }
+  return { token: null, erro: erro || 'nenhuma chave alcança esta WABA' };
+}
 // ── Listar templates ──
 app.get("/templates", async (req, res) => {
   const { account_id } = req.query;
@@ -6126,7 +6142,13 @@ app.get("/templates", async (req, res) => {
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
   // (v424) ?waba=antiga: lista os modelos da WABA ANTIGA desta conta (o número mudou de WABA; os modelos ficaram lá)
-  if (String(req.query.waba || '') === 'antiga') { const wa = _settings['waba_antigo::' + account_id]; if (!wa) return res.status(400).json({ error: 'O FILAZ não conhece a WABA antiga desta conta.' }); account.waba_id = wa; }
+  if (String(req.query.waba || '') === 'antiga') {
+    const wa = _settings['waba_antigo::' + account_id]; if (!wa) return res.status(400).json({ error: 'O FILAZ não conhece a WABA antiga desta conta.' });
+    account.waba_id = wa;
+    const t = await _tokenQueAlcanca(wa, account.token, req.owner); // (v429) a chave do número pode não alcançar mais a WABA antiga
+    if (!t.token) return res.status(400).json({ error: 'Nenhuma chave das suas contas alcança mais a WABA antiga ' + wa + ' (a Meta diz: ' + t.erro + '). Se a WABA antiga foi apagada no Gerenciador da Meta, os modelos dela se perderam — copie de outra conta ou crie de novo.' });
+    account.token = t.token;
+  }
   try {
     const response = await axios.get(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, {
       params: { access_token: account.token, fields: "id,name,status,category,language,components,rejected_reason,quality_score", limit: 100 },
@@ -6233,7 +6255,7 @@ app.post('/templates/copiar', async (req, res) => {
   const { data: contas } = await supabase.from('accounts').select('id, name, token, waba_id').in('id', deAntiga ? [para] : [de, para]).eq('owner', req.owner || ' ');
   const destino = (contas || []).find(c => String(c.id) === para);
   let origem = deAntiga ? null : (contas || []).find(c => String(c.id) === de);
-  if (deAntiga && destino) { const wa = _settings['waba_antigo::' + destino.id]; if (!wa) return res.status(400).json({ error: 'O FILAZ não conhece a WABA antiga desta conta.' }); origem = { id: 'antiga', name: 'WABA antiga ' + wa, token: destino.token, waba_id: wa }; }
+  if (deAntiga && destino) { const wa = _settings['waba_antigo::' + destino.id]; if (!wa) return res.status(400).json({ error: 'O FILAZ não conhece a WABA antiga desta conta.' }); const t = await _tokenQueAlcanca(wa, destino.token, req.owner); if (!t.token) return res.status(400).json({ error: 'Nenhuma chave das suas contas alcança mais a WABA antiga ' + wa + ' (a Meta diz: ' + t.erro + ').' }); origem = { id: 'antiga', name: 'WABA antiga ' + wa, token: t.token, waba_id: wa }; }
   if (!origem || !destino) return res.status(404).json({ error: 'Conta não encontrada' });
   if (!origem.waba_id || !destino.waba_id || !origem.token || !destino.token) return res.status(400).json({ error: 'As duas contas precisam ser da API oficial, com WABA e token.' });
   const lista = async (acct) => {
