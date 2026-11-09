@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 425;
+const SERVER_VER = 426;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -12817,11 +12817,12 @@ function _todosOsDonos() {
 app.get('/admin/wabas', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê esta lista.' });
   if (!supabase) return res.status(500).json({ error: 'sem banco' });
-  const { data: contas } = await supabase.from('accounts').select('id, name, owner, phone_number_id, phone_display, phone_number, token, waba_id, evolution_instance').order('owner').order('name');
+  const { data: contas, error: erroContas } = await supabase.from('accounts').select('id, name, owner, phone_number_id, phone_display, token, waba_id, evolution_instance').order('owner').order('name');
+  if (erroContas) return res.status(500).json({ error: 'banco: ' + erroContas.message });
   const saida = [];
   for (const a of (contas || [])) {
     if (a.evolution_instance || !a.token || !a.phone_number_id) continue;
-    const item = { conta: a.name || a.id, dono: a.owner, numero: a.phone_display || a.phone_number || '', waba_guardada: a.waba_id || null, waba_antiga: _settings['waba_antigo::' + a.id] || null, situacao: '' };
+    const item = { conta: a.name || a.id, dono: a.owner, numero: a.phone_display || '', waba_guardada: a.waba_id || null, waba_antiga: _settings['waba_antigo::' + a.id] || null, situacao: '' };
     if (!a.waba_id) { item.situacao = 'sem WABA no cadastro'; saida.push(item); continue; }
     try {
       let url = `https://graph.facebook.com/v23.0/${a.waba_id}/phone_numbers`, params = { access_token: a.token, fields: 'id,display_phone_number', limit: 100 }, achou = false, lidos = 0;
