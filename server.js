@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 426;
+const SERVER_VER = 427;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -12837,6 +12837,51 @@ app.get('/admin/wabas', async (req, res) => {
     saida.push(item);
   }
   res.json({ total: saida.length, mudaram: saida.filter(x => x.mudou).length, erros: saida.filter(x => x.erro).length, contas: saida });
+});
+// 🔁 (v427) TRANSFERIR UMA CONTA (número) DE UM LOGIN PARA OUTRO, com leads, conversas e tarefas.
+// Ela (09/11): o 35 (+55 15 98104-7450) foi apagado do login dela em 23/10 e recadastrado no login do vendetta;
+// "O 35 é meu". Só quem fornece o FILAZ usa. ?simular=1 só conta e mostra os conflitos, sem mexer em nada.
+// Lead que JÁ existe no destino (mesmo telefone): as conversas vão para o lead do destino e o lead de origem é
+// apagado (nada se perde; etapa/etiquetas/notas ficam as do destino).
+app.post('/admin/transferir-conta', async (req, res) => {
+  if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ pode transferir contas.' });
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const id = String(req.body?.account_id || '').trim(), para = String(req.body?.para || '').trim().toLowerCase();
+  const simular = String(req.query.simular || req.body?.simular || '') === '1';
+  if (!id || !para || !para.includes('@')) return res.status(400).json({ error: 'Informe account_id e para (e-mail do login de destino).' });
+  const { data: a } = await supabase.from('accounts').select('id, name, owner, phone_display').eq('id', id).maybeSingle();
+  if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
+  const de = String(a.owner || '').toLowerCase();
+  if (de === para) return res.status(400).json({ error: 'A conta já é desse login.' });
+  const { data: leads } = await supabase.from('contacts').select('id, phone').eq('owner', de).eq('account_id', id);
+  const fones = (leads || []).map(c => c.phone);
+  let jaTem = [];
+  if (fones.length) { for (let i = 0; i < fones.length; i += 200) { const { data: d } = await supabase.from('contacts').select('phone').eq('owner', para).in('phone', fones.slice(i, i + 200)); jaTem = jaTem.concat((d || []).map(x => x.phone)); } }
+  const conflito = new Set(jaTem);
+  const { count: nMsgs } = await supabase.from('messages').select('id', { count: 'exact', head: true }).eq('owner', de).eq('account_id', id);
+  let nTarefas = 0; if (fones.length) { for (let i = 0; i < fones.length; i += 200) { const { count } = await supabase.from('tasks').select('id', { count: 'exact', head: true }).eq('owner', de).in('phone', fones.slice(i, i + 200)); nTarefas += (count || 0); } }
+  const resumo = { conta: a.name || a.id, numero: a.phone_display || '', de, para, leads: fones.length, leads_ja_no_destino: conflito.size, mensagens: nMsgs || 0, tarefas: nTarefas, simulacao: simular };
+  if (simular) return res.json(resumo);
+  const feito = { contas: 0, leads: 0, leads_fundidos: 0, mensagens: 0, tarefas: 0 };
+  try {
+    // 1) leads sem conflito: trocam de dono
+    const livres = fones.filter(f => !conflito.has(f));
+    for (let i = 0; i < livres.length; i += 200) { const { error } = await supabase.from('contacts').update({ owner: para }).eq('owner', de).eq('account_id', id).in('phone', livres.slice(i, i + 200)); if (error) throw error; feito.leads += Math.min(200, livres.length - i); }
+    // 2) leads em conflito: o de origem é apagado (as conversas vão para o lead do destino no passo 3)
+    const dup = fones.filter(f => conflito.has(f));
+    for (let i = 0; i < dup.length; i += 200) { const { error } = await supabase.from('contacts').delete().eq('owner', de).eq('account_id', id).in('phone', dup.slice(i, i + 200)); if (error) throw error; feito.leads_fundidos += Math.min(200, dup.length - i); }
+    // 3) conversas da conta
+    { const { error } = await supabase.from('messages').update({ owner: para }).eq('owner', de).eq('account_id', id); if (error) throw error; feito.mensagens = nMsgs || 0; }
+    // 4) tarefas dos leads movidos
+    for (let i = 0; i < fones.length; i += 200) { const { error } = await supabase.from('tasks').update({ owner: para }).eq('owner', de).in('phone', fones.slice(i, i + 200)); if (error) throw error; }
+    feito.tarefas = nTarefas;
+    // 5) a conta
+    { const { error } = await supabase.from('accounts').update({ owner: para }).eq('id', id); if (error) throw error; feito.contas = 1; }
+    delete _acctStatusCache[id];
+    _audita(req, 'Conta transferida', (a.name || id) + ' de ' + de + ' para ' + para + ' (' + feito.leads + ' leads, ' + feito.leads_fundidos + ' fundidos, ' + feito.mensagens + ' msgs)');
+    console.warn('Conta "' + (a.name || id) + '" transferida de ' + de + ' para ' + para, feito);
+    res.json(Object.assign(resumo, { ok: true, feito }));
+  } catch (e) { res.status(500).json({ error: 'Parou no meio: ' + (e.message || e), feito, resumo }); }
 });
 app.get('/admin/acesso', async (req, res) => {
   if (!_ehDono(req)) return res.status(403).json({ error: 'Só quem fornece o FILAZ vê esta lista.' });
