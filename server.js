@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 422;
+const SERVER_VER = 424;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -1179,6 +1179,10 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
+    // 🏷️ (v424) A WABA de verdade de cada número vem NO PRÓPRIO WEBHOOK (entry.id). Quando difere da
+    // guardada, corrige o cadastro — é o que faltava para o 101 (modelos listados da WABA antiga, envio
+    // recusado com 132001 porque o número já está em outra WABA).
+    try { _wabaAprendeDoWebhook(body); } catch (_) {}
     // Percorre TODOS os entries (a Meta pode agrupar vários)
     const changes = (body.entry || []).flatMap(e => e.changes || []);
     if (!changes.length) return;
@@ -6121,6 +6125,8 @@ app.get("/templates", async (req, res) => {
     .from("accounts").select("token, waba_id").eq("id", account_id).eq("owner", req.owner || ' ').single();
   if (accErr || !account) return res.status(404).json({ error: "Conta não encontrada" });
   if (!account.waba_id) return res.status(400).json({ error: "WABA ID não encontrado para esta conta" });
+  // (v424) ?waba=antiga: lista os modelos da WABA ANTIGA desta conta (o número mudou de WABA; os modelos ficaram lá)
+  if (String(req.query.waba || '') === 'antiga') { const wa = _settings['waba_antigo::' + account_id]; if (!wa) return res.status(400).json({ error: 'O FILAZ não conhece a WABA antiga desta conta.' }); account.waba_id = wa; }
   try {
     const response = await axios.get(`https://graph.facebook.com/v23.0/${account.waba_id}/message_templates`, {
       params: { access_token: account.token, fields: "id,name,status,category,language,components,rejected_reason,quality_score", limit: 100 },
@@ -6223,8 +6229,11 @@ app.post('/templates/copiar', async (req, res) => {
   const nomes = [].concat(b.nomes || []).map(x => String(x || '').trim()).filter(Boolean);
   if (!de || !para || !nomes.length) return res.status(400).json({ error: 'Informe a conta de origem (de), a de destino (para) e os modelos (nomes).' });
   if (de === para) return res.status(400).json({ error: 'A conta de origem e a de destino são a mesma.' });
-  const { data: contas } = await supabase.from('accounts').select('id, name, token, waba_id').in('id', [de, para]).eq('owner', req.owner || ' ');
-  const origem = (contas || []).find(c => String(c.id) === de), destino = (contas || []).find(c => String(c.id) === para);
+  const deAntiga = de === 'antiga'; // (v424) a WABA ANTIGA desta mesma conta (o número mudou de WABA; os modelos ficaram lá)
+  const { data: contas } = await supabase.from('accounts').select('id, name, token, waba_id').in('id', deAntiga ? [para] : [de, para]).eq('owner', req.owner || ' ');
+  const destino = (contas || []).find(c => String(c.id) === para);
+  let origem = deAntiga ? null : (contas || []).find(c => String(c.id) === de);
+  if (deAntiga && destino) { const wa = _settings['waba_antigo::' + destino.id]; if (!wa) return res.status(400).json({ error: 'O FILAZ não conhece a WABA antiga desta conta.' }); origem = { id: 'antiga', name: 'WABA antiga ' + wa, token: destino.token, waba_id: wa }; }
   if (!origem || !destino) return res.status(404).json({ error: 'Conta não encontrada' });
   if (!origem.waba_id || !destino.waba_id || !origem.token || !destino.token) return res.status(400).json({ error: 'As duas contas precisam ser da API oficial, com WABA e token.' });
   const lista = async (acct) => {
@@ -6435,6 +6444,8 @@ app.post("/send-template", async (req, res) => {
   } catch (err) {
     if (_reg.emVoo) _falhou(); // a Meta recusou: pode tentar de novo na hora
     const e = err.response?.data?.error || {};
+    // (v424) 132001 "não existe neste idioma" com o modelo NA lista = o número está em OUTRA WABA (caso do 101)
+    if (e.code === 132001) { setTimeout(() => { _wabaConferir(account).then(r => { if (r && r.mudou) console.warn('Conta "' + (account.name || account_id) + '": WABA corrigido de ' + r.antes + ' para ' + r.agora); }).catch(() => {}); }, 10); const ant = _settings['waba_antigo::' + account.id]; return res.status(400).json({ error: 'A Meta diz que o modelo "' + template_name + '" não existe na WABA onde este número está HOJE. Isso acontece quando o número muda de WABA: os modelos ficam na antiga. Em Modelos ▸ "Copiar de outra conta" escolha ' + (ant ? '"WABA antiga desta conta"' : 'a conta que tem o modelo') + ' para trazê-los.', codigo: 132001, waba_mudou: true, waba_antigo: ant || null }); }
     const msg = e.error_user_msg || e.message || err.message || "Erro ao enviar template";
     const detail = e.error_user_title || e.error_data?.details || "";
     console.error("Erro ao enviar template:", err.response?.data || err.message);
@@ -7846,6 +7857,37 @@ async function _metaCorpoDoModelo(token, wabaId, name, lang) {
 // ficado com o WABA antigo (o número mudou de WABA). Usa o token da própria conta: negócio dono do WABA
 // atual → WABAs próprios e de clientes → qual tem o número. Guardado 6 h por conta.
 const _wabaDescCache = new Map();
+// 🏷️ (v424) WABA pelo webhook: entry.id é a WABA onde o número ESTÁ hoje (a Meta não mente aqui).
+// Guarda a antiga em settings (waba_antigo::<conta>) para "Copiar modelos da WABA antiga".
+const _wabaWebhookVisto = new Map(); // phone_number_id → quando conferiu (1x por hora)
+function _wabaAprendeDoWebhook(body) {
+  if (!supabase) return;
+  for (const e of (body && body.entry) || []) {
+    const wabaId = String(e && e.id || '').replace(/[^\w]/g, '');
+    if (!wabaId) continue;
+    for (const ch of (e.changes || [])) {
+      const pn = String(ch && ch.value && ch.value.metadata && ch.value.metadata.phone_number_id || '').replace(/[^\w]/g, '');
+      if (!pn) continue;
+      const k = pn; const ult = _wabaWebhookVisto.get(k) || 0;
+      if (Date.now() - ult < 3600000) continue;
+      _wabaWebhookVisto.set(k, Date.now());
+      (async () => {
+        try {
+          const { data: accs } = await supabase.from('accounts').select('id, name, owner, waba_id').eq('phone_number_id', pn);
+          for (const a of (accs || [])) {
+            if (String(a.waba_id || '') === wabaId) continue;
+            const antiga = String(a.waba_id || '');
+            await supabase.from('accounts').update({ waba_id: wabaId }).eq('id', a.id);
+            _wabaDescCache.delete(a.id);
+            if (antiga) { const K = 'waba_antigo::' + a.id; await supabase.from('settings').upsert({ key: K, value: antiga, updated_at: new Date().toISOString() }); _settings[K] = antiga; }
+            console.warn('Conta "' + (a.name || a.id) + '": a Meta avisou pelo webhook que o número está na WABA ' + wabaId + (antiga ? ' (no FILAZ estava ' + antiga + ')' : '') + ' — corrigido no cadastro');
+            if (antiga) addNotice(a.owner, 'Conta ' + (a.name || a.id) + ': o número mudou de WABA na Meta (de ' + antiga + ' para ' + wabaId + '). O FILAZ já corrigiu o cadastro; os MODELOS ficaram na WABA antiga — em Modelos ▸ "Copiar de outra conta" escolha "WABA antiga desta conta" para trazê-los.', 'waba-mudou:' + a.id + ':' + wabaId, { tipo: 'alerta' });
+          }
+        } catch (err) { console.warn('WABA pelo webhook:', err.message); }
+      })();
+    }
+  }
+}
 async function _wabaDescobrir(acct) {
   if (!acct || !acct.token || !acct.phone_number_id) return null;
   const c = _wabaDescCache.get(acct.id); if (c && Date.now() - c.t < 6 * 3600000) return c.waba;
@@ -7904,6 +7946,14 @@ async function _wabaConferir(acct) {
   console.warn('Conta "' + (acct.name || acct.id) + '": o WABA no FILAZ era ' + acct.waba_id + ' e na Meta o número está no WABA ' + real + ' — corrigido no cadastro');
   return { antes: acct.waba_id || null, agora: real, mudou: true };
 }
+app.get('/accounts/:id/waba-antigo', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.json({ waba_antigo: null });
+  const { data: a } = await supabase.from('accounts').select('id, waba_id').eq('id', req.params.id).eq('owner', req.owner || ' ').maybeSingle();
+  if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
+  const v = _settings['waba_antigo::' + a.id] || null;
+  res.json({ waba_antigo: v && v !== String(a.waba_id || '') ? v : null, waba_atual: a.waba_id || null });
+});
 app.post('/accounts/:id/waba-conferir', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
@@ -9581,8 +9631,8 @@ function _iaLinha(m) {
   const t = String(m.type || 'text');
   let txt = String(m.content || '').trim();
   if (t === 'audio') txt = '(áudio' + (m.transcript ? ': ' + String(m.transcript).trim() : '') + ')';
-  else if (t === 'image' || t === 'video' || t === 'sticker') txt = '(' + (t === 'image' ? 'imagem' : t === 'video' ? 'vídeo' : 'figurinha') + (txt ? ': ' + txt : '') + ')';
-  else if (t === 'document') txt = '(documento' + (txt ? ': ' + txt : '') + ')';
+  else if (t === 'image' || t === 'video' || t === 'sticker') txt = '(' + (t === 'image' ? 'imagem' : t === 'video' ? 'vídeo' : 'figurinha') + (txt ? ': ' + txt : '') + (m.transcript && t === 'image' ? ' — o que a IA viu: ' + String(m.transcript).trim() : '') + ')';
+  else if (t === 'document') txt = '(documento' + (txt ? ': ' + txt : '') + (m.transcript ? ' — o que a IA leu: ' + String(m.transcript).trim() : '') + ')';
   else if (t === 'template') txt = txt || '(modelo)';
   else if (t === 'location') txt = '(localização)';
   else if (t === 'contacts') txt = '(contato)';
@@ -10007,6 +10057,46 @@ async function _iaTranscreveSePrecisar(m) {
     return texto || '';
   } catch (e) { console.warn('IA: transcrição do áudio falhou:', e.message); return ''; }
 }
+// 📷📄 (v423) A IA LÊ a FOTO e o DOCUMENTO que o lead mandou. Ela (06/11): "Quero que a IA leia fotos e documentos".
+// O que a IA viu fica guardado em messages.transcript (como o áudio) — lê uma vez só, por mensagem.
+// Precisa de OPENAI_API_KEY (foto e PDF) ou GEMINI_API_KEY (só foto); sem as duas, segue como antes ("(imagem)").
+const _iaVistos = new Map();
+function _iaProvedorVisao() {
+  if (process.env.OPENAI_API_KEY) return { nome: 'openai', url: 'https://api.openai.com/v1/chat/completions', chave: process.env.OPENAI_API_KEY, model: process.env.IA_VISAO_MODELO || 'gpt-4o-mini', pdf: true };
+  if (process.env.GEMINI_API_KEY) return { nome: 'gemini', url: IA_PROVEDORES.gemini.url, chave: process.env.GEMINI_API_KEY, model: process.env.IA_VISAO_MODELO || 'gemini-3.5-flash', pdf: false };
+  return null;
+}
+const _IA_VISAO_INSTR = 'Você lê o que um cliente de crédito consignado mandou pelo WhatsApp para a correspondente bancária. Responda em português, em até 400 caracteres, dizendo O QUE É (extrato de consignação, contracheque, documento com foto, comprovante, print de aplicativo, foto comum…) e os DADOS ÚTEIS que aparecem: nome, banco(s), parcelas e valores, margem, situação do contrato, datas, matrícula ou benefício (só os 4 últimos dígitos). Só o que está escrito; sem opinião e sem conselho. Se estiver ilegível, diga o que dá para ver.';
+async function _iaVeMidia(prov, bytes, mime, nome, ehDoc) {
+  const b64 = Buffer.from(bytes).toString('base64');
+  let parte;
+  if (ehDoc) { if (!prov.pdf || mime !== 'application/pdf') return ''; parte = { type: 'file', file: { filename: nome || 'documento.pdf', file_data: 'data:application/pdf;base64,' + b64 } }; }
+  else parte = { type: 'image_url', image_url: { url: 'data:' + (mime || 'image/jpeg') + ';base64,' + b64 } };
+  const body = { model: prov.model, messages: [{ role: 'system', content: _IA_VISAO_INSTR }, { role: 'user', content: [{ type: 'text', text: 'O que o cliente mandou' + (nome ? ' ("' + nome + '")' : '') + '?' }, parte] }], max_tokens: 300, temperature: 0.2 };
+  const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.chave, 'Content-Type': 'application/json' }, timeout: 45000 });
+  return String((r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content) || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+}
+async function _iaDescreveMidiaSePrecisar(m) {
+  if (!m) return '';
+  if (m.transcript) return m.transcript;
+  const t = String(m.type || 'text'), mime = String(m.media_mime_type || '');
+  const ehImg = t === 'image' || mime.startsWith('image/');
+  const ehDoc = t === 'document' || mime === 'application/pdf';
+  if (!ehImg && !ehDoc) return '';
+  if (!m.media_id) return '';
+  const k = String(m.id);
+  if (_iaVistos.has(k)) { m.transcript = _iaVistos.get(k); return m.transcript; }
+  const prov = _iaProvedorVisao(); if (!prov) return '';
+  try {
+    const bytes = await _bytesDaMidia(m);
+    if (!bytes || bytes.length > 8 * 1024 * 1024) { _iaVistos.set(k, ''); return ''; } // (acima de 8 MB fica de fora)
+    const texto = await _iaVeMidia(prov, bytes, mime || (ehImg ? 'image/jpeg' : 'application/pdf'), String(m.media_name || m.content || ''), ehDoc && !ehImg);
+    _iaVistos.set(k, texto || '');
+    if (_iaVistos.size > 500) _iaVistos.delete(_iaVistos.keys().next().value);
+    if (texto) { m.transcript = texto; try { await supabase.from('messages').update({ transcript: texto }).eq('id', m.id).select('id, phone'); } catch (_) {} }
+    return texto || '';
+  } catch (e) { console.warn('IA: leitura de foto/documento falhou:', (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message); _iaVistos.set(k, ''); return ''; }
+}
 // ⚡🤖 O que ela já tem pronto: respostas rápidas (settings quick_replies::dona) e bots ativos
 const _iaCatCache = {};
 async function _iaCatalogo(owner) {
@@ -10160,8 +10250,52 @@ function _iaConvenio(lead, msgs) {
   return { convenio: r || '', fonte: fontes[0] || '' };
 }
 function _iaFichas(owner) {
-  try { const v = JSON.parse(_cfg('ia_fichas', owner) || '[]'); return Array.isArray(v) ? v.filter(f => f && String(f.como || '').trim()).map(f => ({ banco: String(f.banco || '').trim(), convenio: String(f.convenio || 'TODOS').trim().toUpperCase(), como: String(f.como || '').trim().slice(0, 1200) })) : []; }
+  try { const v = JSON.parse(_cfg('ia_fichas', owner) || '[]'); return Array.isArray(v) ? v.filter(f => f && String(f.como || '').trim()).map(f => ({ banco: String(f.banco || '').trim(), convenio: String(f.convenio || 'TODOS').trim().toUpperCase(), como: String(f.como || '').trim().slice(0, 1200), ...(f.origem ? { origem: String(f.origem), em: f.em || null } : {}) })) : []; }
   catch (_) { return []; }
+}
+// 🧠 (v423) FICHA APRENDIDA SOZINHA. Ela: "eu não preenchi nada na IA, preenche conforme ela vai vendo na conversa".
+// Quando ELA manda ao lead uma mensagem que explica a formalização (Sou Gov, aceite, link, anuência…) e a
+// conversa deixa claro o banco e o convênio, a IA resume a regra e guarda como ficha "aprendida" daquele
+// banco × convênio (nunca por cima de uma ficha que ela escreveu à mão; a aprendida ela pode editar na tela).
+const _IA_FORMALIZA_RE = /sou\s*gov|meu\s*inss|formaliz|anu[êe]ncia|aceite|autoriza|desbloque|biometria|assin(a|e|ar|atura)|token|c[óo]digo de confirma|portabilidade/i;
+const _iaFichaUlt = new Map(); // owner|banco|convenio → quando aprendeu (1x a cada 10 min)
+async function _iaAprendeFicha(owner, phone, enviadas, forcar) {
+  try {
+    const textos = [].concat(enviadas || []).map(x => String(x || '')).filter(t => t.length >= 40 && _IA_FORMALIZA_RE.test(t));
+    if (!textos.length || !supabase) return null;
+    const { data: brutas } = await supabase.from('messages').select('*').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').order('timestamp', { ascending: false }).limit(60);
+    const msgs = (brutas || []).filter(m => m && m.type !== 'note').reverse();
+    let lead = null; try { const { data } = await supabase.from('contacts').select('name, tags, notes').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); lead = (data || [])[0] || null; } catch (_) {}
+    const { convenio } = _iaConvenio(lead, msgs);
+    const naConv = _iaBancoDaConversa(msgs); const banco = naConv.length ? naConv[naConv.length - 1].banco : '';
+    if (!convenio || !banco) return null; // sem saber banco E convênio, não dá para arquivar a regra
+    const k = (owner || ' ') + '|' + banco.toLowerCase() + '|' + convenio;
+    if (!forcar && Date.now() - (_iaFichaUlt.get(k) || 0) < 10 * 60000) return null;
+    _iaFichaUlt.set(k, Date.now());
+    const fichas = _iaFichas(owner);
+    const existente = fichas.find(f => f.convenio === convenio && _iaMesmoBanco(f.banco, banco));
+    if (existente && existente.origem !== 'aprendida') return null; // a ficha que ELA escreveu manda
+    if (!existente && fichas.length >= 40) return null;
+    const sys = 'Você organiza o manual de uma correspondente bancária de crédito consignado. Responda SOMENTE com JSON {"ficha":"..."}.';
+    const usr = 'Banco: ' + banco + '. Convênio: ' + convenio + '.\n'
+      + (existente ? 'Ficha atual (aprendida antes): ' + existente.como + '\n' : '')
+      + 'Mensagens que ELA mandou ao cliente agora:\n' + textos.map(t => '- ' + t.replace(/\s+/g, ' ').slice(0, 700)).join('\n') + '\n'
+      + 'Escreva a REGRA DE FORMALIZAÇÃO deste banco e convênio (como o cliente formaliza/autoriza: ferramentas, ordem dos passos, o que ela pede), em até 350 caracteres, em português, como instrução geral — SEM nome do cliente, SEM valores, SEM links, SEM datas. Se já havia ficha, junte o que é novo à atual, sem repetir. Se as mensagens não ensinam nada sobre formalização, responda {"ficha":""}.';
+    const { texto } = await _iaChamaGroq(sys, usr, owner);
+    let cj = {}; try { const t = String(texto || ''); const i = t.indexOf('{'), f = t.lastIndexOf('}'); if (i >= 0 && f > i) cj = JSON.parse(t.slice(i, f + 1)) || {}; } catch (_) { cj = {}; }
+    const ficha = String(cj.ficha || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    if (!ficha || ficha.length < 25) return null;
+    const hoje = new Date(Date.now() - 3 * 3600000).toISOString().slice(0, 10);
+    let bruto = []; try { bruto = JSON.parse(_cfg('ia_fichas', owner) || '[]'); if (!Array.isArray(bruto)) bruto = []; } catch (_) { bruto = []; }
+    const i = bruto.findIndex(f => f && String(f.convenio || 'TODOS').toUpperCase() === convenio && _iaMesmoBanco(f.banco, banco));
+    const nova = { banco, convenio, como: ficha, origem: 'aprendida', em: hoje };
+    if (i >= 0) { if (String(bruto[i].origem || '') !== 'aprendida') return null; bruto[i] = nova; } else bruto.push(nova);
+    const K = 'ia_fichas::' + (owner || ' '), txt = JSON.stringify(bruto);
+    await supabase.from('settings').upsert({ key: K, value: txt, updated_at: new Date().toISOString() });
+    _settings[K] = txt;
+    console.log('IA: ficha de formalização ' + (i >= 0 ? 'atualizada' : 'aprendida') + ' — ' + banco + ' · ' + convenio + ': ' + ficha.slice(0, 80));
+    return nova;
+  } catch (e) { console.warn('IA: aprender ficha falhou:', e.message); return null; }
 }
 const _iaMesmoBanco = (a, b) => { const n = x => String(x || '').toLowerCase().replace(/\bbanco\b/g, '').replace(/[^a-z0-9]/g, ''); return !!(n(a) && n(b) && (n(a) === n(b) || n(a).includes(n(b)) || n(b).includes(n(a)))); };
 function _iaFormalizacaoTxt(owner, lead, msgs, bancoDaConversa) {
@@ -10236,8 +10370,8 @@ async function _iaSugere(owner, phone, forcar, opts) {
   // o que o lead disse por último (a sequência de mensagens dele desde a minha última)
   const doLead = [];
   for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
-  for (const m of doLead.slice(-3)) await _iaTranscreveSePrecisar(m); // os últimos áudios do lead viram texto
-  const textoLead = doLead.map(m => m.type === 'audio' && m.transcript ? m.transcript : (m.content || '')).join(' ');
+  for (const m of doLead.slice(-3)) { await _iaTranscreveSePrecisar(m); await _iaDescreveMidiaSePrecisar(m); } // os últimos áudios do lead viram texto; fotos/documentos viram descrição (v423)
+  const textoLead = doLead.map(m => m.transcript && /^(audio|image|document)$/.test(String(m.type || '')) ? m.transcript : (m.content || '')).join(' ');
   // 6 exemplos (eram 8) e conversa mais curta: o plano grátis da Groq limita tokens por minuto
   // contexto ATUAL: o que veio antes da fala do lead (sobretudo o que EU disse por último)
   const ctxAtual = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha).join(' ');
@@ -10642,6 +10776,37 @@ app.post('/ia/treino/ensinar', async (req, res) => {
 // cartão aberto manda a lista COMPLETA do que já foi enviado para aquela fala do
 // lead; o exemplo com a mesma chave é substituído (vira UM exemplo com N mensagens,
 // igual aos das conversas reais). É assim que a IA vai ficando com a cara dela.
+// 🧠 (v423) VARREDURA: aprende as fichas com o que ela JÁ explicou nas conversas (últimos 90 dias). Roda em
+// segundo plano; /ia/fichas/varrer devolve na hora e a tela consulta o andamento em /ia/fichas/varrer/status.
+const _iaVarreFichas = {};
+app.post('/ia/fichas/varrer', async (req, res) => {
+  if (!_soContaIA(req, res)) return;
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  const owner = req.owner;
+  if (_iaVarreFichas[owner] && _iaVarreFichas[owner].rodando) return res.json({ ok: true, ja: true, status: _iaVarreFichas[owner] });
+  const st = _iaVarreFichas[owner] = { rodando: true, inicio: new Date().toISOString(), conversas: 0, mensagens: 0, aprendidas: 0, fim: null };
+  res.json({ ok: true, status: st });
+  (async () => {
+    try {
+      const desde = new Date(Date.now() - 90 * 86400000).toISOString();
+      const { data: msgs } = await supabase.from('messages').select('phone, content, timestamp').eq('owner', owner || ' ').eq('direction', 'outbound').gte('timestamp', desde).order('timestamp', { ascending: false }).limit(3000);
+      const porFone = new Map();
+      for (const m of (msgs || [])) { const t = String(m.content || ''); if (t.length < 40 || !_IA_FORMALIZA_RE.test(t) || /^\[(rapida|bot):/.test(t)) continue; const f = String(m.phone || '').replace(/\D/g, ''); if (!f || _iaEhTeste(f, owner)) continue; if (!porFone.has(f)) porFone.set(f, []); if (porFone.get(f).length < 4) porFone.get(f).push(t); }
+      st.mensagens = [...porFone.values()].reduce((a, b) => a + b.length, 0);
+      let n = 0;
+      for (const [fone, textos] of porFone) {
+        if (n++ >= 80) break; // (80 conversas por varredura)
+        st.conversas = n;
+        const r = await _iaAprendeFicha(owner, fone, textos, true);
+        if (r) st.aprendidas++;
+        await new Promise(r2 => setTimeout(r2, 400));
+      }
+    } catch (e) { st.erro = e.message; }
+    st.rodando = false; st.fim = new Date().toISOString();
+  })();
+});
+app.get('/ia/fichas/varrer/status', async (req, res) => { if (!_soContaIA(req, res)) return; res.json(_iaVarreFichas[req.owner] || { rodando: false }); });
 app.post('/ia/aprender', async (req, res) => {
   if (!_soContaIA(req, res)) return;
   if (!_exigeLogin(req, res)) return;
@@ -10713,6 +10878,7 @@ async function _iaGuardaExemplo(owner, b) {
     lista = lista.concat([ex]);
     const cabe = lista.length > 3000 ? lista.slice(lista.length - 3000) : lista; // teto: as mais recentes ficam
     await _iaMemoriaGrava(owner, 'exemplos', cabe.map(o => JSON.stringify(o)).join('\n'));
+    if (!treino) _iaAprendeFicha(owner, phone, enviadas).catch(() => {}); // 🧠 (v423) a regra de formalização que ela acabou de explicar vira ficha
     return { ok: true, guardado: true, total: cabe.length, origem: ex.origem };
   });
 }
