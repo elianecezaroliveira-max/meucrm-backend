@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 431;
+const SERVER_VER = 432;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -8018,7 +8018,24 @@ app.post('/accounts/:id/waba-conferir', async (req, res) => {
   if (!a) return res.status(404).json({ error: 'Conta não encontrada' });
   if (a.evolution_instance || !a.token) return res.status(400).json({ error: 'Só contas da API oficial têm WABA.' });
   _wabaDescCache.delete(a.id); // (v415) clique dela = conferir AGORA, não a resposta guardada de até 6 h
-  _wabaDescCache.delete(a.id);
+  // 🧭 (v432) WABA informada à mão: ela leu o ID no Gerenciador da Meta (04 = 7523…, 33 = 1381…, 09/11) porque a chave é
+  // "todos os ativos da empresa" e a Meta não lista as WABAs dela. Só aceita se a Meta confirmar que ESSA WABA tem o número.
+  const informada = String(req.body?.waba_id || '').replace(/\D/g, '');
+  if (informada) {
+    let tem = false, erro = null;
+    try {
+      let url = `https://graph.facebook.com/v23.0/${informada}/phone_numbers`, params = { access_token: a.token, fields: 'id,display_phone_number', limit: 100 };
+      for (let p = 0; p < 5 && url && !tem; p++) { const r = await axios.get(url, { params, timeout: 12000 }); tem = ((r.data && r.data.data) || []).some(n => String(n.id) === String(a.phone_number_id)); url = (r.data && r.data.paging && r.data.paging.next) || null; params = undefined; }
+    } catch (e) { erro = (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message; }
+    if (!tem) return res.status(400).json({ error: 'A Meta não confirmou que a WABA ' + informada + ' tem este número' + (erro ? ' (' + erro + ')' : '') + '. Confira o ID em Configurações da empresa ▸ Contas de mensagens.' });
+    const antes = String(a.waba_id || '');
+    if (antes && antes !== informada) { try { await supabase.from('settings').upsert({ key: 'waba_antigo::' + a.id, value: antes, updated_at: new Date().toISOString() }); _settings['waba_antigo::' + a.id] = antes; } catch (_) {} }
+    try { await supabase.from('accounts').update({ waba_id: informada }).eq('id', a.id); } catch (e) { return res.status(500).json({ error: e.message }); }
+    let inscrito = false; try { await axios.post(`https://graph.facebook.com/v23.0/${informada}/subscribed_apps`, {}, { params: { access_token: a.token }, timeout: 10000 }); inscrito = true; } catch (_) {}
+    _wabaDescCache.set(a.id, { t: Date.now(), waba: informada }); delete _acctStatusCache[a.id];
+    _audita(req, 'WABA informada', (a.name || a.id) + ': ' + (antes || '—') + ' → ' + informada + (inscrito ? ' (webhook inscrito)' : ''));
+    return res.json({ antes: antes || null, agora: informada, mudou: antes !== informada, inscrito, informada: true });
+  }
   res.json(await _wabaConferir(a));
 });
 async function getTemplateBodyText(token, wabaId, name, lang, owner, acct) {
