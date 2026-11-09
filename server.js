@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 432;
+const SERVER_VER = 433;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -1579,6 +1579,12 @@ app.post("/auth/whatsapp", async (req, res) => {
     console.log("WABA IDs encontrados via debug_token:", wabaIds);
 
     const savedAccounts = [];
+    // 🔒 (v433) Número que JÁ está em OUTRO login do FILAZ NÃO troca de dono por aqui. Ela (09/11): o 35 foi parar no
+    // login do vendetta — os dois logins usam a MESMA empresa da Meta (VETRA), e o "Continuar com o Facebook" de um
+    // gravava por cima (owner = quem clicou) todos os números das WABAs escolhidas, inclusive os do outro login.
+    // Agora esses números são pulados e informados; só quem fornece o FILAZ transfere (/admin/transferir-conta).
+    const pulados = [];
+    const _meuLogin = String(req.owner || '').toLowerCase();
 
     for (const wabaId of wabaIds) {
       // 3. Busca nome do WABA
@@ -1629,7 +1635,13 @@ app.post("/auth/whatsapp", async (req, res) => {
         // o nome dela por cima quando você reconecta/atualiza o token)
         let _nomeAtual = null;
         try {
-          const { data: _ex } = await supabase.from('accounts').select('name').eq('phone_number_id', phone.id).maybeSingle();
+          const { data: _ex } = await supabase.from('accounts').select('name, owner').eq('phone_number_id', phone.id).maybeSingle();
+          if (_ex && _ex.owner && _meuLogin && String(_ex.owner).toLowerCase() !== _meuLogin) {
+            pulados.push({ numero: phone.display_phone_number, nome: _ex.name || '', motivo: 'já está em outro login do FILAZ' });
+            console.warn('Continuar com o Facebook: número ' + phone.display_phone_number + ' (' + (_ex.name || '') + ') já é do login ' + _ex.owner + ' — não foi mexido (pedido de ' + _meuLogin + ')');
+            try { _audita(req, 'Número em outro login (não mexido)', (phone.display_phone_number || phone.id) + ' é do login ' + _ex.owner); } catch (_) {}
+            continue;
+          }
           _nomeAtual = _ex?.name || null;
         } catch (_) {}
         const accountData = {
@@ -1660,12 +1672,13 @@ app.post("/auth/whatsapp", async (req, res) => {
     }
 
     if (savedAccounts.length === 0) {
+      if (pulados.length) return res.status(400).json({ error: pulados.length + ' número(s) encontrado(s), mas já estão cadastrados em outro login do FILAZ e não foram mexidos: ' + pulados.map(x => x.nome ? x.nome + ' (' + x.numero + ')' : x.numero).join(', ') + '. Só quem fornece o FILAZ pode transferir um número de um login para outro.', pulados });
       return res.status(400).json({
         error: "Nenhum número de WhatsApp encontrado nesta conta do Facebook. Verifique se há uma conta WhatsApp Business vinculada.",
       });
     }
 
-    res.json({ success: true, accounts: savedAccounts });
+    res.json({ success: true, accounts: savedAccounts, pulados });
   } catch (err) {
     console.error("Erro auth:", err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || "Erro ao conectar com o Facebook" });
