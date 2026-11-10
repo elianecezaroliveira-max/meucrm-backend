@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 434;
+const SERVER_VER = 435;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -6167,7 +6167,7 @@ app.get("/templates", async (req, res) => {
       params: { access_token: account.token, fields: "id,name,status,category,language,components,rejected_reason,quality_score", limit: 100 },
     });
     // a listagem já traz o corpo de cada modelo → fica guardado para o bot (sem depender da Meta na hora do envio)
-    try { (response.data.data || []).forEach(t => { const b = (t.components || []).find(c => c.type === 'BODY'); if (t.status === 'APPROVED' && b && b.text) _tmplCorpoAnota(account.waba_id, t.name, t.language, b.text); }); } catch (_) {}
+    try { (response.data.data || []).forEach(t => { const b = (t.components || []).find(c => c.type === 'BODY'); if (t.status === 'APPROVED' && b && b.text) { _tmplCorpoAnota(account.waba_id, t.name, t.language, b.text); _tmplExtrasAnota(account.waba_id, t.name, t.language, t.components); } }); } catch (_) {}
     res.json(response.data.data || []);
   } catch (err) {
     console.error("Erro ao listar templates:", err.response?.data || err.message);
@@ -6464,13 +6464,16 @@ app.post("/send-template", async (req, res) => {
       direction: "outbound", timestamp: new Date().toISOString(), account_id: safeAccountId,
       status: tplWamid ? 'sent' : 'pending', wamid: tplWamid, owner: req.owner || null,
     }, req);
+    // (v435) rodapé e botões do modelo vão junto (campo transcript) para a conversa mostrar como o cliente vê
+    const _extrasTpl = await _tmplExtrasTxt(account.waba_id, template_name, _lang);
+    const _gravaMsgTpl = async () => { if (_extrasTpl) { const { error } = await supabase.from("messages").insert(Object.assign({}, _linhaMsg, { transcript: _extrasTpl })); if (!error) return; } return supabase.from("messages").insert(_linhaMsg); };
     await Promise.all([
       supabase.from("contacts").upsert(
         { phone: to, last_message_at: new Date().toISOString(), account_id: safeAccountId,
           last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null },
         { onConflict: "owner,phone" }
       ),
-      supabase.from("messages").insert(_linhaMsg),
+      _gravaMsgTpl(),
     ]);
     console.log("Template enviado:", template_name, "→", to, "wamid:", tplWamid);
     res.json({ success: true, data: response.data });
@@ -7890,6 +7893,43 @@ function _tmplCorpoAnota(wabaId, name, lang, txt) {
   _tmplBodyCache[key] = txt;
   if (supabase) supabase.from('settings').upsert({ key: _tmplCorpoChave(wabaId, name, lang), value: txt, updated_at: new Date().toISOString() }).then(() => {}, () => {});
 }
+// 🔘 (v435) RODAPÉ e BOTÕES do modelo, para a conversa mostrar a mensagem como o cliente vê. Ela (10/11): "no chat
+// não mostra o botão e rodapé dos modelos". Guardados em memória e em settings (tmpl_extras::waba::nome::idioma)
+// sempre que a Meta devolve o modelo; na hora de gravar a mensagem enviada vão no campo transcript (JSON).
+const _tmplExtrasCache = {};
+const _tmplExtrasChave = (wabaId, name, lang) => 'tmpl_extras::' + wabaId + '::' + name + '::' + (lang || '');
+function _tmplExtrasDe(components) {
+  const cs = Array.isArray(components) ? components : [];
+  const f = cs.find(c => c && c.type === 'FOOTER'), b = cs.find(c => c && c.type === 'BUTTONS');
+  const rodape = f && f.text ? String(f.text).slice(0, 200) : '';
+  const botoes = (b && Array.isArray(b.buttons) ? b.buttons : []).map(x => ({ t: String((x && x.text) || '').slice(0, 60), tipo: String((x && x.type) || 'QUICK_REPLY') })).filter(x => x.t).slice(0, 10);
+  return { rodape, botoes };
+}
+function _tmplExtrasAnota(wabaId, name, lang, components) {
+  try {
+    if (!wabaId || !name || !Array.isArray(components)) return;
+    const v = JSON.stringify(_tmplExtrasDe(components)), key = wabaId + '|' + name + '|' + (lang || '');
+    if (_tmplExtrasCache[key] === v) return;
+    _tmplExtrasCache[key] = v;
+    if (supabase) supabase.from('settings').upsert({ key: _tmplExtrasChave(wabaId, name, lang), value: v, updated_at: new Date().toISOString() }).then(() => {}, () => {});
+  } catch (_) {}
+}
+// Texto pronto para messages.transcript (ou null se o modelo não tem rodapé nem botão / não é conhecido). Nunca lança.
+async function _tmplExtrasTxt(wabaId, name, lang) {
+  try {
+    if (!wabaId || !name) return null;
+    const key = wabaId + '|' + name + '|' + (lang || '');
+    let v = _tmplExtrasCache[key];
+    if (v === undefined && supabase) {
+      try { const { data } = await supabase.from('settings').select('value').eq('key', _tmplExtrasChave(wabaId, name, lang)).maybeSingle(); v = (data && data.value) || ''; } catch (_) { v = ''; }
+      _tmplExtrasCache[key] = v;
+    }
+    if (!v) return null;
+    const o = JSON.parse(v);
+    if (!o || (!o.rodape && !(o.botoes || []).length)) return null;
+    return JSON.stringify({ _tmpl: 1, nome: name, rodape: o.rodape || '', botoes: o.botoes || [] });
+  } catch (_) { return null; }
+}
 async function _metaCorpoDoModelo(token, wabaId, name, lang) {
   const pega = async (params) => {
     const r = await axios.get(`https://graph.facebook.com/v23.0/${wabaId}/message_templates`, { params: Object.assign({ access_token: token, fields: 'name,language,components', limit: 100 }, params) });
@@ -7898,6 +7938,7 @@ async function _metaCorpoDoModelo(token, wabaId, name, lang) {
   let list = await pega({ name });
   if (!list.some(t => t.name === name)) list = await pega({}); // o filtro por nome voltou vazio → lista inteira
   const tmpl = list.find(t => t.name === name && (!lang || t.language === lang)) || list.find(t => t.name === name);
+  if (tmpl) _tmplExtrasAnota(wabaId, name, lang, tmpl.components); // (v435) rodapé e botões para a conversa
   return tmpl?.components?.find(c => c.type === 'BODY')?.text || null;
 }
 // 🔎 Descobre em QUAL WABA o número (phone_number_id) está hoje na Meta — o cadastro do FILAZ pode ter
@@ -8217,7 +8258,12 @@ async function sendBotTemplate(phone, accountId, cfg, name, notes, owner) {
       let shown = bodyText ? renderTemplateBody(bodyText, vars) : `[Modelo: ${cfg.template_name}]`;
       const prev = shown.length > 80 ? shown.substring(0, 80) + '…' : shown;
       const tWamid = r.data?.messages?.[0]?.id || null;
-      await supabase.from('messages').insert({ phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null });
+      // (v435) rodapé e botões do modelo vão junto (campo transcript); se a gravação com eles falhar, grava como sempre
+      const _linhaT = { phone, content: shown, type: 'template', direction: 'outbound', timestamp: ts, account_id: usedAcctId, status: 'pending', wamid: tWamid, owner: owner || null };
+      const _extrasT = await _tmplExtrasTxt(acct.waba_id, cfg.template_name, cfg.language || 'pt_BR');
+      let _gravouT = false;
+      if (_extrasT) { try { const { error: _eT } = await supabase.from('messages').insert(Object.assign({}, _linhaT, { transcript: _extrasT })); _gravouT = !_eT; } catch (_) {} }
+      if (!_gravouT) await supabase.from('messages').insert(_linhaT);
       await applyPendingStatus(tWamid);
       await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null, unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner || ' '); // enviou de verdade → a conversa fica lida
       if (bodyText) await _modeloPreencheAntigos(owner, cfg.template_name, bodyText); // conserta as antigas "[Modelo: …]"
