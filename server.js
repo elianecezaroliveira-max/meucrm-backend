@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 433;
+const SERVER_VER = 434;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -7585,8 +7585,20 @@ async function _vigiaFalha(owner, accountId) {
           const ids = (bots || []).map(b => b.id);
           const usa = new Set((bots || []).filter(b => String(b.account_id || '') === String(accountId)).map(b => String(b.trigger_stage_id)));
           if (ids.length) {
-            const { data: nos } = await supabase.from('bot_nodes').select('bot_id, config').in('bot_id', ids);
-            for (const n of (nos || [])) if (n.config && String(n.config.account_id || '') === String(accountId)) { const b = (bots || []).find(x => x.id === n.bot_id); if (b) usa.add(String(b.trigger_stage_id)); }
+            const { data: nos } = await supabase.from('bot_nodes').select('id, bot_id, type, config').in('bot_id', ids);
+            // (v434) Passo SOLTO não conta. Ela (10/11): tirou o 101 e o 89 (banidos) do rodízio do SIAPE2 e os passos
+            // deles ficaram soltos no quadro — "não faz sentido eu ter que tirar". Nenhum lead novo passa por passo
+            // solto; então só vale o passo que o INÍCIO alcança. (Bot sem passo de início: vale tudo, como antes.)
+            let ligs = []; try { const { data: e } = await supabase.from('bot_edges').select('bot_id, from_node_id, to_node_id').in('bot_id', ids); ligs = e || []; } catch (_) {}
+            const alcanca = {};
+            for (const bid of ids) {
+              const meus = (nos || []).filter(n => n.bot_id === bid), ini = meus.filter(n => n.type === 'start').map(n => n.id);
+              if (!ini.length) { alcanca[bid] = null; continue; }
+              const vis = new Set(), fila = ini.slice();
+              while (fila.length) { const id = fila.shift(); if (vis.has(id)) continue; vis.add(id); ligs.forEach(e => { if (e.from_node_id === id) fila.push(e.to_node_id); }); }
+              alcanca[bid] = vis;
+            }
+            for (const n of (nos || [])) if (n.config && String(n.config.account_id || '') === String(accountId) && (!alcanca[n.bot_id] || alcanca[n.bot_id].has(n.id))) { const b = (bots || []).find(x => x.id === n.bot_id); if (b) usa.add(String(b.trigger_stage_id)); }
           }
           let mudou = false;
           for (const r of regras) if (usa.has(String(r.para))) { r.parado_ate = new Date(agora + pausaMin * 60000).toISOString(); if (r.manual) { r.manual = false; r._desligarManual = true; } pausadas.push(r.nome || r.id); mudou = true; }
