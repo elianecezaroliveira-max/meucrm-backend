@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 438;
+const SERVER_VER = 439;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -1055,7 +1055,7 @@ async function _esperaEnvioDoBot(wamid, ms) {
 async function updateMsgStatus(wamid, upd) {
   if (!supabase || !wamid || !upd?.status) return;
   // Tique de entrega/leitura vale SÓ para mensagem enviada por mim (outbound)
-  if (upd.status === 'failed') { const { data: fal } = await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound').select('id, phone, wamid, owner, account_id'); for (const f of (fal || [])) _vigiaFalha(f.owner, f.account_id).catch(() => {}); _mirrorContactStatus(wamid, 'failed'); _avisaEsperaStatus(wamid, 'failed'); return; }
+  if (upd.status === 'failed') { const { data: fal } = await supabase.from('messages').update(upd).eq('wamid', wamid).eq('direction', 'outbound').select('id, phone, wamid, owner, account_id'); for (const f of (fal || [])) _vigiaFalha(f.owner, f.account_id, upd.error_info).catch(() => {}); _mirrorContactStatus(wamid, 'failed'); _avisaEsperaStatus(wamid, 'failed'); return; }
   const rank = _ST_RANK[upd.status];
   if (rank === undefined) return;
   const lower = Object.keys(_ST_RANK).filter(s => _ST_RANK[s] < rank);
@@ -7669,9 +7669,16 @@ async function _rrContaDoRamo(rrNodeId, i) {
 }
 const _falhasConta = new Map(); // owner|acct → [ms]
 const _falhasAvisado = new Map(); // owner|acct → ms do último aviso
-async function _vigiaFalha(owner, accountId) {
+// (v439) Falha que é do LEAD, não do número: não conta para tirar o número do rodízio / parar o gotejamento. Ela
+// (11/11, "ficou alguma falha que não vimos?"): em 7 dias, 56 das 97 falhas eram "número sem WhatsApp" (131026) ou
+// "fora da janela de 24 h" (131047) — 5 leads sem WhatsApp numa hora tiravam do rodízio um número saudável.
+// Contam (problema do NÚMERO/conta): banido/bloqueado, pagamento, chave vencida, modelo inexistente, limite da Meta…
+const _FALHA_DO_LEAD = /\b(131026|131047|131049|131050|131051|131052|131053|130472|131021)\b|Message Undeliverable|não tem WhatsApp|Fora da janela de 24h/i;
+function _falhaDoLead(txt) { return !!txt && _FALHA_DO_LEAD.test(String(txt)); }
+async function _vigiaFalha(owner, accountId, erroTxt) {
   try {
     if (!supabase || !owner || !accountId) return;
+    if (_falhaDoLead(erroTxt)) return; // (v439) o número está bem: o problema é o lead
     const lim = Math.max(1, parseInt(process.env.FALHAS_AVISO || '5', 10) || 5);
     const k = owner + '|' + accountId, agora = Date.now();
     const l = (_falhasConta.get(k) || []).filter(t => agora - t < 3600000); l.push(agora); _falhasConta.set(k, l);
@@ -7787,7 +7794,7 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
         'botfail:' + (accountId || 'sem'), { tipo: 'erro', alvo: 'bots' });
     } catch (_) {}
     await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
-    _vigiaFalha(owner, accountId).catch(() => {}); // 🚨 muitas falhas no mesmo número → aviso + pausa
+    _vigiaFalha(owner, accountId, errText).catch(() => {}); // 🚨 muitas falhas no mesmo número → aviso + pausa
   } catch(e) { console.error('recordBotFail:', e.message); }
 }
 
@@ -15115,4 +15122,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
