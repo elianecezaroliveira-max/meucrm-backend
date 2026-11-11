@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 437;
+const SERVER_VER = 438;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -8212,7 +8212,10 @@ app.get('/accounts/:id/diagnostico-meta', async (req, res) => {
   const g = async (path, params) => { try { const r = await axios.get('https://graph.facebook.com/v23.0/' + path, { params: Object.assign({ access_token: a.token }, params || {}), timeout: 12000 }); return { ok: true, data: r.data }; } catch (e) { return { ok: false, erro: erroDe(e) }; } };
   const out = { conta: a.name, numero_cadastrado: a.phone_display || null, phone_number_id: a.phone_number_id, waba_guardada: a.waba_id || null, waba_antiga: _settings['waba_antigo::' + a.id] || null };
   out.numero = await g(a.phone_number_id, { fields: 'id,display_phone_number,verified_name,status,quality_rating,code_verification_status,platform_type,name_status' });
-  const dbg = await g('debug_token', { input_token: a.token });
+  // (v438) a chave do "Continuar com o Facebook" (usuário do sistema da integração) não pode consultar a si mesma
+  // ("#100 You must provide an app access token") — a do APP pode, e mostra tipo e vencimento. Tenta a do app primeiro.
+  let dbg = (APP_ID && APP_SECRET) ? await g('debug_token', { input_token: a.token, access_token: APP_ID + '|' + APP_SECRET }) : { ok: false };
+  if (!dbg.ok) dbg = await g('debug_token', { input_token: a.token });
   if (dbg.ok) { const d = dbg.data && dbg.data.data || {}; out.chave = { valida: d.is_valid, tipo: d.type, app_id: d.app_id, vence: d.expires_at ? new Date(d.expires_at * 1000).toISOString() : 'nunca', permissoes: d.scopes || [], alcance: (d.granular_scopes || []).map(x => ({ permissao: x.scope, wabas: x.target_ids || 'todas da empresa' })) }; } else out.chave = dbg;
   out.waba_guardada_na_meta = a.waba_id ? await g(a.waba_id, { fields: 'id,name,owner_business_info' }) : null;
   const ids = new Set(); if (dbg.ok) ((dbg.data.data || {}).granular_scopes || []).forEach(x => { if (/whatsapp_business/.test(String(x.scope || ''))) (x.target_ids || []).forEach(i => ids.add(String(i))); });
