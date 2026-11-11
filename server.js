@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 435;
+const SERVER_VER = 436;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -5140,7 +5140,34 @@ app.get('/drip', async (req, res) => {
   const hhmm = String(agora.getUTCHours()).padStart(2, '0') + ':' + String(agora.getUTCMinutes()).padStart(2, '0');
   const janela = {};
   for (const r of regras) janela[r.id] = _dripDentroDaJanela(r);
-  res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay() });
+  // (v436) números fora do rodízio (muitas falhas) e o que fazer nas 5 falhas
+  const _fora = _numPausados(req.owner);
+  const numeros_fora = Object.keys(_fora).map(id => ({ id, nome: _fora[id].nome || id, ate: _fora[id].ate, desde: _fora[id].desde || null, renovado: _fora[id].renovado || 0 }));
+  res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay(), numeros_fora, falhas_modo: _falhasModo(req.owner) });
+});
+// (v436) o que fazer quando um número tem muitas falhas: 'numero' = só ele sai do rodízio; 'regra' = para o gotejamento
+app.put('/drip/falhas-modo', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const modo = String(req.body && req.body.modo) === 'regra' ? 'regra' : 'numero';
+  const k = 'falhas_modo::' + req.owner;
+  await supabase.from('settings').upsert({ key: k, value: modo, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  _settings[k] = modo;
+  _audita(req, 'Muitas falhas num número', modo === 'regra' ? 'parar o gotejamento' : 'tirar só o número do rodízio');
+  res.json({ ok: true, falhas_modo: modo });
+});
+// (v436) devolve na hora um número ao rodízio (ela conferiu o número e quer que volte antes do prazo)
+app.post('/drip/numero-devolver', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  if (!req.owner) return res.status(401).json({ error: 'Faça login no CRM' });
+  const id = String((req.body && req.body.account_id) || '');
+  const o = _numPausados(req.owner);
+  if (!o[id]) return res.json({ ok: true, ja: true });
+  const nome = o[id].nome || id;
+  delete o[id]; await _numPausadosSalva(req.owner, o);
+  _falhasConta.delete(req.owner + '|' + id); _falhasAvisado.delete(req.owner + '|' + id); // contagem zerada: precisa de 5 falhas NOVAS para sair de novo
+  _audita(req, 'Número devolvido ao rodízio', nome);
+  res.json({ ok: true });
 });
 // 📜 Histórico: os últimos 200 leads movidos pelo gotejamento (mais recente primeiro) + ritmo real por regra
 app.get('/drip/historico', (req, res) => {
@@ -7564,6 +7591,51 @@ function applyVars(str, name, phone, notes) {
 // FALHAS_AVISO) → aviso na sininho + push, e as regras de gotejamento cujo bot de destino usa esse número
 // ficam PARADAS por FALHAS_PAUSA_MIN minutos (padrão 120; 0 = não pausa). Antes, um número com token
 // vencido ou bloqueado derrubava o disparo inteiro em silêncio — ela só via abrindo Relatórios.
+// ⏸ (v436) NÚMERO FORA DO RODÍZIO. Ela (10/11): "tem como pausar apenas o número que está com muitas falhas no
+// disparo, em vez de parar o bot todo?" — com 5 falhas o número sai do rodízio por FALHAS_PAUSA_MIN e o gotejamento
+// segue com os outros. Se o bot não tiver como desviar (sem rodízio, ou sem outro número saudável), vale o de antes:
+// a regra para. Opção por conta (settings falhas_modo): 'numero' (padrão) ou 'regra' (para o gotejamento, como antes).
+// Guardado em settings num_pausados::<dono> = { contaId: { ate, nome, desde } }.
+function _falhasModo(owner) { return _cfg('falhas_modo', owner) === 'regra' ? 'regra' : 'numero'; }
+function _numPausados(owner) { try { const o = JSON.parse(_cfg('num_pausados', owner) || '{}'); return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {}; } catch (_) { return {}; } }
+async function _numPausadosSalva(owner, o) {
+  const k = 'num_pausados::' + (owner || ' '), value = JSON.stringify(o || {});
+  _settings[k] = value;
+  try { await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() }, { onConflict: 'key' }); } catch (_) {}
+}
+const _falhasPausaMin = () => Math.max(0, parseInt(process.env.FALHAS_PAUSA_MIN || '120', 10) || 0);
+// O número está fora do rodízio AGORA? Prazo vencido: só volta se a Meta disser que está conectado (número banido
+// não volta sozinho — senão queimaria 5 leads a cada 2 h). Nunca lança.
+async function _numFora(owner, accId) {
+  try {
+    const o = _numPausados(owner), e = o[accId];
+    if (!e) return false;
+    if (Date.now() < (Date.parse(e.ate) || 0)) return true;
+    let st = 'connected';
+    try { delete _acctStatusCache[accId]; st = await cloudApiStatus(accId); } catch (_) {}
+    if (st !== 'connected') { e.ate = new Date(Date.now() + Math.max(30, _falhasPausaMin()) * 60000).toISOString(); e.renovado = (e.renovado || 0) + 1; await _numPausadosSalva(owner, o); return true; }
+    delete o[accId]; await _numPausadosSalva(owner, o);
+    console.log('Número ' + (e.nome || accId) + ' voltou ao rodízio (prazo cumprido e a Meta diz conectado)');
+    return false;
+  } catch (_) { return false; }
+}
+// Por qual número o ramo i do rodízio envia: a opção pode ter o número nela; senão é o do primeiro "Enviar
+// mensagem" do caminho (rodízio → etiquetas → modelo). null = não dá para saber (não pula).
+async function _rrContaDoRamo(rrNodeId, i) {
+  try {
+    const eds = await _edgesFrom(rrNodeId);
+    let id = ((eds || []).find(x => String(x.label) === String(i)) || {}).to_node_id;
+    for (let p = 0; p < 8 && id; p++) {
+      const { data: n } = await supabase.from('bot_nodes').select('id, type, config').eq('id', id).maybeSingle();
+      if (!n) return null;
+      if (n.type === 'message') return (n.config && n.config.account_id) ? String(n.config.account_id) : null;
+      if (n.type === 'round_robin' || n.type === 'wait_reply' || n.type === 'end') return null;
+      const prox = await _edgesFrom(id);
+      id = ((prox || []).find(x => !x.label || x.label === 'default') || {}).to_node_id;
+    }
+  } catch (_) {}
+  return null;
+}
 const _falhasConta = new Map(); // owner|acct → [ms]
 const _falhasAvisado = new Map(); // owner|acct → ms do último aviso
 async function _vigiaFalha(owner, accountId) {
@@ -7579,7 +7651,7 @@ async function _vigiaFalha(owner, accountId) {
     try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', accountId).maybeSingle(); if (a) nome = a.phone_display || a.name || accountId; } catch (_) {}
     // regras de gotejamento cujo bot da etapa de destino envia por este número
     const pausaMin = Math.max(0, parseInt(process.env.FALHAS_PAUSA_MIN || '120', 10) || 0);
-    const pausadas = [];
+    const pausadas = [], seguem = []; let foraDoRodizio = false;
     if (pausaMin > 0) {
       try {
         const regras = _dripRegras(owner).filter(r => (r.manual || r.agendado) && r.para);
@@ -7603,13 +7675,62 @@ async function _vigiaFalha(owner, accountId) {
             }
             for (const n of (nos || [])) if (n.config && String(n.config.account_id || '') === String(accountId) && (!alcanca[n.bot_id] || alcanca[n.bot_id].has(n.id))) { const b = (bots || []).find(x => x.id === n.bot_id); if (b) usa.add(String(b.trigger_stage_id)); }
           }
+          // (v436) dá para DESVIAR? O bot da etapa usa este número só como ramo de um rodízio que tem outro número
+          // saudável → o número sai do rodízio e a regra SEGUE. Senão (sem rodízio, número fixo num passo, bot com o
+          // número no cadastro, ou nenhum outro número de pé) → a regra para, como antes.
+          const desvia = new Set();
+          if (_falhasModo(owner) === 'numero' && ids.length) {
+            try {
+              const { data: nosT } = await supabase.from('bot_nodes').select('id, bot_id, type, config').in('bot_id', ids);
+              let ligsT = []; try { const { data: e } = await supabase.from('bot_edges').select('bot_id, from_node_id, to_node_id, label').in('bot_id', ids); ligsT = e || []; } catch (_) {}
+              const foraHoje = _numPausados(owner);
+              const porEtapa = {};
+              for (const b of (bots || [])) {
+                const et = String(b.trigger_stage_id); if (!usa.has(et)) continue;
+                const meus = (nosT || []).filter(n => n.bot_id === b.id);
+                const vis = new Set(), fila = meus.filter(n => n.type === 'start').map(n => n.id); const temIni = fila.length > 0;
+                while (fila.length) { const id = fila.shift(); if (vis.has(id)) continue; vis.add(id); ligsT.forEach(e => { if (e.from_node_id === id) fila.push(e.to_node_id); }); }
+                const noCaminho = n => !temIni || vis.has(n.id);
+                const usaEste = meus.filter(n => noCaminho(n) && n.type === 'message' && n.config && String(n.config.account_id || '') === String(accountId));
+                if (String(b.account_id || '') !== String(accountId) && !usaEste.length) continue; // este bot nem usa o número
+                // primeiro "Enviar mensagem" de cada ramo de cada rodízio no caminho
+                const cabecas = new Set(), contas = new Set();
+                meus.filter(n => noCaminho(n) && n.type === 'round_robin').forEach(rr => {
+                  ((rr.config && rr.config.branches) || []).forEach((br, i) => {
+                    let id = (ligsT.find(e => e.from_node_id === rr.id && String(e.label) === String(i)) || {}).to_node_id;
+                    for (let p = 0; p < 8 && id; p++) {
+                      const n = meus.find(x => x.id === id); if (!n) break;
+                      if (n.type === 'message') { if (n.config && n.config.account_id) { cabecas.add(n.id); contas.add(String(n.config.account_id)); } break; }
+                      if (n.type === 'round_robin' || n.type === 'wait_reply' || n.type === 'end') break;
+                      id = (ligsT.find(e => e.from_node_id === id && (!e.label || e.label === 'default')) || {}).to_node_id;
+                    }
+                  });
+                });
+                const outroDePe = [...contas].some(c => c !== String(accountId) && !(foraHoje[c] && Date.now() < (Date.parse(foraHoje[c].ate) || 0)));
+                const pode = String(b.account_id || '') !== String(accountId) && usaEste.length > 0 && usaEste.every(n => cabecas.has(n.id)) && outroDePe;
+                porEtapa[et] = (porEtapa[et] === undefined ? true : porEtapa[et]) && pode;
+              }
+              Object.keys(porEtapa).forEach(et => { if (porEtapa[et]) desvia.add(et); });
+            } catch (e) { console.error('vigia de falhas (rodízio):', e.message); }
+          }
+          if (desvia.size) {
+            const o = _numPausados(owner);
+            o[accountId] = { ate: new Date(agora + pausaMin * 60000).toISOString(), nome, desde: new Date(agora).toISOString() };
+            await _numPausadosSalva(owner, o);
+            foraDoRodizio = true;
+          }
           let mudou = false;
-          for (const r of regras) if (usa.has(String(r.para))) { r.parado_ate = new Date(agora + pausaMin * 60000).toISOString(); if (r.manual) { r.manual = false; r._desligarManual = true; } pausadas.push(r.nome || r.id); mudou = true; }
+          for (const r of regras) if (usa.has(String(r.para))) {
+            if (desvia.has(String(r.para))) { seguem.push(r.nome || r.id); continue; } // a regra segue com os outros números
+            r.parado_ate = new Date(agora + pausaMin * 60000).toISOString(); if (r.manual) { r.manual = false; r._desligarManual = true; } pausadas.push(r.nome || r.id); mudou = true;
+          }
           if (mudou) { const todas = _dripRegras(owner); for (const r of regras) { const a = todas.find(x => x.id === r.id); if (a) { a.parado_ate = r.parado_ate; if (r._desligarManual) a.manual = false; } } await _dripSalva(owner, todas); }
         }
       } catch (e) { console.error('vigia de falhas (gotejamento):', e.message); }
     }
-    const txt = 'O número "' + nome + '" teve ' + l.length + ' falhas de envio na última hora.' + (pausadas.length ? ' O gotejamento ' + pausadas.map(n => '"' + n + '"').join(', ') + ' ficou PARADO por ' + (pausaMin >= 60 ? Math.round(pausaMin / 60) + ' h' : pausaMin + ' min') + ' — confira o número em Config ▸ Diagnóstico ▸ Saúde e toque ▶ para retomar.' : ' Confira o número em Config ▸ Diagnóstico ▸ Saúde.');
+    const _por = pausaMin >= 60 ? Math.round(pausaMin / 60) + ' h' : pausaMin + ' min';
+    const _txtFora = foraDoRodizio ? ' Ele ficou FORA DO RODÍZIO por ' + _por + ' — o gotejamento ' + seguem.map(n => '"' + n + '"').join(', ') + ' continua com os outros números. Para devolver antes: Automação ▸ Gotejamento ▸ "Devolver ao rodízio".' : '';
+    const txt = 'O número "' + nome + '" teve ' + l.length + ' falhas de envio na última hora.' + _txtFora + (foraDoRodizio && !pausadas.length ? '' : pausadas.length ? ' O gotejamento ' + pausadas.map(n => '"' + n + '"').join(', ') + ' ficou PARADO por ' + (pausaMin >= 60 ? Math.round(pausaMin / 60) + ' h' : pausaMin + ' min') + ' — confira o número em Config ▸ Diagnóstico ▸ Saúde e toque ▶ para retomar.' : ' Confira o número em Config ▸ Diagnóstico ▸ Saúde.');
     await addNotice(owner, txt, 'falhas:' + accountId, { tipo: 'erro', alvo: 'contas' });
   } catch (e) { console.error('vigia de falhas:', e.message); }
 }
@@ -8729,6 +8850,23 @@ async function processNode(run, depth=0) {
         await supabase.from('settings').upsert({ key, value: String(idx + 1), updated_at: new Date().toISOString() });
       }
       branchIdx = idx % branches.length;
+      // ⏸ (v436) número FORA DO RODÍZIO (muitas falhas): este lead vai pelo próximo ramo saudável. Só olha quando há
+      // algum número fora (no dia a dia não custa nada). Todos fora = segue o ramo sorteado, como sempre.
+      try {
+        if (branches.length > 1 && Object.keys(_numPausados(OW)).length) {
+          // reparte IGUAL entre os ramos de pé (antes a vez do número fora caía sempre no seguinte, que ficava com o dobro)
+          const dePe = [];
+          for (let i = 0; i < branches.length; i++) {
+            const conta = (branches[i] && branches[i].account_id) ? String(branches[i].account_id) : await _rrContaDoRamo(nodeId, i);
+            if (!conta || !(await _numFora(OW, conta))) dePe.push(i);
+          }
+          if (dePe.length && dePe.length < branches.length) {
+            const novo = dePe[idx % dePe.length];
+            if (novo !== branchIdx) console.log('Rodízio: número do ramo ' + branchIdx + ' está fora do rodízio — lead ' + phone + ' foi pelo ramo ' + novo);
+            branchIdx = novo;
+          }
+        }
+      } catch (e) { console.error('rodízio (número fora):', e.message); }
       const accId = branches[branchIdx]?.account_id;
       if (accId) {
         chosen = accId;
@@ -11978,6 +12116,7 @@ const CHAVES_POR_CONTA = new Set([
   'ia_sug_on', 'ia_sug_model', // sugestões de resposta por IA (cartão acima do campo)
   'ia_bancos', 'ia_fones_teste', // IA: bancos para onde ela porta hoje; números de teste
   'ia_fichas', // (v421) IA: fichas de formalização por banco × convênio (SIAPE/INSS)
+  'num_pausados', 'falhas_modo', // (v436) números fora do rodízio por muitas falhas; o que fazer nas 5 falhas
 ]);
 function _cfg(key, owner) {
   const own = owner || ' ';
@@ -14942,4 +15081,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
