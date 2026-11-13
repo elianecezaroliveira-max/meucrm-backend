@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 444;
+const SERVER_VER = 445;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -10630,19 +10630,24 @@ async function _iaTranscreveSePrecisar(m) {
 // 📷📄 (v423) A IA LÊ a FOTO e o DOCUMENTO que o lead mandou. Ela (06/11): "Quero que a IA leia fotos e documentos".
 // O que a IA viu fica guardado em messages.transcript (como o áudio) — lê uma vez só, por mensagem.
 // Precisa de OPENAI_API_KEY (foto e PDF) ou GEMINI_API_KEY (só foto); sem as duas, segue como antes ("(imagem)").
-const _iaVistos = new Map();
+const _iaVistos = new Map(); const _iaVendo = new Set();
 function _iaProvedorVisao() {
   if (process.env.OPENAI_API_KEY) return { nome: 'openai', url: 'https://api.openai.com/v1/chat/completions', chave: process.env.OPENAI_API_KEY, model: process.env.IA_VISAO_MODELO || 'gpt-4o-mini', pdf: true };
   if (process.env.GEMINI_API_KEY) return { nome: 'gemini', url: IA_PROVEDORES.gemini.url, chave: process.env.GEMINI_API_KEY, model: process.env.IA_VISAO_MODELO || 'gemini-3.5-flash', pdf: false };
   return null;
 }
 const _IA_VISAO_INSTR = 'Você lê o que um cliente de crédito consignado mandou pelo WhatsApp para a correspondente bancária. Responda em português, em até 400 caracteres, dizendo O QUE É (extrato de consignação, contracheque, documento com foto, comprovante, print de aplicativo, foto comum…) e os DADOS ÚTEIS que aparecem: nome, banco(s), parcelas e valores, margem, situação do contrato, datas, matrícula ou benefício (só os 4 últimos dígitos). Só o que está escrito; sem opinião e sem conselho. Se estiver ilegível, diga o que dá para ver.';
-async function _iaVeMidia(prov, bytes, mime, nome, ehDoc) {
+// 📷 (v445) Ela (13/11): "A IA lê os documentos que mando para o cliente? … a simulação que eu envio é em foto — nesse
+// exemplo é uma proposta de portar a parcela que está na CAIXA para o Paraná Banco, liberando R$ 5.869,35; R$ 913,30 é
+// o valor da parcela". Não lia: só o que o LEAD mandava. Agora lê também o que ELA envia, sabendo ler a simulação.
+const _IA_VISAO_INSTR_MINHA = 'Você lê o que a correspondente bancária (crédito consignado) ENVIOU ao cliente pelo WhatsApp. Responda em português, em até 400 caracteres, dizendo O QUE É (simulação/proposta de portabilidade e refinanciamento, comprovante, contrato, tabela, print de sistema, foto comum…) e os DADOS que aparecem, copiando os valores exatamente como estão. Numa SIMULAÇÃO de portabilidade: "Portabilidade para o …" é o banco de DESTINO; cada linha abaixo é um contrato que será portado — a sigla/nome é o banco de ORIGEM (CEF = Caixa, BB = Banco do Brasil…) e o valor ao lado é a PARCELA desse contrato; "o prazo volta para" é o novo prazo (ex.: 120x); "LIBERANDO APROX." é o valor que o cliente RECEBE na conta (troco). Escreva nesse formato: "Simulação enviada ao cliente: portabilidade da parcela de R$ … (banco de origem) para o (banco de destino), prazo …x, liberando aprox. R$ …". Só o que está escrito; sem opinião. Se estiver ilegível, diga o que dá para ver.';
+const IA_VISAO_ESPERA_MS = parseInt(process.env.IA_VISAO_ESPERA_MS || '7000', 10);
+async function _iaVeMidia(prov, bytes, mime, nome, ehDoc, minha) {
   const b64 = Buffer.from(bytes).toString('base64');
   let parte;
   if (ehDoc) { if (!prov.pdf || mime !== 'application/pdf') return ''; parte = { type: 'file', file: { filename: nome || 'documento.pdf', file_data: 'data:application/pdf;base64,' + b64 } }; }
   else parte = { type: 'image_url', image_url: { url: 'data:' + (mime || 'image/jpeg') + ';base64,' + b64 } };
-  const body = { model: prov.model, messages: [{ role: 'system', content: _IA_VISAO_INSTR }, { role: 'user', content: [{ type: 'text', text: 'O que o cliente mandou' + (nome ? ' ("' + nome + '")' : '') + '?' }, parte] }], max_tokens: 300, temperature: 0.2 };
+  const body = { model: prov.model, messages: [{ role: 'system', content: minha ? _IA_VISAO_INSTR_MINHA : _IA_VISAO_INSTR }, { role: 'user', content: [{ type: 'text', text: (minha ? 'O que a correspondente enviou ao cliente' : 'O que o cliente mandou') + (nome ? ' ("' + nome + '")' : '') + '?' }, parte] }], max_tokens: 300, temperature: 0.2 };
   const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.chave, 'Content-Type': 'application/json' }, timeout: 45000 });
   return String((r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content) || '').replace(/\s+/g, ' ').trim().slice(0, 600);
 }
@@ -10657,15 +10662,18 @@ async function _iaDescreveMidiaSePrecisar(m) {
   const k = String(m.id);
   if (_iaVistos.has(k)) { m.transcript = _iaVistos.get(k); return m.transcript; }
   const prov = _iaProvedorVisao(); if (!prov) return '';
+  if (_iaVendo.has(k)) return ''; // (v445) já está sendo lida por outra sugestão: não paga duas vezes
+  _iaVendo.add(k);
   try {
     const bytes = await _bytesDaMidia(m);
     if (!bytes || bytes.length > 8 * 1024 * 1024) { _iaVistos.set(k, ''); return ''; } // (acima de 8 MB fica de fora)
-    const texto = await _iaVeMidia(prov, bytes, mime || (ehImg ? 'image/jpeg' : 'application/pdf'), String(m.media_name || m.content || ''), ehDoc && !ehImg);
+    const texto = await _iaVeMidia(prov, bytes, mime || (ehImg ? 'image/jpeg' : 'application/pdf'), String(m.media_name || m.content || ''), ehDoc && !ehImg, m.direction === 'outbound');
     _iaVistos.set(k, texto || '');
     if (_iaVistos.size > 500) _iaVistos.delete(_iaVistos.keys().next().value);
     if (texto) { m.transcript = texto; try { await supabase.from('messages').update({ transcript: texto }).eq('id', m.id).select('id, phone'); } catch (_) {} }
     return texto || '';
   } catch (e) { console.warn('IA: leitura de foto/documento falhou:', (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message); _iaVistos.set(k, ''); return ''; }
+  finally { _iaVendo.delete(k); }
 }
 // ⚡🤖 O que ela já tem pronto: respostas rápidas (settings quick_replies::dona) e bots ativos
 const _iaCatCache = {};
@@ -10945,6 +10953,15 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const doLead = [];
   for (let i = msgs.length - 1; i >= 0 && msgs[i].direction !== 'outbound'; i--) doLead.unshift(msgs[i]);
   for (const m of doLead.slice(-3)) { await _iaTranscreveSePrecisar(m); await _iaDescreveMidiaSePrecisar(m); } // os últimos áudios do lead viram texto; fotos/documentos viram descrição (v423)
+  // 📷 (v445) (a) o que a IA já leu nesta conversa continua valendo nas mensagens de antes (fica na memória do servidor:
+  // o banco dela não tem a coluna transcript); (b) as 2 últimas fotos/PDFs que ELA enviou (a simulação) também são
+  // lidas — uma vez cada; a sugestão espera pouco por isso e, se demorar, a leitura termina em segundo plano
+  if (!treino) {
+    const _ehArq = (m) => /^(image|document)$/.test(String(m.type || ''));
+    for (const m of msgs) { if (!m.transcript && _ehArq(m)) { const v = _iaVistos.get(String(m.id)); if (v) m.transcript = v; } }
+    const _minhasMidias = msgs.slice(-16).filter(m => m.direction === 'outbound' && _ehArq(m) && m.media_id && !m.transcript && !_iaVistos.has(String(m.id))).slice(-2);
+    if (_minhasMidias.length) await Promise.race([Promise.all(_minhasMidias.map(m => _iaDescreveMidiaSePrecisar(m).catch(() => ''))), new Promise(r => setTimeout(r, IA_VISAO_ESPERA_MS))]);
+  }
   const textoLead = doLead.map(m => m.transcript && /^(audio|image|document)$/.test(String(m.type || '')) ? m.transcript : (m.content || '')).join(' ');
   // 6 exemplos (eram 8) e conversa mais curta: o plano grátis da Groq limita tokens por minuto
   // contexto ATUAL: o que veio antes da fala do lead (sobretudo o que EU disse por último)
@@ -11017,6 +11034,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, foto ou documento, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
     + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
     + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]"/"{link}" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
+    + '- Quando uma linha MINHA ("Eu: …") traz uma imagem ou documento com a leitura da IA entre parênteses, isso é o que EU JÁ ENVIEI ao lead. Se for uma SIMULAÇÃO, aqueles são os números da proposta já apresentada (banco de destino, parcela que será portada, prazo e valor liberado): use-os para responder as dúvidas do lead sobre a proposta, sem mudar nenhum número e sem pedir de novo o que já está nela.\n'
     + '- NUNCA escreva link/endereço nenhum (http, www, id.unico…): o link de aceite é gerado por ela em outro sistema e é único por cliente. Quando o passo é enviar um aceite, sugira só o aviso ("Vou digitar a proposta e já te envio aqui o aceite 🙌🏼" / "{nome}, segue aceite:") — nunca o bloco do aceite com link.\n'
     + '- CADA CLIENTE É ÚNICO e cada dia da operação é uma fase diferente (o processo leva cerca de 7 dias úteis). Antes de sugerir, leia a conversa INTEIRA com as datas: veja o que já foi feito, quantos dias úteis se passaram desde a última etapa e em que fase este cliente está HOJE.\n'
     + '- Nunca peça de novo algo que o lead já mandou, nem repita uma etapa já concluída, nem antecipe uma etapa que ainda não chegou. Se o prazo que ela deu já venceu, a resposta tem de reconhecer isso.\n'
