@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 443;
+const SERVER_VER = 444;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -1696,6 +1696,7 @@ app.get("/accounts", async (req, res) => {
   // Status de conexão: QR = tempo real (estado do motor embutido); API = checagem com cache
   const out = await Promise.all((data || []).map(async acc => {
     let status = 'unknown';
+    if (_ehInstPC(acc.evolution_instance)) return { ...acc, pc: true, status: 'connected', assistente_aberto: _pcVivo(req.owner) }; // 💻 (v444) WhatsApp do PC
     if (acc.evolution_instance) {
       // Sem meio-termo: ou está conectada, ou está DESCONECTADA (o "conectando"
       // eterno das re-tentativas confundia — melhor avisar que caiu)
@@ -2664,6 +2665,134 @@ app.use(['/send', '/send-media', '/send-template', '/send-location', '/send-cont
     return res.status(409).json({ silencio: true, ate: new Date(sil.ate).toISOString(), ate_txt: sil.ate_txt, error: 'O número ' + (nome ? '"' + nome + '" ' : '') + 'está em "não perturbe" até ' + sil.ate_txt + '.' });
   } catch (_) { return next(); }
 });
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// 💻 WHATSAPP DO PC NO FILAZ (v444) — ela (13/11): "Eu quero que apenas coloque o assistente do FILAZ no FILAZ. Para
+// que se misture com as conversas que eu tenho no FILAZ. Eu sei que vai ser o meu WhatsApp que está instalado no meu
+// PC. Eu queria poder olhar pelo FILAZ mesmo, o oficial." (todas as conversas; responder pelo FILAZ também)
+//   • O FILAZ Assistente (no PC dela) LÊ a conversa aberta no WhatsApp do Windows e manda para cá (POST /pc/espelho):
+//     as mensagens entram na conversa do lead (pelo telefone; contato sem telefone visível ganha um número interno
+//     que começa com 0000) com a conta "PC" — uma conta do tipo QR de mentira (instância "pc-…"), para o app tratar
+//     como número sem janela de 24h e sem modelos. Sem aviso no celular, sem bot, sem mexer em não lidas.
+//   • Responder pelo FILAZ: o /send dessa conta NÃO fala com a Meta — põe a mensagem numa fila que o assistente busca
+//     (GET /pc/saida, só memória: não gasta banco) e cola+envia no WhatsApp do PC SE a conversa aberta lá for a
+//     mesma; depois confirma (POST /pc/saida/feito). Sem assistente aberto ou sem a conversa aberta em 90 s = falha
+//     com o motivo na bolha.
+//   • A IA fica de fora dessas conversas (ela tirou a IA do número pessoal em 06/11).
+const _pcInst = (owner) => 'pc-' + require('crypto').createHash('sha1').update(String(owner || '')).digest('hex').slice(0, 12);
+const _ehInstPC = (inst) => /^pc-[0-9a-f]{12}$/.test(String(inst || ''));
+const _pcContaId = {};          // dono → id da conta "PC"
+const _pcEhConta = new Map();   // id de conta → é a conta do PC?
+async function _pcConta(owner, criar) {
+  if (!supabase || !owner) return null;
+  if (_pcContaId[owner]) return _pcContaId[owner];
+  const inst = _pcInst(owner);
+  try { const { data } = await supabase.from('accounts').select('id').eq('owner', owner).eq('evolution_instance', inst).maybeSingle(); if (data && data.id) { _pcEhConta.set(String(data.id), true); return (_pcContaId[owner] = data.id); } } catch (_) {}
+  if (!criar) return null;
+  const { data: nova, error } = await supabase.from('accounts').insert({ name: 'PC', type: 'evolution', evolution_instance: inst, phone_display: 'WhatsApp do PC', phone_number_id: inst, token: '', owner }).select('id').single();
+  if (error || !nova) throw new Error('não consegui criar a conta do WhatsApp do PC: ' + ((error && error.message) || 'sem resposta'));
+  _pcEhConta.set(String(nova.id), true);
+  return (_pcContaId[owner] = nova.id);
+}
+async function _ehContaPC(accountId) {
+  const k = String(accountId || ''); if (!k || !supabase) return false;
+  if (_pcEhConta.has(k)) return _pcEhConta.get(k);
+  let eh = false;
+  try { const { data } = await supabase.from('accounts').select('evolution_instance').eq('id', accountId).maybeSingle(); eh = !!(data && _ehInstPC(data.evolution_instance)); } catch (_) { return false; }
+  _pcEhConta.set(k, eh); return eh;
+}
+// nome da conversa no WhatsApp do PC de cada telefone (é por ele que o assistente confere a conversa antes de enviar)
+const _pcNomes = {}; // dono → { fone: nome }
+const _pcNomesK = (owner) => 'pc_nomes::' + (owner || ' ');
+async function _pcNomesDe(owner) {
+  if (_pcNomes[owner]) return _pcNomes[owner];
+  let v = {};
+  try { const { data } = await supabase.from('settings').select('value').eq('key', _pcNomesK(owner)).maybeSingle(); v = (data && data.value) ? JSON.parse(data.value) : {}; } catch (_) {}
+  return (_pcNomes[owner] = (v && typeof v === 'object') ? v : {});
+}
+async function _pcNomeGuarda(owner, fone, nome) {
+  const m = await _pcNomesDe(owner);
+  if (m[fone] === nome) return;
+  m[fone] = nome;
+  try { await supabase.from('settings').upsert({ key: _pcNomesK(owner), value: JSON.stringify(m), updated_at: new Date().toISOString() }, { onConflict: 'key' }); } catch (_) {}
+}
+// contato do WhatsApp sem telefone visível (só o nome salvo): número interno, estável, que não é telefone de verdade
+const _pcFoneInterno = (owner, nome) => '0000' + (parseInt(require('crypto').createHash('sha1').update(String(owner || '') + '|' + String(nome || '').trim().toLowerCase()).digest('hex').slice(0, 12), 16) % 1e12).toString().padStart(12, '0');
+const _pcFila = new Map();   // dono → [{ id, phone, nome, texto, em }]
+const _pcVisto = {};         // dono → quando o assistente buscou a fila pela última vez
+const _pcVivo = (owner) => (Date.now() - (_pcVisto[owner] || 0)) < 20000;
+const PC_ESPERA_MS = parseInt(process.env.PC_ESPERA_MS || '90000', 10);
+async function _pcFalha(owner, item, motivo) {
+  const l = _pcFila.get(owner) || []; const i = l.findIndex(x => x.id === item.id); if (i < 0) return false;
+  l.splice(i, 1);
+  try { await supabase.from('messages').update({ status: 'failed', error_info: motivo }).eq('wamid', item.id).eq('owner', owner); } catch (_) {}
+  try { await supabase.from('contacts').update({ last_message_status: 'failed' }).eq('phone', item.phone).eq('owner', owner).eq('last_message_direction', 'outbound'); } catch (_) {}
+  return true;
+}
+// POST /pc/espelho { nome, fone?, mensagens:[{ k, quem:'eu'|'lead', texto, ts, st? }] } — só o que o assistente leu na tela
+app.post('/pc/espelho', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  try {
+    const b = req.body || {}; const owner = req.owner;
+    const nome = String(b.nome || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!nome) return res.status(400).json({ error: 'sem o nome da conversa' });
+    const dig = String(b.fone || '').replace(/\D/g, '');
+    let phone = dig.length >= 10 ? await resolveExistingPhone(dig, owner) : _pcFoneInterno(owner, nome);
+    const conta = await _pcConta(owner, true);
+    const sha = (t) => require('crypto').createHash('sha1').update(t).digest('hex').slice(0, 28);
+    const msgs = [].concat(b.mensagens || []).slice(-80).map(m => {
+      const texto = String((m && m.texto) || '').slice(0, 4096); const ts = new Date((m && m.ts) || '');
+      if (!texto.trim() || isNaN(ts) || !m.k || (m.quem !== 'eu' && m.quem !== 'lead')) return null;
+      if (ts.getTime() > Date.now() + 10 * 60000) return null; // nada no futuro
+      return { wamid: 'pc:' + sha(owner + '|' + phone + '|' + String(m.k)), direction: m.quem === 'eu' ? 'outbound' : 'inbound', content: texto, ts: ts.toISOString(), st: m.st === 'lida' ? 'read' : m.st === 'entregue' ? 'delivered' : 'sent' };
+    }).filter(Boolean);
+    await _pcNomeGuarda(owner, phone, nome);
+    if (!msgs.length) return res.json({ ok: true, phone, novos: 0 });
+    const { data: ja } = await supabase.from('messages').select('wamid').eq('owner', owner).in('wamid', msgs.map(m => m.wamid));
+    const tem = new Set((ja || []).map(x => x.wamid));
+    let novas = msgs.filter(m => !tem.has(m.wamid));
+    // o que ELA enviou pelo FILAZ (fila do PC) aparece depois na tela do WhatsApp: é a MESMA mensagem — casa em vez de duplicar
+    if (novas.some(m => m.direction === 'outbound')) {
+      const { data: enviadas } = await supabase.from('messages').select('id, wamid, content, timestamp').eq('owner', owner).eq('phone', phone).eq('direction', 'outbound').eq('account_id', conta).order('timestamp', { ascending: false }).limit(40);
+      const livres = (enviadas || []).filter(x => /^pcenv:/.test(String(x.wamid || '')));
+      for (const m of novas.filter(x => x.direction === 'outbound')) {
+        const i = livres.findIndex(x => String(x.content || '').trim() === m.content.trim() && Math.abs(new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(x.timestamp)) ? x.timestamp : String(x.timestamp) + 'Z').getTime() - new Date(m.ts).getTime()) < 30 * 60000);
+        if (i < 0) continue;
+        const alvo = livres.splice(i, 1)[0]; m.casada = true;
+        try { await supabase.from('messages').update({ wamid: m.wamid, status: m.st }).eq('id', alvo.id); } catch (_) {}
+      }
+      novas = novas.filter(m => !m.casada);
+    }
+    if (novas.length) {
+      const { error: eIns } = await supabase.from('messages').insert(novas.map(m => ({ phone, content: m.content, type: 'text', direction: m.direction, timestamp: m.ts, account_id: conta, status: m.direction === 'outbound' ? m.st : null, wamid: m.wamid, owner })));
+      if (eIns) return res.status(500).json({ error: eIns.message });
+      const ult = novas.reduce((a, m) => (!a || m.ts >= a.ts) ? m : a, null);
+      const { data: c } = await supabase.from('contacts').select('phone, last_message_at').eq('phone', phone).eq('owner', owner).maybeSingle();
+      const previa = ult.content.length > 80 ? ult.content.substring(0, 80) + '…' : ult.content;
+      if (!c) await supabase.from('contacts').upsert({ phone, name: nome, owner, account_id: conta, last_message_at: ult.ts, last_message_preview: previa, last_message_direction: ult.direction, last_message_status: ult.direction === 'outbound' ? ult.st : null }, { onConflict: 'owner,phone' });
+      else if (!c.last_message_at || new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(c.last_message_at)) ? c.last_message_at : String(c.last_message_at) + 'Z').getTime() <= new Date(ult.ts).getTime())
+        await supabase.from('contacts').update({ last_message_at: ult.ts, last_message_preview: previa, last_message_direction: ult.direction, last_message_status: ult.direction === 'outbound' ? ult.st : null }).eq('phone', phone).eq('owner', owner);
+    }
+    res.json({ ok: true, phone, novos: novas.length });
+  } catch (e) { console.error('PC espelho:', e.message); res.status(500).json({ error: e.message }); }
+});
+// GET /pc/saida — o assistente busca o que ela mandou pelo FILAZ para sair pelo WhatsApp do PC (só memória)
+app.get('/pc/saida', (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  _pcVisto[req.owner] = Date.now();
+  res.json({ fila: (_pcFila.get(req.owner) || []).map(x => ({ id: x.id, nome: x.nome, texto: x.texto, ha_s: Math.round((Date.now() - x.em) / 1000) })) });
+});
+// POST /pc/saida/feito { id, ok, erro? } — o assistente enviou (ou não conseguiu)
+app.post('/pc/saida/feito', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const b = req.body || {}; const l = _pcFila.get(req.owner) || []; const item = l.find(x => x.id === String(b.id || ''));
+  if (!item) return res.json({ ok: true, ja: true });
+  if (!b.ok) { await _pcFalha(req.owner, item, String(b.erro || 'O assistente não conseguiu enviar pelo WhatsApp do PC.').slice(0, 300)); return res.json({ ok: true }); }
+  l.splice(l.indexOf(item), 1);
+  try { await supabase.from('messages').update({ status: 'sent' }).eq('wamid', item.id).eq('owner', req.owner); } catch (_) {}
+  try { await _previaEnviada(req.owner, item.phone, 'sent', req); } catch (_) {}
+  res.json({ ok: true });
+});
 app.post("/send", async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   if (_planoBarra(req, res)) return;
@@ -2701,6 +2830,26 @@ app.post("/send", async (req, res) => {
     if (phoneNumberId && token) {
       console.log("Conta não encontrada no banco — usando credenciais das variáveis de ambiente");
     }
+  }
+
+  // 💻 (v444) conta "PC": vai para a fila do FILAZ Assistente, que cola e envia no WhatsApp instalado no PC dela
+  if (_ehInstPC(evolutionInstance)) {
+    try {
+      const nomePC = (await _pcNomesDe(req.owner))[to];
+      if (!nomePC) return res.status(400).json({ error: 'Abra esta conversa no WhatsApp do PC uma vez, com o FILAZ Assistente aberto, para poder responder por aqui.' });
+      if (!_pcVivo(req.owner)) return res.status(400).json({ error: 'O FILAZ Assistente não está aberto no PC. Abra o assistente para enviar pelo WhatsApp do PC.' });
+      const wamid = 'pcenv:' + require('crypto').randomBytes(10).toString('hex');
+      const preview = message.length > 80 ? message.substring(0, 80) + '…' : message;
+      await supabase.from('contacts').upsert({ phone: to, last_message_at: new Date().toISOString(), account_id: account_id, last_message_preview: preview, last_message_direction: 'outbound', last_message_status: null, owner: req.owner || null }, { onConflict: 'owner,phone' });
+      await supabase.from('messages').insert(await _comAutor({ phone: to, content: message, type: 'text', direction: 'outbound', timestamp: new Date().toISOString(), account_id: account_id, status: 'pending', wamid, owner: req.owner || null }, req));
+      const item = { id: wamid, phone: to, nome: nomePC, texto: message, em: Date.now() };
+      if (!_pcFila.has(req.owner)) _pcFila.set(req.owner, []);
+      _pcFila.get(req.owner).push(item);
+      const _dono = req.owner;
+      setTimeout(() => { _pcFalha(_dono, item, 'Não saiu: a conversa de "' + nomePC + '" não estava aberta no WhatsApp do PC. Abra a conversa lá e envie de novo.').catch(() => {}); }, PC_ESPERA_MS);
+      await _previaEnviada(req.owner, to, 'pending', req);
+      return res.json({ success: true, via: 'pc' });
+    } catch (e) { console.error('PC envio:', e.message); return res.status(500).json({ error: 'Falha ao pôr na fila do WhatsApp do PC: ' + e.message }); }
   }
 
   // 3. Envio via Evolution API (QR Code)
@@ -10769,6 +10918,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const antigas = todas.slice(0, Math.max(0, todas.length - RECENTES));
   if (!msgs.length) return { mensagens: [], motivo: 'sem conversa' };
   const ult = msgs[msgs.length - 1];
+  if (!treino && ult.account_id && await _ehContaPC(ult.account_id)) return { mensagens: [], definitivo: true, motivo: 'conversa do WhatsApp do PC — a IA fica de fora do número pessoal' }; // 💻 (v444)
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
   const c = _iaSugCache[chave];
   if (c && !forcar && !treino && Date.now() - c.t < 10 * 60000) return c.r;
@@ -11399,9 +11549,11 @@ async function _iaVarreRespostas() {
   const agora = Date.now();
   const desde = _iaVarridoAte || (agora - 30 * 60000);
   // 💸 só o que chegou desde a última varredura (com folga de 5 min) — não as 300 últimas sempre
-  const { data: brutas } = await supabase.from('messages').select('id, phone, direction, type, content, timestamp')
+  let { data: brutas } = await supabase.from('messages').select('id, phone, direction, type, content, timestamp, account_id')
     .eq('owner', owner || ' ').gte('timestamp', new Date(desde - 5 * 60000).toISOString())
     .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(300);
+  // 💻 (v444) o que veio do WhatsApp do PC (número pessoal) não ensina a IA
+  { const _pcs = new Set(); for (const id of new Set((brutas || []).map(m => m && m.account_id).filter(Boolean))) if (await _ehContaPC(id)) _pcs.add(String(id)); if (_pcs.size) brutas = (brutas || []).filter(m => !_pcs.has(String(m.account_id))); }
   const quando = (ts) => { const d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(ts)) ? ts : String(ts) + 'Z'); return isNaN(d) ? 0 : d.getTime(); };
   const porFone = new Map();
   for (const m of (brutas || [])) { if (!m || m.type === 'note') continue; if (!porFone.has(m.phone)) porFone.set(m.phone, []); porFone.get(m.phone).push(m); }
@@ -14726,6 +14878,7 @@ async function waFetchAvatar(instanceName, phone, owner) {
 
 async function waSendText(instanceName, to, text, quoted) {
   const sock = _waSocks[instanceName];
+  if (_ehInstPC(instanceName)) throw new Error('Pelo WhatsApp do PC, por enquanto só dá para enviar TEXTO por aqui — foto, áudio e arquivo: envie direto no WhatsApp.'); // 💻 (v444)
   if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
   const jid = await waResolveJid(sock, to);
   // Com citação: se o WhatsApp recusar a mensagem citada (muito antiga, apagada),
@@ -14739,6 +14892,7 @@ async function waSendText(instanceName, to, text, quoted) {
 // Envio de conteúdo especial pelo QR (localização, contato, enquete, revogação…)
 async function waSendRaw(instanceName, to, payload) {
   const sock = _waSocks[instanceName];
+  if (_ehInstPC(instanceName)) throw new Error('Pelo WhatsApp do PC, por enquanto só dá para enviar TEXTO por aqui — foto, áudio e arquivo: envie direto no WhatsApp.'); // 💻 (v444)
   if (!sock || _waState[instanceName] !== 'open') throw new Error('WhatsApp desconectado — gere o QR novamente em Contas');
   const jid = await waResolveJid(sock, to);
   return await sock.sendMessage(jid, payload);
@@ -14755,7 +14909,7 @@ async function initEmbeddedWa() {
   try {
     const { data } = await supabase.from('accounts').select('evolution_instance').eq('type', 'evolution');
     for (const a of data || []) {
-      if (!a.evolution_instance) continue;
+      if (!a.evolution_instance || _ehInstPC(a.evolution_instance)) continue; // 💻 conta do WhatsApp do PC não é QR
       waStart(a.evolution_instance).catch(e => console.error('WA boot:', a.evolution_instance, e.message));
       await new Promise(r => setTimeout(r, 1500));
     }
@@ -15321,4 +15475,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
