@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 439;
+const SERVER_VER = 441;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -10056,14 +10056,72 @@ function _iaMascara(t) {
 // (documento e áudio com transcrição CONTAM: "o lead mandou o extrato → hora de digitar" é contexto de
 //  verdade — ela: "Como que não ensina, olha o contexto". Figurinha/foto/vídeo sem texto seguem vazios.)
 const _iaFalaVazia = (linhas) => ![].concat(linhas || []).some(x => { const t = String(x || '').replace(/^Lead: /, '').trim(); if (!t) return false; if (/^\(?\[?(documento|document)\b/i.test(t)) return true; if (/^\(?\[?(áudio|audio)\b/i.test(t)) return /[:]\s*\S/.test(t); return !/^\(?\[?(figurinha|sticker|imagem|image|vídeo|video)\b/i.test(t) && !_iaEhMarcador(t); });
+// 🧹 (v440) Ela (11/11): "ela envia uma mensagem para um cliente sem sentido nenhum, se baseando em uma conversa que eu
+// tive com outro cliente". Na memória: 28 das 40 "novidades" eram de UM cliente ("Saldo será recebido na sexta, 13/11",
+// "O banco credor ainda não liberou a margem") e entravam em TODA sugestão — e o prompt dizia que a novidade vencia o
+// manual; 328 dos 1.581 exemplos traziam data/valor/dia de outro cliente. Correções:
+//  - novidade com cara de situação de UM cliente não entra (filtro aqui + o extrator pergunta "vale para um cliente
+//    que você nunca atendeu?"); a lista guardada é revisada uma vez pela IA (fica cópia em ia_mem::…::novidades_bkp)
+//  - exemplos vão MASCARADOS ([DATA]/[VALOR]/[DIA]) e rotulados como de OUTROS clientes
+//  - a resposta não pode trazer data (dd/mm) nem valor (R$) que não esteja NESTA conversa, nas notas ou no manual
+const _IA_NOV_DE_CLIENTE = /\b(o|a|do|da|ao|à) cliente\b|\b(saldo|valor|valores|cr[eé]dito|refinanciamento|portabilidade|anu[eê]ncia|margem)\b[^.;]{0,50}\b(ser[áa]|ficar[áa]|previst[oa]|previs[ãa]o|chega|chegar[áa]|cai|cair[áa]|tentar[áa]|liberou|foi suspensa|foi averbad)|\bainda n[ãa]o (liberou|chegou|caiu|averbou|creditou)\b/i;
+function _iaNovidadeGeral(t) { return !!String(t || '').trim() && !_IA_NOV_DE_CLIENTE.test(String(t)); }
+const _IA_DIAS_SEMANA = /\b(segunda|ter[çc]a|quarta|quinta|sexta)(-feira)?\b|\bs[áa]bado\b|\bdomingo\b|\bamanh[ãa]\b|\bhoje\b|\bontem\b/gi;
+// exemplo de OUTRO cliente: datas, valores e dias viram marcador (o jeito de escrever fica; a situação dele, não)
+function _iaMascaraExemplo(t) { return _iaMascara(String(t || '')).replace(_IA_DIAS_SEMANA, '[DIA]'); }
+// datas (dd/mm) e valores (R$) de uma frase, normalizados para comparar com a conversa
+function _iaFatos(t) {
+  const out = []; const x = String(t || '');
+  (x.match(/\b\d{1,2}\/\d{1,2}\b/g) || []).forEach(d => { const [a, b] = d.split('/'); out.push('d:' + (+a) + '/' + (+b)); });
+  (x.match(/R\$\s?\*?\d[\d.]*(?:,\d{1,2})?/g) || []).forEach(v => out.push('v:' + v.replace(/[^\d,]/g, '').replace(/,00$/, '')));
+  return out;
+}
+// 👋 (v441) Ela (13/11, print): o lead fechou com "Certo. Bom Final de semana" e a IA sugeriu repetir o que ela tinha
+// acabado de dizer ("Certo, Alrilides! O saldo está previsto para chegar na quarta-feira" + "Assim que recebermos…").
+// DESPEDIDA/AGRADECIMENTO do lead (sem pergunta, e sem ela ter perguntado nada antes) pede só UMA frase curta
+// retribuindo — nunca informação da operação de novo. Devolve null quando não é despedida.
+const _IA_FIM_PAL = new Set(('certo ok okay okk blz beleza ta tah bom boa tudo bem entendi entendido combinado fechado obrigado obrigada obg obgd brigado brigada valeu vlw agradeco agradecido agradecida grato grata deus abencoe te lhe amem dia tarde noite final fim de semana feriado descanso otimo otima ate mais logo amanha segunda terca quarta quinta sexta sabado domingo feira abraco abracos tchau igualmente pra para voce vc tambem tb tbm fico no aguardo aguardando perfeito maravilha show joia sim senhora senhor dona muito e a o um uma por enquanto isso so tranquilo tranquila pode deixar fica com que assim eu pela pelo atencao retorno informacao ai entao viu').split(' '));
+const _IA_FIM_SINAL = /\b(obrigad[oa]|obg|obgd|brigad[oa]|valeu|vlw|agradec\w+|grat[oa]|(final|fim) de semana|feriado|descanso|ate (mais|logo|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)|tchau|abracos?|deus (te |lhe )?abencoe|amem|fica com deus)\b/;
+function _iaEncerramento(textoLead, minhaUltima) {
+  const bruto = String(textoLead || ''); if (!bruto.trim() || /\?/.test(bruto)) return null;
+  if (/\?/.test(String(minhaUltima || ''))) return null; // ela tinha perguntado: "certo, obrigado" é RESPOSTA, não despedida
+  const t = bruto.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const pal = t.split(' ').filter(Boolean);
+  if (!pal.length || pal.length > 16 || pal.some(w => !_IA_FIM_PAL.has(w)) || !_IA_FIM_SINAL.test(t)) return null;
+  let devolve = '';
+  if (/(final|fim) de semana/.test(t)) devolve = 'bom final de semana';
+  else if (/feriado/.test(t)) devolve = 'bom feriado';
+  else if (/descanso/.test(t)) devolve = 'bom descanso';
+  else if (/boa noite/.test(t)) devolve = 'boa noite';
+  else if (/boa tarde/.test(t)) devolve = 'boa tarde';
+  else if (/bom dia/.test(t)) devolve = 'bom dia';
+  const deus = /deus (te |lhe )?abencoe|fica com deus/.test(t);
+  return { devolve, deus };
+}
 // ── Novidades (informações novas com data) e resumo da parte antiga da conversa ──
 const _iaNovK = (owner) => _iaMemK(owner, 'novidades');
+const _iaNovLimpas = new Set(); // (v440) dono cuja lista antiga já foi limpa nesta execução
 async function _iaNovidades(owner) {
-  try { const { data } = await supabase.from('settings').select('value').eq('key', _iaNovK(owner)).maybeSingle(); return _iaLinhasJsonl(data && data.value); } catch (_) { return []; }
+  let lista = [];
+  try { const { data } = await supabase.from('settings').select('value').eq('key', _iaNovK(owner)).maybeSingle(); lista = _iaLinhasJsonl(data && data.value); } catch (_) { return []; }
+  // 🧹 (v440) limpeza automática: o que é situação de UM cliente sai da lista (cópia do que estava em …novidades_bkp)
+  if (!_iaNovLimpas.has(owner)) {
+    _iaNovLimpas.add(owner);
+    const gerais = lista.filter(n => n && _iaNovidadeGeral(n.texto));
+    if (gerais.length < lista.length) {
+      try {
+        await supabase.from('settings').upsert({ key: _iaMemK(owner, 'novidades_bkp'), value: lista.map(o => JSON.stringify(o)).join('\n'), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+        await supabase.from('settings').upsert({ key: _iaNovK(owner), value: gerais.map(o => JSON.stringify(o)).join('\n'), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+        console.log('🧹 IA: ' + (lista.length - gerais.length) + ' novidade(s) de um cliente só tirada(s) da memória de ' + owner);
+      } catch (_) {}
+      lista = gerais;
+    }
+  }
+  return lista;
 }
 async function _iaNovidadesGrava(owner, lista) {
   const corte = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
-  const viva = lista.filter(n => n && n.texto && (n.em || '') >= corte).slice(-40); // 60 dias, no máximo 40
+  const viva = lista.filter(n => n && n.texto && (n.em || '') >= corte && _iaNovidadeGeral(n.texto)).slice(-40); // 60 dias, no máximo 40, só avisos gerais (v440)
   await supabase.from('settings').upsert({ key: _iaNovK(owner), value: viva.map(o => JSON.stringify(o)).join('\n'), updated_at: new Date().toISOString() }, { onConflict: 'key' });
   return viva;
 }
@@ -10084,12 +10142,13 @@ async function _iaExtraiNovidades(owner, textos) {
   if (Date.now() - _iaNovUltima < 10 * 60000) { _iaNovFila.push(...textos); return 0; } // junta e manda a cada 10 min
   const lote = _iaNovFila.splice(0).concat(textos).slice(-40);
   _iaNovUltima = Date.now();
-  const sys = 'Você lê mensagens que uma correspondente bancária (consignado SIAPE) enviou hoje aos clientes e extrai SÓ informações operacionais NOVAS e passageiras, que valem para todos os clientes nos próximos dias: banco fora do ar ou de volta, saldos/portabilidades suspensos ou liberados, prazo que mudou, sistema instável, regra nova, feriado, promoção. Ignore o que é rotina da operação, cortesia ou específico de um cliente (valor dele, parcela dele). Responda SOMENTE JSON: {"novidades":["frase curta e datável", ...]} — ou {"novidades":[]}.';
+  const sys = 'TESTE OBRIGATÓRIO para cada item: ele valeria IGUAL para um cliente que ela nunca atendeu? Se fala do saldo, do crédito, da margem, da averbação, da previsão ou do andamento de UMA operação (mesmo sem citar o nome), NÃO é novidade — é a situação daquele cliente; descarte. Só entra o que mudou para TODOS (banco parou ou voltou a portar, regra/taxa/produto novo do banco, sistema fora do ar, feriado que atrasa todos). Na dúvida, descarte. '
+    + 'Você lê mensagens que uma correspondente bancária (consignado SIAPE) enviou hoje aos clientes e extrai SÓ informações operacionais NOVAS e passageiras, que valem para todos os clientes nos próximos dias: banco fora do ar ou de volta, banco que suspendeu ou voltou a fazer portabilidade/refinanciamento para todos, prazo do banco que mudou para todos, sistema instável, regra nova, feriado, promoção. Ignore o que é rotina da operação, cortesia ou específico de um cliente (valor dele, parcela dele, saldo dele, previsão de crédito dele, margem dele, andamento da operação dele). Responda SOMENTE JSON: {"novidades":["frase curta e datável", ...]} — ou {"novidades":[]}.';
   const usr = 'Hoje é ' + _iaHoje() + '.\n\nMENSAGENS QUE ELA ENVIOU:\n' + lote.map(t => '- ' + String(t).slice(0, 300)).join('\n');
   try {
     const { texto } = await _iaChamaGroq(sys, usr, owner);
     const m = /\{[\s\S]*\}/.exec(texto || ''); const j = m ? JSON.parse(m[0]) : null;
-    const lista = (j && Array.isArray(j.novidades) ? j.novidades : []).map(x => String(x || '').trim()).filter(x => x.length > 8).slice(0, 6);
+    const lista = (j && Array.isArray(j.novidades) ? j.novidades : []).map(x => String(x || '').trim()).filter(x => x.length > 8 && _iaNovidadeGeral(x)).slice(0, 6); // (v440) nada de situação de um cliente
     const n = await _iaNovidadeJunta(owner, lista);
     if (n) console.log('IA anotou ' + n + ' novidade(s) do dia');
     return n;
@@ -10686,6 +10745,9 @@ async function _iaSugere(owner, phone, forcar, opts) {
     else { resumoAntigo = (cR && cR.texto) || ''; _iaResumoAntigo(owner, phone, antigas).catch(() => {}); }
   }
   const novidades = await _iaNovidades(owner);
+  // (v440) só avisos GERAIS e recentes (10 dias) entram; situação de um cliente nunca vai para outro
+  const _corteNov = new Date(Date.now() - 10 * 86400000).toISOString().slice(0, 10);
+  const _novGerais = novidades.filter(n => n && (n.em || '') >= _corteNov && _iaNovidadeGeral(n.texto)).slice(-10);
   let lead = null;
   if (treino) lead = { name: String(opts.nome || 'Cliente').slice(0, 40), stage_id: null, tags: [], notes: String(opts.notas || '').slice(0, 400) };
   else try { const { data } = await supabase.from('contacts').select('name, stage_id, tags, notes').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); lead = (data || [])[0] || null; } catch (_) {}
@@ -10751,11 +10813,12 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const sys = 'Você escreve SUGESTÕES de resposta para a dona deste WhatsApp (correspondente bancária). Você não é um assistente: você escreve exatamente como ELA escreveria para o lead. A sugestão aparece na tela dela e só é enviada se ela tocar — então escreva pronto para enviar.\n\n'
     + (mem.estilo ? '### COMO ELA ESCREVE\n' + mem.estilo + '\n\n' : '')
     + (mem.fluxo ? '### COMO A OPERAÇÃO FUNCIONA\n' + mem.fluxo + '\n\n' : '')
-    + (novidades.length ? '### NOVIDADES RECENTES (o que mudou nos últimos dias, com data — quando bater de frente com o manual, vale a novidade)\n' + novidades.slice(-15).map(n => '[' + String(n.em || '').split('-').reverse().slice(0, 2).join('/') + '] ' + n.texto).join('\n') + '\n\n' : '')
+    + (_novGerais.length ? '### AVISOS GERAIS DOS ÚLTIMOS DIAS (valem para TODOS os clientes: banco que parou ou voltou, regra ou taxa nova. NÃO são a situação de nenhum cliente — a situação DESTE cliente está só na conversa dele. Se um aviso parecer ser de um cliente só, ignore-o. O manual continua valendo; um aviso só muda o manual se disser claramente que a regra mudou para todos.)\n' + _novGerais.map(n => '[' + String(n.em || '').split('-').reverse().slice(0, 2).join('/') + '] ' + n.texto).join('\n') + '\n\n' : '')
     + bancosTxt
     + formTxt
     + '### REGRAS DE SAÍDA\n'
     + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
+    + '- ANTES de escrever, descubra pela CONVERSA DESTE CLIENTE (não pelos exemplos) em qual das etapas do manual ele está HOJE e o que já foi feito com ele. A resposta tem de servir para ESTE cliente nesta etapa; o que aconteceu com outros clientes não vale aqui. O "porque" tem de citar uma fala DESTA conversa (entre aspas) que mostra a etapa. Prazo que não está escrito nesta conversa vai em dias úteis pelo manual ("em até 5 dias úteis"), nunca como data dd/mm.\n'
     + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."],"porque":"..."}: "assunto" em 2–5 palavras; as mensagens VÊM ANTES do porquê; "porque" em 1 ou 2 frases curtas (no máximo 300 caracteres), em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
     + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
@@ -10771,7 +10834,8 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + '- Hoje é ' + _iaHoje() + '. Não escreva nada além do JSON.';
   // 🎓 exemplo ENSINADO no treino traz o porquê dela — a IA generaliza a regra, não só o texto
   const exTxt = exemplos.map((e, i) => {
-    const ctx = [].concat(e.contexto || []).slice(-3).map(x => String(x).slice(0, 220)).join('\n');
+    const ctx = [].concat(e.contexto || []).slice(-3).map(x => _iaMascaraExemplo(String(x).slice(0, 220))).join('\n'); // (v440) sem data/valor/dia de outro cliente
+    e = Object.assign({}, e, { lead: [].concat(e.lead || []).map(_iaMascaraExemplo), resposta: [].concat(e.resposta || []).map(_iaMascaraExemplo) });
     return '--- Exemplo ' + (i + 1) + (e.origem === 'treino' ? ' (ENSINADO por ela, com o motivo)' : '') + ' ---\n' + (ctx ? ctx + '\n' : '') + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n') + (e.motivo ? '\nPor quê (ela explicou): ' + String(e.motivo).slice(0, 300) : '');
   }).join('\n');
   // Quanto tempo esta operação já leva — a IA precisa disso para saber a FASE do cliente
@@ -10788,8 +10852,8 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + doLead.map(m => '[' + _iaDataHora(m.timestamp) + '] ' + _iaLinha(m)).join('\n')
     + (_temArquivo ? '\n⚠️ Ele mandou ARQUIVO/FOTO' + (doLead.length > 1 ? ' junto com o texto' : '') + ': a resposta precisa reconhecer o que chegou ("Recebi…") — nunca responder como se o arquivo não tivesse vindo (ex.: "aguardo seu retorno" depois que ele já enviou).' : '') : '';
   const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300) + (e.motivo ? '\nPor quê (ela explicou): ' + String(e.motivo).slice(0, 300) : '')).join('\n---\n');
-  const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + x).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + x).join('\n')).join('\n');
-  const usr = catTxt + (exTxt ? '### EXEMPLOS PARECIDOS COM A FALA DO LEAD (mesmo assunto — a melhor referência)\n(linhas "Eu: ⏳ depois: …" são passos que ela manda HORAS depois, não na resposta de agora)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
+  const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + _iaMascaraExemplo(x)).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + _iaMascaraExemplo(x)).join('\n')).join('\n');
+  const usr = catTxt + (exTxt ? '### COMO ELA RESPONDEU A OUTROS CLIENTES EM SITUAÇÃO PARECIDA (são OUTRAS pessoas, em outros dias: copie o JEITO de escrever e o PASSO da operação — nunca a situação, prazo, previsão, banco ou problema de lá; [DATA]/[VALOR]/[DIA] eram dados daquele cliente. Se o exemplo está em OUTRA etapa da operação que este cliente, ignore-o.)\n(linhas "Eu: ⏳ depois: …" são passos que ela manda HORAS depois, não na resposta de agora)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
     + (exEstiloTxt ? '### EXEMPLOS SÓ DE ESTILO (assunto DIFERENTE do atual — copie o jeito de escrever, nunca o conteúdo)\n' + exEstiloTxt + '\n\n' : '')
     + (corrTxt ? '### CORREÇÕES DELA (aprenda com o erro: não repita o que ela trocou)\n' + corrTxt + '\n\n' : '')
     + '### LEAD\nNome: ' + (nome || '(sem nome)') + '\nConvênio: ' + (formInfo.convenio || '(não identificado)') + '\nEtapa no pipeline: ' + (etapa || '(sem etapa)') + '\nEtiquetas: ' + ((lead && Array.isArray(lead.tags) && lead.tags.length) ? lead.tags.join(', ') : '(nenhuma)') + '\nNotas: ' + String((lead && lead.notes) || '(nenhuma)').slice(0, 1500)
@@ -10802,6 +10866,10 @@ async function _iaSugere(owner, phone, forcar, opts) {
   // no mesmo contexto, a resposta é a dela — sem perguntar ao modelo (ela: "acabei de mostrar como se
   // faz e ele vem com resposta rápida em vez do bot que eu corrigi"). Rápido e previsível.
   const regra = _iaRegraEnsinada(mem.exemplos, textoLead || '', ctxAtual);
+  // 👋 (v441) despedida/agradecimento do lead: só UMA frase curta retribuindo
+  const _minhaUlt = (() => { for (let i = msgs.length - doLead.length - 1; i >= 0; i--) if (msgs[i].direction === 'outbound') return String(msgs[i].content || ''); return ''; })();
+  const _fim = doLead.every(m => !m.type || m.type === 'text') ? _iaEncerramento(textoLead, _minhaUlt) : null;
+  const usrFinal = _fim ? usr + '\n\n⚠️ O LEAD SE DESPEDIU/AGRADECEU ("' + String(textoLead).slice(0, 120) + '") — ele NÃO perguntou nada. NÃO repita o que ela já disse, NÃO fale de saldo, prazo, previsão nem andamento, NÃO prometa atualização de novo. Responda com UMA única frase curta retribuindo' + (_fim.devolve ? ' (ele desejou "' + _fim.devolve + '": deseje também)' : '') + ', no jeito dela — ou {"mensagens":[]} se não há o que retribuir.' : usr;
   let texto, model;
   if (regra) {
     // "⏳ depois:" = passo que ela manda HORAS depois (ela: "podem ser horas de diferença para enviar um
@@ -10812,7 +10880,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     const linhas = agora.map(x => { const o = _iaItemTorto(x); return o ? o : x.replace(/\{nome\}/g, primeiro || '{nome}'); });
     texto = JSON.stringify({ assunto: 'regra ensinada', porque: 'Regra que você ensinou no treino' + (regra.em ? ' em ' + String(regra.em).split('-').reverse().join('/') : '') + ': ' + (regra.motivo || 'mesma fala do lead, mesma resposta') + (depois.length ? ' — Depois, quando for a hora: ' + depois.join(' · ') : ''), mensagens: linhas });
     model = 'regra-ensinada';
-  } else ({ texto, model } = await _iaChamaGroq(sys, usr, owner));
+  } else ({ texto, model } = await _iaChamaGroq(sys, usrFinal, owner));
   // 🎯 filtro dos itens: rápida/bot só com momento cadastrado; texto que é de rápida/bot vira o
   // item (se tem momento) ou cai fora (era isso que fazia a IA sugerir "Qualquer dúvida me aciona…" na hora errada)
   const brutosIt = _iaExtraiItens(texto, rapidas, bots, false);
@@ -10845,7 +10913,31 @@ async function _iaSugere(owner, phone, forcar, opts) {
       return pal.length >= 3 && comum / pal.length >= 0.8; // 80% das palavras são as do lead
     });
   };
-  const itensSemRep = itensOk.filter(it => !_repetida(it) && !_ecoDoLead(it));
+  // 🛡️ (v440) data (dd/mm) ou valor (R$) que não aparece NESTA conversa, nas notas, no resumo nem no manual = veio de
+  // outro cliente: a mensagem sai da sugestão (melhor nenhuma sugestão do que a de outro cliente)
+  const _baseFatos = new Set(_iaFatos(todas.map(m => String(m.content || '') + ' ' + String(m.transcript || '')).join(' ') + ' ' + String((lead && lead.notes) || '') + ' ' + String(resumoAntigo || '') + ' ' + String(mem.fluxo || '') + ' ' + new Date(Date.now() - 3 * 3600000).toISOString().slice(5, 10).split('-').reverse().join('/'))); // + hoje (Brasília)
+  let _foraDaConversa = 0;
+  const _deOutroCliente = it => { if (it.tipo !== 'texto' || model === 'regra-ensinada') return false; /* regra que ela ensinou vale como está */ const f = _iaFatos(it.texto).filter(x => !_baseFatos.has(x)); if (f.length) { _foraDaConversa++; return true; } return false; };
+  // 🔁 (v441) QUASE repetida: a mesma informação que ela acabou de dar, reescrita ("O saldo segue em andamento e está
+  // previsto para chegar na quarta-feira" → "Certo, Fulano! O saldo está previsto para chegar na quarta-feira"). Vale
+  // quando o lead NÃO perguntou nada (se ele perguntou de novo, responder a mesma coisa é legítimo).
+  const _STOPREP = new Set(['para', 'pra', 'com', 'que', 'uma', 'por', 'dos', 'das', 'seu', 'sua', 'aqui', 'esta', 'voce', 'mais', 'como', 'foi', 'nos', 'ele', 'ela', 'certo', 'sim', 'tudo', 'bem', 'bom', 'boa', 'dia', 'tarde', 'noite', 'ola', _normRep(primeiro)]);
+  const _palRep = x => _normRep(x).split(' ').filter(w => w.length > 2 && !_STOPREP.has(w));
+  const _leadPergunta = /\?/.test(textoLead || '') || /\b(quando|como|qual|quais|quanto|quantos|quanta|onde|cade|que dia|que horas|sera que|por que|porque)\b/.test(_normRep(textoLead));
+  const _minhasUltPal = todas.filter(m => m.direction === 'outbound' && m.type !== 'note').slice(-4).map(m => new Set(_palRep(m.content))).filter(S => S.size >= 4);
+  let _quaseRep = 0;
+  const _quaseRepetida = it => { if (it.tipo !== 'texto' || model === 'regra-ensinada' || _leadPergunta) return false; const p = _palRep(it.texto); if (p.length < 4) return false; const rep = _minhasUltPal.some(S => p.filter(w => S.has(w)).length / p.length >= 0.7); if (rep) _quaseRep++; return rep; };
+  let itensSemRep = itensOk.filter(it => !_repetida(it) && !_ecoDoLead(it) && !_deOutroCliente(it) && !_quaseRepetida(it));
+  // 👋 (v441) despedida: fica UMA frase curta, sem assunto da operação; se ele desejou algo e a IA não retribuiu, a
+  // retribuição é montada aqui (nunca fica sem resposta nem com informação repetida)
+  if (_fim && model !== 'regra-ensinada') {
+    const _opRe = /\b(saldo|margem|portabilidade|refinanciamento|proposta|contrato|banco|parcela|valor|previs\w+|prazo|andamento|atualiz\w+|receber\w*|recebermos|libera\w+|averba\w+)\b/;
+    const _retrRe = /semana|feriado|descanso|\bdia\b|tarde|noite|tambem|igualmente|amem|obrigad|deus|abraco|por nada|disponha|imagina/;
+    const boas = itensSemRep.filter(it => it.tipo === 'texto' && it.texto.length <= 90 && !/\d/.test(it.texto) && !_opRe.test(_normRep(it.texto)) && ((!_fim.devolve && !_fim.deus) || _retrRe.test(_normRep(it.texto))));
+    if (boas.length) itensSemRep = [boas[0]];
+    else if (_fim.devolve || _fim.deus) itensSemRep = [{ tipo: 'texto', texto: (_fim.deus ? 'Amém, obrigada' : 'Obrigada') + (primeiro ? ', ' + primeiro : '') + '!' + (_fim.devolve ? ' ' + _fim.devolve.charAt(0).toUpperCase() + _fim.devolve.slice(1) + ' pra você também' : '') + ' 🙏🏼' }];
+    else itensSemRep = [];
+  }
   const itens = itensSemRep.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
   // 🔍 "Quero entender o porquê da sugestão": o que a IA viu e em que se baseou, para a tela mostrar
@@ -10856,7 +10948,9 @@ async function _iaSugere(owner, phone, forcar, opts) {
     fala_do_lead: String(textoLead || '').slice(0, 300) || (doLead.length ? '(sem texto: ' + doLead.map(m => m.type || 'mídia').join(', ') + ')' : ''),
     contexto: msgs.slice(Math.max(0, msgs.length - doLead.length - 3), msgs.length - doLead.length).map(_iaLinha).map(x => x.slice(0, 160)),
     exemplos: exemplos.slice(0, 4).map(_ex), so_estilo: exEstilo.length, correcoes: correcoes.slice(0, 2).map(_ex),
-    novidades: novidades.slice(-3).map(n => String(n.texto || '').slice(0, 140)),
+    novidades: _novGerais.slice(-3).map(n => String(n.texto || '').slice(0, 140)),
+    fora_da_conversa: _foraDaConversa, // (v440) mensagens tiradas por trazer data/valor de fora desta conversa
+    quase_repetidas: _quaseRep, despedida: !!_fim, // (v441) tiradas por repetir o que ela acabou de dizer · o lead só se despediu
     momentos: itensSemRep.filter(it => it.tipo !== 'texto').map(it => ({ tipo: it.tipo, nome: it.tipo === 'rapida' ? '/' + it.atalho : it.nome, momento: it.tipo === 'rapida' ? _momento(String(quando.rapidas[it.atalho] || '').trim(), usos.rapidas[it.atalho]) : _momento(String(quando.bots[it.id] || '').trim(), usos.bots[it.id]) })),
     convenio: formInfo.convenio || '', convenio_fonte: formInfo.fonte || '', fichas_usadas: formInfo.fichas || 0,
     fase: { etapa: etapa || '', dias_uteis_desde_minha: _ultMinha ? _iaDiasUteis(_ultMinha.timestamp) : null, dias_uteis_desde_inicio: _pri ? _iaDiasUteis(_pri.timestamp) : null, resumo_antigo: !!resumoAntigo, mensagens_lidas: msgs.length + antigas.length },
@@ -15122,4 +15216,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
