@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 441;
+const SERVER_VER = 443;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -1442,7 +1442,7 @@ app.post("/webhook", async (req, res) => {
         (async () => {
           try {
             if (await _isContactMuted(from, ownerEmail)) return; // silenciada: sem push
-            await sendPushToOwner(ownerEmail, { title: existing?.name || name || from, body: preview, phone: from, tag: 'chat-' + from }, { naoLidaMais: 1 });
+            await sendPushToOwner(ownerEmail, { title: existing?.name || name || from, body: preview, phone: from, tag: 'chat-' + from }, { naoLidaMais: 1, t_msg: parseInt(message.timestamp, 10) * 1000 });
           } catch (_) {}
         })();
         const contactData = { phone: from };
@@ -10049,6 +10049,7 @@ function _iaAnonima(txt, nomeLead) {
 // para a dona preencher.
 function _iaMascara(t) {
   return String(t || '')
+    .replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, '{cpf}').replace(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g, '{cnpj}') // (v442) CPF/CNPJ (ex.: chave PIX) nunca ficam na memória
     .replace(/R\$\s?\*?\d[\d.]*(?:,\d{1,2})?\*?/g, '[VALOR]')
     .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, '[DATA]');
 }
@@ -10065,7 +10066,11 @@ const _iaFalaVazia = (linhas) => ![].concat(linhas || []).some(x => { const t = 
 //  - exemplos vão MASCARADOS ([DATA]/[VALOR]/[DIA]) e rotulados como de OUTROS clientes
 //  - a resposta não pode trazer data (dd/mm) nem valor (R$) que não esteja NESTA conversa, nas notas ou no manual
 const _IA_NOV_DE_CLIENTE = /\b(o|a|do|da|ao|à) cliente\b|\b(saldo|valor|valores|cr[eé]dito|refinanciamento|portabilidade|anu[eê]ncia|margem)\b[^.;]{0,50}\b(ser[áa]|ficar[áa]|previst[oa]|previs[ãa]o|chega|chegar[áa]|cai|cair[áa]|tentar[áa]|liberou|foi suspensa|foi averbad)|\bainda n[ãa]o (liberou|chegou|caiu|averbou|creditou)\b/i;
-function _iaNovidadeGeral(t) { return !!String(t || '').trim() && !_IA_NOV_DE_CLIENTE.test(String(t)); }
+// (v442) a lista de verdade (13/11) ainda tinha andamento de UMA operação que a regra acima não pegava: "A proposta
+// ainda não foi averbada pelo banco", "Suporte está verificando a situação", "Aceite deve ser liberado antes das
+// 12:00", "Previsão de crédito para o dia 09/11", "Banco Inter enviará o saldo em até 5 dias úteis a partir de 05/11"
+const _IA_NOV_DE_CLIENTE2 = /\b(a|sua|essa|esta|nossa) proposta\b|\bproposta (ainda )?(nao )?(foi|esta|sera)\b|\bcancelou (a )?proposta\b|\bsuporte\b|\b(o|do|seu|os|dos) saldos?\b|\brecalculo\b|\bprevisao de (credito|saldo|pagamento)\b|\b(aceite|anuencia|credito|valor|saldo|portabilidade|averbacao)\b[^.;]{0,40}\b(deve|devera|precisa|vai|ira)\b|\b(em alguns minutos|ainda hoje|ate as \d|antes das \d)\b|\bvalor de r ?\d|\bvalor de valor\b|^aguardar\b|\bo banco tentara\b/;
+function _iaNovidadeGeral(t) { const x = String(t || '').trim(); if (!x || _IA_NOV_DE_CLIENTE.test(x)) return false; return !_IA_NOV_DE_CLIENTE2.test(x.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\[valor\]/g, 'valor').replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()); }
 const _IA_DIAS_SEMANA = /\b(segunda|ter[çc]a|quarta|quinta|sexta)(-feira)?\b|\bs[áa]bado\b|\bdomingo\b|\bamanh[ãa]\b|\bhoje\b|\bontem\b/gi;
 // exemplo de OUTRO cliente: datas, valores e dias viram marcador (o jeito de escrever fica; a situação dele, não)
 function _iaMascaraExemplo(t) { return _iaMascara(String(t || '')).replace(_IA_DIAS_SEMANA, '[DIA]'); }
@@ -10074,7 +10079,40 @@ function _iaFatos(t) {
   const out = []; const x = String(t || '');
   (x.match(/\b\d{1,2}\/\d{1,2}\b/g) || []).forEach(d => { const [a, b] = d.split('/'); out.push('d:' + (+a) + '/' + (+b)); });
   (x.match(/R\$\s?\*?\d[\d.]*(?:,\d{1,2})?/g) || []).forEach(v => out.push('v:' + v.replace(/[^\d,]/g, '').replace(/,00$/, '')));
+  // (v442) prazo em dias ("3 a 5 dias úteis"), hora ("até as 12:00") e porcentagem ("1,60%") também são fatos
+  (x.match(/\b\d{1,3}(?:\s*(?:a|ou|-)\s*\d{1,3})?\s*(?:dias?|horas?|hrs?|h)\b/gi) || []).forEach(v => out.push('p:' + v.toLowerCase().replace(/\s+/g, '').replace(/horas?|hrs?|h$/, 'h').replace(/dias?/, 'd')));
+  (x.match(/\b\d{1,2}:\d{2}\b/g) || []).forEach(v => out.push('t:' + v));
+  (x.match(/\d{1,2}(?:[.,]\d{1,2})?\s?%/g) || []).forEach(v => out.push('x:' + v.replace(/\s|%/g, '').replace('.', ',').replace(/,00?$/, '').replace(/(,\d)0$/, '$1')));
   return out;
+}
+// 🔎 (v442) Ela (13/11): "você consegue ver as sugestões que eu não usei… entender o motivo". Das 80 ignoradas em 7 dias:
+// ~23 a IA AFIRMOU o estado da operação que só ela vê no sistema do banco ("o valor foi creditado com sucesso ✅",
+// "o saldo veio maior do que solicitamos" — inventado 3 vezes); quase todas terminavam em "Se precisar, estou à
+// disposição" / "Qualquer dúvida, me avisa" (ela responde "Está bem", "Isso mesmo"); prazos e taxas inventados
+// ("3 a 5 dias úteis", "até as 12:00", "1,60% no BRB"). Aqui:
+//  - _iaEstadoAfirmado: fatos da operação afirmados no texto (saldo chegou, veio maior, creditou, averbou, cancelou…)
+//    — só passam se ELA (ou o lead) já escreveu isso nesta conversa
+//  - _iaSemEnrolacao: tira as frases de enchimento
+//  - _iaFatos passa a conferir também prazo em dias, hora e porcentagem
+const _IA_ESTADOS = [
+  ['saldo recebido', /\b(recebemos|recebi|chegou|chegaram)\b.{0,30}\bsaldos?\b|\bsaldos?\b.{0,25}\b(chegou|chegaram|foi recebido|foram recebidos|foi confirmado)\b/],
+  ['saldo veio diferente', /\b(veio|vieram|chegou|chegaram)\b.{0,30}\b(maior|menor|acima|abaixo|divergente)\b/],
+  ['saldo enquadrou', /\benquadr(ou|aram)\b/],
+  ['valor creditado', /\b(foi|foram|ja foi|esta|ja esta)\s+creditad|creditad[oa]s? com sucesso|\bvalor(es)? em conta\b/],
+  ['averbado', /\b(foi|ja foi|esta|ja esta)\s+averbad|\b(refinanciamento|proposta|contrato) averbad/],
+  ['portabilidade feita', /\bportabilidade (ja )?(foi )?(realizada|concluida|finalizada|paga)\b/],
+  ['proposta digitada/cancelada', /\b(ja )?digitei\b|\bproposta (ja )?(foi )?(digitada|cancelada|aprovada|reprovada|paga)\b|\bestamos digitando\b/],
+  ['margem liberada', /\b(ja )?liberou\b.{0,15}\bmargem\b|\bmargem (ja )?(foi )?liberada\b/],
+  ['aceite constou', /\bconstou o aceite\b|\baceite (ja )?(foi )?(liberado|confirmado)\b/],
+];
+const _iaNormEst = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+function _iaEstadoAfirmado(t) { const n = _iaNormEst(t); return _IA_ESTADOS.filter(e => e[1].test(n)).map(e => e[0]); }
+const _IA_ENROLA = /^(se precisar|caso precise|caso tenha|caso queira|qualquer duvida|qualquer coisa|se tiver (alguma |qualquer )?duvida|se houver (alguma |qualquer )?duvida|fico a disposicao|estou a disposicao|estarei a disposicao|estou aqui|estarei por aqui|estamos a disposicao|precisando)\b|\ba disposicao\b/;
+function _iaSemEnrolacao(t) {
+  const partes = String(t || '').split(/(?<=[.!?…])\s+(?=\S)/); // frases (o emoji do fim fica com a frase dele)
+  const boas = partes.filter(f => !_IA_ENROLA.test(_iaNormEst(f)));
+  const r = boas.join(' ').trim();
+  return /[a-zA-Z0-9\u00C0-\u00FF]/.test(r) ? r : ''; // sobrou só emoji/pontuação: a mensagem era toda enchimento
 }
 // 👋 (v441) Ela (13/11, print): o lead fechou com "Certo. Bom Final de semana" e a IA sugeriu repetir o que ela tinha
 // acabado de dizer ("Certo, Alrilides! O saldo está previsto para chegar na quarta-feira" + "Assim que recebermos…").
@@ -10819,7 +10857,9 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + '### REGRAS DE SAÍDA\n'
     + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
     + '- ANTES de escrever, descubra pela CONVERSA DESTE CLIENTE (não pelos exemplos) em qual das etapas do manual ele está HOJE e o que já foi feito com ele. A resposta tem de servir para ESTE cliente nesta etapa; o que aconteceu com outros clientes não vale aqui. O "porque" tem de citar uma fala DESTA conversa (entre aspas) que mostra a etapa. Prazo que não está escrito nesta conversa vai em dias úteis pelo manual ("em até 5 dias úteis"), nunca como data dd/mm.\n'
-    + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."],"porque":"..."}: "assunto" em 2–5 palavras; as mensagens VÊM ANTES do porquê; "porque" em 1 ou 2 frases curtas (no máximo 300 caracteres), em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 4 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."],"porque":"..."}: "assunto" em 2–5 palavras; as mensagens VÊM ANTES do porquê; "porque" em 1 ou 2 frases curtas (no máximo 300 caracteres), em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 3 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + '- VOCÊ NÃO VÊ O SISTEMA DO BANCO: só ela sabe se o saldo chegou, se veio maior ou menor, se enquadrou, se averbou, se o valor foi creditado, se a proposta foi digitada ou cancelada. NUNCA afirme nada disso se ELA não escreveu nesta conversa. Se a resposta depende disso, entregue só o esqueleto com marcador ([VALOR]) do que ela costuma mandar nesse passo, ou {"mensagens":[]}.\n'
+    + '- TAMANHO: ela responde curto. Confirmação é "Isso mesmo", "Está bem", "Sim, …" e para aí. Se a resposta cabe em 5 palavras, use 5 palavras. PROIBIDO fechar com "Se precisar, estou à disposição", "Qualquer dúvida, me avisa", "Se precisar de ajuda…" ou parecido.\n'
     + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
@@ -10915,7 +10955,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
   };
   // 🛡️ (v440) data (dd/mm) ou valor (R$) que não aparece NESTA conversa, nas notas, no resumo nem no manual = veio de
   // outro cliente: a mensagem sai da sugestão (melhor nenhuma sugestão do que a de outro cliente)
-  const _baseFatos = new Set(_iaFatos(todas.map(m => String(m.content || '') + ' ' + String(m.transcript || '')).join(' ') + ' ' + String((lead && lead.notes) || '') + ' ' + String(resumoAntigo || '') + ' ' + String(mem.fluxo || '') + ' ' + new Date(Date.now() - 3 * 3600000).toISOString().slice(5, 10).split('-').reverse().join('/'))); // + hoje (Brasília)
+  const _baseFatos = new Set(_iaFatos(todas.map(m => String(m.content || '') + ' ' + String(m.transcript || '')).join(' ') + ' ' + String((lead && lead.notes) || '') + ' ' + String(resumoAntigo || '') + ' ' + String(mem.fluxo || '') + ' ' + _novGerais.map(n => n.texto).join(' ') + ' 7 dias úteis 5 dias úteis ' + new Date(Date.now() - 3 * 3600000).toISOString().slice(5, 10).split('-').reverse().join('/'))); // + hoje (Brasília)
   let _foraDaConversa = 0;
   const _deOutroCliente = it => { if (it.tipo !== 'texto' || model === 'regra-ensinada') return false; /* regra que ela ensinou vale como está */ const f = _iaFatos(it.texto).filter(x => !_baseFatos.has(x)); if (f.length) { _foraDaConversa++; return true; } return false; };
   // 🔁 (v441) QUASE repetida: a mesma informação que ela acabou de dar, reescrita ("O saldo segue em andamento e está
@@ -10927,7 +10967,14 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const _minhasUltPal = todas.filter(m => m.direction === 'outbound' && m.type !== 'note').slice(-4).map(m => new Set(_palRep(m.content))).filter(S => S.size >= 4);
   let _quaseRep = 0;
   const _quaseRepetida = it => { if (it.tipo !== 'texto' || model === 'regra-ensinada' || _leadPergunta) return false; const p = _palRep(it.texto); if (p.length < 4) return false; const rep = _minhasUltPal.some(S => p.filter(w => S.has(w)).length / p.length >= 0.7); if (rep) _quaseRep++; return rep; };
-  let itensSemRep = itensOk.filter(it => !_repetida(it) && !_ecoDoLead(it) && !_deOutroCliente(it) && !_quaseRepetida(it));
+  // 🏦 (v442) estado da operação AFIRMADO sem ela (ou o lead) ter escrito nesta conversa = invenção: a mensagem sai
+  const _baseEstados = new Set(_iaEstadoAfirmado(todas.map(m => String(m.content || '') + ' ' + String(m.transcript || '')).join(' . ')));
+  let _inventadas = 0, _enroladas = 0;
+  const _estadoInventado = it => { if (it.tipo !== 'texto' || model === 'regra-ensinada') return false; const f = _iaEstadoAfirmado(it.texto).filter(x => !_baseEstados.has(x)); if (f.length) { _inventadas++; return true; } return false; };
+  // ✂️ (v442) sem frase de enchimento (fora da despedida, onde "à disposição" cabe); mensagem que era só enchimento sai
+  const _enxuga = it => { if (it.tipo !== 'texto' || model === 'regra-ensinada' || _fim) return it; const t = _iaSemEnrolacao(it.texto); if (t === it.texto) return it; _enroladas++; return t ? { ...it, texto: t } : null; };
+  let itensSemRep = itensOk.map(_enxuga).filter(Boolean).filter(it => !_repetida(it) && !_ecoDoLead(it) && !_deOutroCliente(it) && !_estadoInventado(it) && !_quaseRepetida(it));
+  if (model !== 'regra-ensinada') { let nT = 0; itensSemRep = itensSemRep.filter(it => it.tipo !== 'texto' || ++nT <= 3); } // no máximo 3 textos
   // 👋 (v441) despedida: fica UMA frase curta, sem assunto da operação; se ele desejou algo e a IA não retribuiu, a
   // retribuição é montada aqui (nunca fica sem resposta nem com informação repetida)
   if (_fim && model !== 'regra-ensinada') {
@@ -10950,6 +10997,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     exemplos: exemplos.slice(0, 4).map(_ex), so_estilo: exEstilo.length, correcoes: correcoes.slice(0, 2).map(_ex),
     novidades: _novGerais.slice(-3).map(n => String(n.texto || '').slice(0, 140)),
     fora_da_conversa: _foraDaConversa, // (v440) mensagens tiradas por trazer data/valor de fora desta conversa
+    estado_inventado: _inventadas, enrolacao_cortada: _enroladas, // (v442) tiradas por afirmar o que só ela vê no banco · frases de enchimento cortadas
     quase_repetidas: _quaseRep, despedida: !!_fim, // (v441) tiradas por repetir o que ela acabou de dizer · o lead só se despediu
     momentos: itensSemRep.filter(it => it.tipo !== 'texto').map(it => ({ tipo: it.tipo, nome: it.tipo === 'rapida' ? '/' + it.atalho : it.nome, momento: it.tipo === 'rapida' ? _momento(String(quando.rapidas[it.atalho] || '').trim(), usos.rapidas[it.atalho]) : _momento(String(quando.bots[it.id] || '').trim(), usos.bots[it.id]) })),
     convenio: formInfo.convenio || '', convenio_fonte: formInfo.fonte || '', fichas_usadas: formInfo.fichas || 0,
@@ -11404,6 +11452,20 @@ async function _iaVarreRespostas() {
   try { novidades = await _iaExtraiNovidades(owner, paraNovidades); } catch (_) {}
   return { novos, novidades };
 }
+// 🧹 (v442) CPF/CNPJ que já estavam nos exemplos (ex.: a chave PIX que ela mandou a um cliente) viram {cpf}/{cnpj} —
+// uma vez, sozinho, na fila da memória (não atropela o aprendizado)
+async function _iaMascaraDocsNaMemoria(owner) {
+  return _iaMemNaFila(async () => {
+    const mem = await _iaMemoria(owner, true);
+    if (!/\d{3}\.\d{3}\.\d{3}-\d{2}|\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(mem.brutoExemplos || '')) return 0;
+    const doc = t => String(t || '').replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, '{cpf}').replace(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g, '{cnpj}');
+    let n = 0;
+    for (const e of mem.exemplos) for (const c of ['lead', 'resposta', 'sugerido', 'contexto']) { if (!e[c]) continue; const antes = JSON.stringify(e[c]); e[c] = [].concat(e[c]).map(doc); if (JSON.stringify(e[c]) !== antes) n++; }
+    if (n) { await _iaMemoriaGrava(owner, 'exemplos', mem.exemplos.map(o => JSON.stringify(o)).join('\n')); console.log('🧹 IA: ' + n + ' trecho(s) com CPF/CNPJ mascarado(s) na memória de ' + owner); }
+    return n;
+  });
+}
+setTimeout(() => { _soMaestro(() => _iaMascaraDocsNaMemoria(_CONTA_IA))().catch(() => {}); }, 150000);
 setTimeout(() => { _soMaestro(_iaVarreRespostas)().catch(() => {}); setInterval(() => { _soMaestro(_iaVarreRespostas)().catch(() => {}); }, 3 * 60000); }, 90000);
 
 // ═══════════════════════ Regra "contato errado" ═══════════════════════
@@ -13771,6 +13833,42 @@ app.post('/push/test', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ⏱️ (v443) Ela (13/11): "Estou recebendo notificação no celular com muito atraso às vezes, de 6 minutos depois".
+// O servidor já manda na hora e com urgência alta — faltava MEDIR onde o tempo se perde. Cada aviso de mensagem leva
+// um número (pid) e o aparelho responde "recebi" (POST /push/recebido — sem login, só vale para pid que existe).
+// Ficam os 300 últimos na memória: quando a Meta carimbou a mensagem, quando ela chegou aqui, quando saiu para o
+// Google/Apple e quando cada aparelho recebeu. GET /push/atrasos (logada) mostra onde foi o atraso.
+const _pushDiag = [];
+function _pushDiagNovo(owner, payload, opt) {
+  const d = { pid: require('crypto').randomBytes(8).toString('hex'), owner, fone: String(payload.phone || '').replace(/\D/g, '').slice(-4), t_msg: (opt && opt.t_msg > 0) ? opt.t_msg : null, t_srv: Date.now(), saiu: null, aparelhos: 0, prov: {}, recebido: [] };
+  _pushDiag.push(d); if (_pushDiag.length > 300) _pushDiag.shift();
+  return d;
+}
+const _pushAparelho = (ua) => /iPhone|iPad|iPod/i.test(String(ua || '')) ? 'iphone' : /Android/i.test(String(ua || '')) ? 'android' : 'computador';
+app.post('/push/recebido', (req, res) => {
+  try {
+    const pid = String((req.body && req.body.pid) || '').slice(0, 40);
+    const d = pid ? _pushDiag.find(x => x.pid === pid) : null;
+    if (d && d.recebido.length < 8) d.recebido.push({ t: Date.now(), aparelho: _pushAparelho(req.headers['user-agent']) });
+  } catch (_) {}
+  res.json({ ok: true });
+});
+app.get('/push/atrasos', (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const seg = (a, b) => (a && b) ? Math.max(0, Math.round((b - a) / 1000)) : null;
+  const lista = _pushDiag.filter(d => d.owner === req.owner).slice(-120).reverse().map(d => ({
+    quando: new Date(d.t_srv).toISOString(), fone_final: d.fone, aparelhos: d.aparelhos, provedores: d.prov,
+    meta_ate_servidor_s: seg(d.t_msg, d.t_srv),     // a mensagem demorou a CHEGAR no FILAZ (Meta/WhatsApp reenviando, servidor reiniciando)
+    servidor_ate_envio_s: seg(d.t_srv, d.saiu),     // o FILAZ demorou a mandar o aviso
+    envio_ate_aparelho: d.recebido.map(r => ({ aparelho: r.aparelho, s: seg(d.saiu || d.t_srv, r.t) })), // Google/Apple/celular seguraram o aviso
+    confirmado: d.recebido.length > 0,
+  }));
+  const LIM = 60, lento = (v) => v != null && v >= LIM;
+  res.json({ desde: _pushDiag.length ? new Date(_pushDiag[0].t_srv).toISOString() : null, total: lista.length,
+    resumo: { limite_s: LIM, chegou_tarde_no_servidor: lista.filter(x => lento(x.meta_ate_servidor_s)).length, servidor_demorou_a_enviar: lista.filter(x => lento(x.servidor_ate_envio_s)).length,
+      aparelho_recebeu_tarde: lista.filter(x => x.envio_ate_aparelho.some(r => lento(r.s))).length, sem_confirmacao_do_aparelho: lista.filter(x => !x.confirmado).length },
+    avisos: lista });
+});
 // Envia push para todos os aparelhos do dono; remove inscrições mortas (404/410)
 async function sendPushToOwner(owner, payload, opt) {
   if (!webpush || !_vapid || !supabase) return;
@@ -13780,6 +13878,9 @@ async function sendPushToOwner(owner, payload, opt) {
   if (!owner) { console.warn('Push ignorado: mensagem sem dono definido'); return; }
   try {
     payload.owner = owner; // o aparelho confere se o aviso é mesmo dele
+    // ⏱️ (v443) aviso de MENSAGEM leva o número da medição e o endereço para o aparelho confirmar que recebeu
+    const _diag = (!payload.tipo && /^chat-/.test(String(payload.tag || ''))) ? _pushDiagNovo(owner, payload, opt) : null;
+    if (_diag) { payload.pid = _diag.pid; payload.ack = BACKEND_URL + '/push/recebido'; }
     // As duas consultas (contador do ícone + aparelhos) vão JUNTAS, e o envio para
     // cada aparelho também: antes era um atrás do outro e cada passo somava atraso.
     // 🔇 conversa silenciada não conta no ícone (igual WhatsApp); se a coluna "muted"
@@ -13802,6 +13903,7 @@ async function sendPushToOwner(owner, payload, opt) {
       payload.badge = rows.length + ((opt && opt.naoLidaMais && !jaConta) ? 1 : 0);
     } catch (_) {}
     let subs = (subsR && subsR.data) || [];
+    if (_diag) _diag.aparelhos = subs.length;
     // Aviso SÓ de contador (conversa lida em outro aparelho): não vai para iPhone — o iOS
     // exige uma notificação visível a cada push e cancela a inscrição depois de 3 "mudos".
     if (opt && opt.soSemNotificacao) subs = subs.filter(s => !/web\.push\.apple\.com/i.test(String(s.endpoint || '')));
@@ -13811,7 +13913,10 @@ async function sendPushToOwner(owner, payload, opt) {
         // urgency 'high': sem isso o Google/Apple entregam com prioridade normal e o celular
         // em economia de bateria segura o aviso por MINUTOS (chegava atrasado). Alta = acorda o
         // aparelho na hora, como o WhatsApp. TTL 1h: mensagem velha não vale mais aviso.
-        await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: payload.tipo === 'badge' ? 600 : 3600, urgency: 'high' });
+        const _prov = /web\.push\.apple\.com/i.test(String(s.endpoint || '')) ? 'apple' : 'google';
+        try { await webpush.sendNotification(s.subscription, JSON.stringify(payload), { TTL: payload.tipo === 'badge' ? 600 : 3600, urgency: 'high' }); }
+        catch (e) { if (_diag) _diag.prov[_prov] = e.statusCode || 'erro'; throw e; }
+        if (_diag) { _diag.saiu = Date.now(); _diag.prov[_prov] = 'aceito'; }
       } catch (e) {
         if (e.statusCode === 404 || e.statusCode === 410) {
           await supabase.from('push_subscriptions').delete().eq('endpoint', s.endpoint);
@@ -15183,7 +15288,7 @@ app.post('/evolution-webhook', async (req, res) => {
         // TÍTULO = o nome que ELA salvou no FILAZ (editado no CRM), não o nome público
         // do WhatsApp (pushName): ela editava o lead e o celular seguia avisando com o nome velho.
         const tituloPush = contactData.name || (existC && existC.name) || name || phone;
-        if (!fromMe && !(await _isContactMuted(phone, ownerEmail))) sendPushToOwner(ownerEmail, { title: tituloPush, body: preview, phone, tag: 'chat-' + phone }).catch(() => {});
+        if (!fromMe && !(await _isContactMuted(phone, ownerEmail))) sendPushToOwner(ownerEmail, { title: tituloPush, body: preview, phone, tag: 'chat-' + phone }, { t_msg: Number(data.messageTimestamp) > 0 ? Number(data.messageTimestamp) * 1000 : null }).catch(() => {});
 
         // Bot e n8n só para mensagens RECEBIDAS
         if (!fromMe && type === 'text' && content) {
@@ -15216,4 +15321,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
