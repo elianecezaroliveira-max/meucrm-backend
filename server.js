@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 445;
+const SERVER_VER = 446;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -1515,7 +1515,11 @@ app.post("/webhook", async (req, res) => {
         // (a notificação push já saiu lá em cima, antes das gravações)
         // Processa reply de bot ativo (texto OU clique em botão/lista)
         if (['text','button','interactive'].includes(type) && content) {
-          try { await handleBotReply(from, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
+          try {
+            const _tratou = await handleBotReply(from, content, ownerEmail);
+            // 🔘 (v446) clicou no botão do modelo DEPOIS que a espera do bot venceu: o bot segue pelo botão clicado
+            if (!_tratou && type !== 'text' && message.context && message.context.id) await _botCliqueTardio(from, content, ownerEmail, message.context.id);
+          } catch(be) { console.error('Bot reply error:', be.message); }
         }
         // IA: regra de "contato errado" primeiro; se não tratou, tenta o FAQ
         if (['text','button','interactive'].includes(type) && content) {
@@ -9305,6 +9309,49 @@ async function handleBotReply(phone, text, owner) {
   return true;
 }
 
+// 🔘 (v446) CLIQUE TARDIO no botão do modelo. Ela (13/11 e 18/11): "Não respondeu com o bot automaticamente, o bot foi
+// encerrado antes do lead clicar no botão". O modelo saiu na quarta 12:01, o passo espera 48 h pelo clique, a espera
+// venceu na sexta 12:01 e o lead clicou em "Verificar simulação" às 13:45 — ninguém respondeu.
+// Agora o clique acorda a execução e ela segue pelo botão clicado, mas SÓ quando é seguro:
+//   • é clique em BOTÃO (não texto digitado) e cita uma mensagem nossa
+//   • essa mensagem citada é a ÚLTIMA coisa que saiu para o lead (ninguém — nem ela, nem outro bot — falou depois)
+//   • a execução mais recente do lead terminou POR PRAZO ('completed') parada nesse modelo, que tem esse botão ligado
+//     a um caminho (execução parada por ela, ou porque o lead respondeu outra coisa, fica 'stopped' e NÃO acorda)
+//   • o bot continua ativo; até BOT_CLIQUE_TARDIO_DIAS (30) dias
+//   • só uma vez (troca atômica): dois cliques seguidos não disparam o caminho duas vezes
+const BOT_CLIQUE_TARDIO_DIAS = parseInt(process.env.BOT_CLIQUE_TARDIO_DIAS || '30', 10);
+async function _botCliqueTardio(phone, texto, owner, ctxWamid) {
+  if (!supabase || !ctxWamid || BOT_CLIQUE_TARDIO_DIAS <= 0) return false;
+  try {
+    const tl = String(texto || '').toLowerCase().trim(); if (!tl) return false;
+    // a execução MAIS RECENTE do lead (qualquer estado): tem de ser a que venceu parada no modelo
+    let rq = supabase.from('bot_runs').select('*').eq('contact_phone', phone).order('created_at', { ascending: false }).limit(1);
+    if (owner) rq = rq.eq('owner', owner);
+    const { data: rs } = await rq; const run = (rs || [])[0];
+    if (!run || run.status !== 'completed') return false;
+    if (Date.now() - new Date(run.updated_at || run.created_at || 0).getTime() > BOT_CLIQUE_TARDIO_DIAS * 86400000) return false;
+    const no = await _nodeById(run.current_node_id); if (!no || no.type !== 'message') return false;
+    let cfg = {}; try { cfg = typeof no.config === 'string' ? JSON.parse(no.config) : (no.config || {}); } catch (_) {}
+    if (cfg.mode !== 'template' || !Array.isArray(cfg.buttons) || !cfg.buttons.some(b => String(b || '').toLowerCase().trim() === tl)) return false;
+    const edges = await _edgesFrom(run.current_node_id);
+    const e = (edges || []).find(x => x.label && !String(x.label).startsWith('__') && String(x.label).toLowerCase().trim() === tl && x.to_node_id);
+    if (!e) return false;
+    if (!(await _botAtivo(run.bot_id))) return false;
+    // a mensagem citada pelo clique é a última que saiu para o lead?
+    let mq = supabase.from('messages').select('id, wamid, type, timestamp').in('phone', phoneVariants(phone)).eq('direction', 'outbound')
+      .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(5);
+    if (owner) mq = mq.eq('owner', owner);
+    const { data: ms } = await mq; const ultima = (ms || []).filter(m => m && m.type !== 'note')[0];
+    if (!ultima || String(ultima.wamid || '') !== String(ctxWamid)) return false;
+    const upd = { current_node_id: e.to_node_id, status: 'running', pause_until: null, updated_at: new Date().toISOString() };
+    const { data: pegou } = await supabase.from('bot_runs').update(upd).eq('id', run.id).eq('status', 'completed').eq('current_node_id', run.current_node_id).select('id');
+    if (!pegou || !pegou.length) return true; // outro clique já acordou esta execução
+    console.log('Bot: clique tardio no botão "' + tl + '" — a execução ' + run.id + ' segue por ele');
+    await processNode({ ...run, ...upd });
+    return true;
+  } catch (e) { console.error('clique tardio no botão do bot:', e.message); return false; }
+}
+
 // ── AÇÕES DE ETAPA (Automação do funil): executadas quando o lead ENTRA na etapa.
 // Tipos: task (criar tarefa), complete_task (concluir), tags (editar), move_stage
 // (mudar etapa, com proteção contra loop), create_lead (criar lead fixo).
@@ -15493,4 +15540,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
