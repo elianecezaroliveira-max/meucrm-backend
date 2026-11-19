@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 446;
+const SERVER_VER = 447;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -10151,8 +10151,8 @@ function _iaLinha(m) {
   const t = String(m.type || 'text');
   let txt = String(m.content || '').trim();
   if (t === 'audio') txt = '(áudio' + (m.transcript ? ': ' + String(m.transcript).trim() : '') + ')';
-  else if (t === 'image' || t === 'video' || t === 'sticker') txt = '(' + (t === 'image' ? 'imagem' : t === 'video' ? 'vídeo' : 'figurinha') + (txt ? ': ' + txt : '') + (m.transcript && t === 'image' ? ' — o que a IA viu: ' + String(m.transcript).trim() : '') + ')';
-  else if (t === 'document') txt = '(documento' + (txt ? ': ' + txt : '') + (m.transcript ? ' — o que a IA leu: ' + String(m.transcript).trim() : '') + ')';
+  else if (t === 'image' || t === 'video' || t === 'sticker') txt = '(' + (t === 'image' ? 'imagem' : t === 'video' ? 'vídeo' : 'figurinha') + (txt ? ': ' + txt : '') + (m.transcript && t === 'image' ? ' — o que a IA viu: ' + _iaLimpaLeitura(m.transcript) : '') + ')';
+  else if (t === 'document') txt = '(documento' + (txt ? ': ' + txt : '') + (m.transcript ? ' — o que a IA leu: ' + _iaLimpaLeitura(m.transcript) : '') + ')';
   else if (t === 'template') txt = txt || '(modelo)';
   else if (t === 'location') txt = '(localização)';
   else if (t === 'contacts') txt = '(contato)';
@@ -10683,7 +10683,17 @@ function _iaProvedorVisao() {
   if (process.env.GEMINI_API_KEY) return { nome: 'gemini', url: IA_PROVEDORES.gemini.url, chave: process.env.GEMINI_API_KEY, model: process.env.IA_VISAO_MODELO || 'gemini-3.5-flash', pdf: false };
   return null;
 }
-const _IA_VISAO_INSTR = 'Você lê o que um cliente de crédito consignado mandou pelo WhatsApp para a correspondente bancária. Responda em português, em até 400 caracteres, dizendo O QUE É (extrato de consignação, contracheque, documento com foto, comprovante, print de aplicativo, foto comum…) e os DADOS ÚTEIS que aparecem: nome, banco(s), parcelas e valores, margem, situação do contrato, datas, matrícula ou benefício (só os 4 últimos dígitos). Só o que está escrito; sem opinião e sem conselho. Se estiver ilegível, diga o que dá para ver.';
+// 📩 (v447) Ela (19/11): "Olha que péssima sugestão, a portabilidade foi realizada hoje". O lead mandou o print do SMS
+// do banco ("Sorria! … Finalizamos a portabilidade do contrato…") e a leitura devolveu "extrato de consignação" com
+// uma lista de campos ("Nome: não disponível…") — a frase que importava sumiu, e a sugestão saiu "Recebi o extrato…
+// vamos aguardar o saldo devedor". Agora a leitura diz primeiro O QUE A MENSAGEM AVISA, em texto corrido.
+const _IA_VISAO_INSTR = 'Você lê o que um cliente de crédito consignado mandou pelo WhatsApp para a correspondente bancária. Responda em português, em TEXTO CORRIDO, em até 500 caracteres — sem markdown, sem asteriscos, sem lista e sem escrever o que NÃO aparece ("não disponível"). Comece dizendo O QUE É: print de SMS/mensagem/e-mail/notificação de banco, extrato de consignação (a lista de contratos do SouGov ou do Meu INSS), contracheque, confirmação de autorização, documento com foto, comprovante, print de aplicativo, foto comum… Se for print de SMS, mensagem, e-mail ou aviso de aplicativo, o mais importante é O QUE A MENSAGEM AVISA: diga quem enviou e copie a frase principal como está escrita (ex.: "Finalizamos a portabilidade do contrato…", "proposta aprovada", "pendência", "crédito liberado") — isso NÃO é extrato. Depois os DADOS ÚTEIS que aparecem: banco(s), contrato, parcelas e valores, margem, situação, datas (diga do que é cada data com as palavras da imagem; não chame de vencimento o que não está escrito como vencimento), matrícula ou benefício (só os 4 últimos dígitos); não copie CPF nem CNPJ. Só o que está escrito; sem opinião e sem conselho. Se estiver ilegível, diga o que dá para ver.';
+// tira o que a leitura não devia trazer: negrito de markdown e os itens "Campo: não disponível" (gastam o espaço da leitura)
+function _iaLimpaLeitura(t) {
+  let s = String(t || '').replace(/\*\*|__/g, '');
+  s = s.replace(/(?:^|\s)[-•]?\s*[^:.\n\d$\-•]{2,40}:\s*(?:n[ãa]o\s+(?:dispon[íi]ve(?:l|is)|informad[oa]s?|consta|aparecem?|identificad[oa]s?|h[áa])|n\/a)(?=\s*(?:[.;,]|$|[-•]))\s*[.;,]?/gi, ' ');
+  return s.replace(/\s+[-•]\s+(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])/g, ' ').replace(/\s+/g, ' ').trim();
+}
 // 📷 (v445) Ela (13/11): "A IA lê os documentos que mando para o cliente? … a simulação que eu envio é em foto — nesse
 // exemplo é uma proposta de portar a parcela que está na CAIXA para o Paraná Banco, liberando R$ 5.869,35; R$ 913,30 é
 // o valor da parcela". Não lia: só o que o LEAD mandava. Agora lê também o que ELA envia, sabendo ler a simulação.
@@ -10694,9 +10704,9 @@ async function _iaVeMidia(prov, bytes, mime, nome, ehDoc, minha) {
   let parte;
   if (ehDoc) { if (!prov.pdf || mime !== 'application/pdf') return ''; parte = { type: 'file', file: { filename: nome || 'documento.pdf', file_data: 'data:application/pdf;base64,' + b64 } }; }
   else parte = { type: 'image_url', image_url: { url: 'data:' + (mime || 'image/jpeg') + ';base64,' + b64 } };
-  const body = { model: prov.model, messages: [{ role: 'system', content: minha ? _IA_VISAO_INSTR_MINHA : _IA_VISAO_INSTR }, { role: 'user', content: [{ type: 'text', text: (minha ? 'O que a correspondente enviou ao cliente' : 'O que o cliente mandou') + (nome ? ' ("' + nome + '")' : '') + '?' }, parte] }], max_tokens: 300, temperature: 0.2 };
+  const body = { model: prov.model, messages: [{ role: 'system', content: minha ? _IA_VISAO_INSTR_MINHA : _IA_VISAO_INSTR }, { role: 'user', content: [{ type: 'text', text: (minha ? 'O que a correspondente enviou ao cliente' : 'O que o cliente mandou') + (nome ? ' ("' + nome + '")' : '') + '?' }, parte] }], max_tokens: 380, temperature: 0.2 };
   const r = await axios.post(prov.url, body, { headers: { Authorization: 'Bearer ' + prov.chave, 'Content-Type': 'application/json' }, timeout: 45000 });
-  return String((r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content) || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+  return _iaLimpaLeitura(String((r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content) || '')).slice(0, 700);
 }
 async function _iaDescreveMidiaSePrecisar(m) {
   if (!m) return '';
@@ -11078,7 +11088,8 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + '- Onde os exemplos têm {nome}, use o primeiro nome do lead' + (primeiro ? ' ("' + primeiro + '")' : '') + '; onde têm {meu_whatsapp}, mantenha {meu_whatsapp}.\n'
     + '- Nunca invente valor, parcela, taxa, prazo, banco ou nome que não esteja na conversa, nas notas ou no manual. Sem o dado, use a frase de espera ("Vou verificar e já retorno aqui 🙏🏼").\n'
     + '- Se a frase só fizer sentido COM um número que não está na conversa, escreva o marcador entre colchetes para ELA preencher antes de enviar ([VALOR LIBERADO], [VALOR DA PARCELA], [SALDO DEVEDOR], [BANCO], [Nº DO CONTRATO], [DATA]) — nunca um número chutado. Se nem com marcador a frase fizer sentido, use a frase de espera.\n'
-    + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, foto ou documento, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
+    + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, ou foto/documento SEM leitura, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
+    + '- A leitura que vem entre parênteses numa imagem ou documento do lead diz o que ele mandou: responda ao que a LEITURA diz e chame o arquivo pelo nome que ela dá (não diga "recebi o extrato" se a leitura não fala em extrato). Se a leitura traz um AVISO do banco (SMS, mensagem, notificação — ex.: portabilidade finalizada, proposta aprovada, pendência), esse aviso é um FATO NOVO da operação: situe a fase por ele e nunca fale em aguardar uma etapa que o aviso mostra que já aconteceu.\n'
     + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
     + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]"/"{link}" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
     + '- Quando uma linha MINHA ("Eu: …") traz uma imagem ou documento com a leitura da IA entre parênteses, isso é o que EU JÁ ENVIEI ao lead. Se for uma SIMULAÇÃO, aqueles são os números da proposta já apresentada (banco de destino, parcela que será portada, prazo e valor liberado): use-os para responder as dúvidas do lead sobre a proposta, sem mudar nenhum número e sem pedir de novo o que já está nela.\n'
@@ -15540,4 +15551,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
