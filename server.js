@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 449;
+const SERVER_VER = 450;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -2665,8 +2665,8 @@ app.use(['/send', '/send-media', '/send-template', '/send-location', '/send-cont
     if (!acct && to && supabase) { try { const { data: c } = await supabase.from('contacts').select('account_id').eq('owner', req.owner).in('phone', phoneVariants(String(to))).limit(1).maybeSingle(); acct = c && c.account_id; } catch (_) {} }
     const sil = _silencioAgora(req.owner, acct);
     if (!sil.bloqueado) return next();
-    let nome = ''; try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', acct).maybeSingle(); nome = a ? (a.phone_display || a.name || '') : ''; } catch (_) {}
-    return res.status(409).json({ silencio: true, ate: new Date(sil.ate).toISOString(), ate_txt: sil.ate_txt, error: 'O número ' + (nome ? '"' + nome + '" ' : '') + 'está em "não perturbe" até ' + sil.ate_txt + '.' });
+    let nome = ''; try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', acct).maybeSingle(); nome = a ? _contaRotulo(a, true) : ''; } catch (_) {}
+    return res.status(409).json({ silencio: true, ate: new Date(sil.ate).toISOString(), ate_txt: sil.ate_txt, error: 'O número ' + (nome ? nome + ' ' : '') + 'está em "não perturbe" até ' + sil.ate_txt + '.' });
   } catch (_) { return next(); }
 });
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -7867,8 +7867,8 @@ async function _vigiaFalha(owner, accountId, erroTxt) {
     if (l.length < lim) return;
     if (_falhasAvisado.get(k) && agora - _falhasAvisado.get(k) < 3600000) return; // 1 aviso por hora por número
     _falhasAvisado.set(k, agora);
-    let nome = accountId;
-    try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', accountId).maybeSingle(); if (a) nome = a.phone_display || a.name || accountId; } catch (_) {}
+    let nome = accountId, nomeAviso = '"' + accountId + '"'; // (v450) nome da conta primeiro ("67"), telefone ao lado
+    try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', accountId).maybeSingle(); if (a) { nome = _contaRotulo(a, false, accountId); nomeAviso = _contaRotulo(a, true, accountId); } } catch (_) {}
     // regras de gotejamento cujo bot da etapa de destino envia por este número
     const pausaMin = Math.max(0, parseInt(process.env.FALHAS_PAUSA_MIN || '120', 10) || 0);
     const pausadas = [], seguem = []; let foraDoRodizio = false;
@@ -7950,9 +7950,19 @@ async function _vigiaFalha(owner, accountId, erroTxt) {
     }
     const _por = pausaMin >= 60 ? Math.round(pausaMin / 60) + ' h' : pausaMin + ' min';
     const _txtFora = foraDoRodizio ? ' Ele ficou FORA DO RODÍZIO por ' + _por + ' — o gotejamento ' + seguem.map(n => '"' + n + '"').join(', ') + ' continua com os outros números. Para devolver antes: Automação ▸ Gotejamento ▸ "Devolver ao rodízio".' : '';
-    const txt = 'O número "' + nome + '" teve ' + l.length + ' falhas de envio na última hora.' + _txtFora + (foraDoRodizio && !pausadas.length ? '' : pausadas.length ? ' O gotejamento ' + pausadas.map(n => '"' + n + '"').join(', ') + ' ficou PARADO por ' + (pausaMin >= 60 ? Math.round(pausaMin / 60) + ' h' : pausaMin + ' min') + ' — confira o número em Config ▸ Diagnóstico ▸ Saúde e toque ▶ para retomar.' : ' Confira o número em Config ▸ Diagnóstico ▸ Saúde.');
+    const txt = 'O número ' + nomeAviso + ' teve ' + l.length + ' falhas de envio na última hora.' + _txtFora + (foraDoRodizio && !pausadas.length ? '' : pausadas.length ? ' O gotejamento ' + pausadas.map(n => '"' + n + '"').join(', ') + ' ficou PARADO por ' + (pausaMin >= 60 ? Math.round(pausaMin / 60) + ' h' : pausaMin + ' min') + ' — confira o número em Config ▸ Diagnóstico ▸ Saúde e toque ▶ para retomar.' : ' Confira o número em Config ▸ Diagnóstico ▸ Saúde.');
     await addNotice(owner, txt, 'falhas:' + accountId, { tipo: 'erro', alvo: 'contas' });
   } catch (e) { console.error('vigia de falhas:', e.message); }
+}
+// (v450) Ela (23/11), sobre o aviso 'Um bot não conseguiu enviar uma mensagem pelo número "+55 15 9…"': "Deveria estar
+// escrito 67 para facilitar". Ela conhece cada número pelo NOME que deu na tela Contas ("67", "101"); o aviso trazia só o
+// telefone. Nos avisos e erros: o nome primeiro, o telefone ao lado. aspas=true → "67" (+55 15 9…), para o texto do aviso.
+function _contaRotulo(a, aspas, reserva) {
+  const n = String((a && a.name) || '').trim(), t = String((a && a.phone_display) || '').trim();
+  const q = s => aspas ? '"' + s + '"' : s;
+  if (n && t && n !== t) return q(n) + ' (' + t + ')';
+  const um = n || t || String(reserva || '');
+  return um ? q(um) : '';
 }
 // Registra no CRM uma mensagem de bot que FALHOU — fica visível na conversa com ⚠️ e o MOTIVO,
 // para o usuário saber que houve tentativa e por que não foi enviada.
@@ -7962,8 +7972,8 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
     const ts = new Date().toISOString();
     const content = shown || '[Falha no envio]';
     // Identifica QUAL número tentou enviar (útil no Round Robin com vários números)
-    let acctName = '';
-    if (accountId) { try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', accountId).maybeSingle(); if (a) acctName = a.phone_display || a.name || ''; } catch(_){} }
+    let acctName = '', acctAviso = '';
+    if (accountId) { try { const { data: a } = await supabase.from('accounts').select('name, phone_display').eq('id', accountId).maybeSingle(); if (a) { acctName = _contaRotulo(a, false); acctAviso = _contaRotulo(a, true); } } catch(_){} }
     const fullErr = acctName ? `[Número: ${acctName}] ${errText || 'Falha no envio'}` : (errText || 'Falha no envio');
     await supabase.from('messages').insert({
       phone, content, type: type || 'text', direction: 'outbound', timestamp: ts,
@@ -7972,7 +7982,7 @@ async function _recordBotFail(phone, shown, errText, accountId, owner, type) {
     const prev = String(content || '').slice(0, 80);
     // Avisa que um bot não está conseguindo enviar (1 aviso por hora, por número)
     try {
-      addNotice(owner, 'Um bot não conseguiu enviar uma mensagem' + (acctName ? ' pelo número "' + acctName + '"' : '') + ': ' + (errText || 'falha no envio'),
+      addNotice(owner, 'Um bot não conseguiu enviar uma mensagem' + (acctAviso ? ' pelo número ' + acctAviso : '') + ': ' + (errText || 'falha no envio'),
         'botfail:' + (accountId || 'sem'), { tipo: 'erro', alvo: 'bots' });
     } catch (_) {}
     await supabase.from('contacts').update({ last_message_at: ts, last_message_preview: prev, last_message_direction: 'outbound', last_message_status: null }).eq('phone', phone).eq('owner', owner || ' ');
