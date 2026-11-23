@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 447;
+const SERVER_VER = 448;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -5053,6 +5053,34 @@ async function _dripForaNaRegra(owner, r) {
     return n;
   } catch (_) { return 0; }
 }
+// 🔢 (v448) Ela (23/11): "Quero que mostre aqui a quantidade de números que tem em cada bot". Na regra do gotejamento
+// aparecia só o "(6 números)" que ELA digitou na regra; agora vem, do próprio bot que a etapa de destino dispara,
+// quantos números estão no rodízio dele (bot sem rodízio = 1 número) e quais são. Cache de 60 s por etapa: a tela
+// pede o /drip de tempos em tempos e isto não pode gastar a cota do banco. Nunca lança.
+const _dripBotsCache = new Map(); // owner|etapa → { t, lista }
+async function _dripBotsDaEtapa(owner, etapa) {
+  try {
+    if (!supabase || !etapa) return [];
+    const ck = owner + '|' + etapa, c = _dripBotsCache.get(ck);
+    if (c && Date.now() - c.t < 60000) return c.lista;
+    const { data: bots } = await supabase.from('bots').select('id, name').eq('owner', owner).eq('trigger_type', 'stage_enter').eq('active', true).eq('trigger_stage_id', String(etapa));
+    const lista = []; let nomes = null;
+    for (const b of (bots || [])) {
+      const { data: rrs } = await supabase.from('bot_nodes').select('id, config').eq('bot_id', b.id).eq('type', 'round_robin');
+      const contas = new Set();
+      for (const rr of (rrs || [])) {
+        let cfg = rr.config; if (typeof cfg === 'string') { try { cfg = JSON.parse(cfg); } catch (_) { cfg = {}; } }
+        const brs = (cfg && cfg.branches) || [];
+        for (let i = 0; i < brs.length; i++) { const ct = (brs[i] && brs[i].account_id) ? String(brs[i].account_id) : await _rrContaDoRamo(rr.id, i); if (ct) contas.add(String(ct)); }
+      }
+      if (contas.size && !nomes) { nomes = {}; try { const { data: acs } = await supabase.from('accounts').select('id, name').eq('owner', owner); (acs || []).forEach(a => { nomes[String(a.id)] = a.name || ''; }); } catch (_) {} }
+      lista.push({ id: b.id, nome: b.name || 'Bot', numeros: contas.size || 1, rodizio: contas.size > 0, nomes: [...contas].map(id => (nomes && nomes[id]) || '').filter(Boolean) });
+    }
+    _dripBotsCache.set(ck, { t: Date.now(), lista });
+    if (_dripBotsCache.size > 300) _dripBotsCache.delete(_dripBotsCache.keys().next().value);
+    return lista;
+  } catch (_) { return []; }
+}
 function _dripMinMax(r) {
   const div = _dripDiv(r);
   const minS = Math.max(1, Math.round((Math.max(1, Number(r.min_seg) || 210)) / div));
@@ -5327,7 +5355,8 @@ app.get('/drip', async (req, res) => {
   const _fora = _numPausados(req.owner);
   const numeros_fora = Object.keys(_fora).map(id => ({ id, nome: _fora[id].nome || id, ate: _fora[id].ate, desde: _fora[id].desde || null, renovado: _fora[id].renovado || 0 }));
   const fora_por_regra = {}; for (const r of regras) { const n = await _dripForaNaRegra(req.owner, r); if (n) fora_por_regra[r.id] = n; } // (v437)
-  res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay(), numeros_fora, fora_por_regra, falhas_modo: _falhasModo(req.owner) });
+  const bots_por_regra = {}; for (const r of regras) { const l = await _dripBotsDaEtapa(req.owner, r.para); if (l.length) bots_por_regra[r.id] = l; } // (v448) quantos números tem o bot de cada regra
+  res.json({ regras, contagens, janela, agora_brasilia: hhmm, dia_semana: agora.getUTCDay(), numeros_fora, fora_por_regra, bots_por_regra, falhas_modo: _falhasModo(req.owner) });
 });
 // (v436) o que fazer quando um número tem muitas falhas: 'numero' = só ele sai do rodízio; 'regra' = para o gotejamento
 app.put('/drip/falhas-modo', async (req, res) => {
@@ -15551,4 +15580,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _dripBotsDaEtapa, _dripBotsCache,_sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
