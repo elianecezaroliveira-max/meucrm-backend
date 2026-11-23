@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 452;
+const SERVER_VER = 453;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -2752,6 +2752,16 @@ app.post('/pc/espelho', async (req, res) => {
     }).filter(Boolean);
     await _pcNomeGuarda(owner, phone, nome);
     if (!msgs.length) return res.json({ ok: true, phone, novos: 0 });
+    // (v453) a conversa foi ABERTA no WhatsApp do PC: as mensagens inteiras estão vindo — a prévia do aviso (pcav:) sai.
+    // Se o aviso tinha criado a conversa pelo número interno e agora ela veio pelo telefone de verdade, a de mentira some.
+    try {
+      const interno = _pcFoneInterno(owner, nome);
+      await _pcLimpaAvisos(owner, [phone, interno]);
+      if (phone !== interno) {
+        const { data: resto } = await supabase.from('messages').select('id').eq('owner', owner).eq('phone', interno).limit(1);
+        if (!resto || !resto.length) await supabase.from('contacts').delete().eq('owner', owner).eq('phone', interno).eq('account_id', conta);
+      }
+    } catch (_) {}
     const { data: ja } = await supabase.from('messages').select('wamid').eq('owner', owner).in('wamid', msgs.map(m => m.wamid));
     const tem = new Set((ja || []).map(x => x.wamid));
     let novas = msgs.filter(m => !tem.has(m.wamid));
@@ -2779,6 +2789,84 @@ app.post('/pc/espelho', async (req, res) => {
     }
     res.json({ ok: true, phone, novos: novas.length });
   } catch (e) { console.error('PC espelho:', e.message); res.status(500).json({ error: e.message }); }
+});
+// 🔔 AVISOS DO WHATSAPP DO PC (v453) — ela (23/11): "Tem como fazer com que as notificações do WhatsApp que eu tenho
+// instalado no PC fique no FILAZ?" (escolheu: só pessoas; só dentro do FILAZ — sem notificação no celular).
+// O assistente lê a LISTA de conversas do WhatsApp do PC e manda quem tem mensagem não lida:
+//   POST /pc/avisos { conversas: [{ nome, n, hora, previa }] }   (a lista INTEIRA de não lidas, sempre)
+//   • conversa nova na lista, ou com outra prévia/quantidade → a conversa sobe no FILAZ (conta "PC") com a bolinha
+//     (unread_count = n) e a prévia entra como mensagem provisória do lead (wamid "pcav:…");
+//   • conversa que saiu da lista (ela leu no WhatsApp) → a bolinha some no FILAZ;
+//   • quando ela abre a conversa no WhatsApp do PC, o espelho traz as mensagens inteiras e a provisória sai.
+// Sem push, sem bot, sem IA. A mesma prévia nunca entra duas vezes (nem depois de reiniciar o servidor), e ler a
+// conversa no FILAZ não volta a marcar como não lida enquanto não chegar mensagem nova.
+const _pcAvisos = {}; // dono → { nome: 'n|previa' } — o que o assistente mandou por último
+const _pcSha = (t) => require('crypto').createHash('sha1').update(String(t)).digest('hex').slice(0, 28);
+const _pcNorma = (s) => String(s || '').normalize('NFKC').replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+const _pcIgual = (a, b) => { const x = String(a || '').replace(/\s+/g, ' ').trim(), y = String(b || '').replace(/\s+/g, ' ').trim(); if (!x || !y) return false; return x === y || (y.length >= 12 && x.startsWith(y.replace(/(…|\.\.\.)$/, '').slice(0, 60))); };
+// o telefone (do FILAZ) de uma conversa do WhatsApp do PC, pelo nome: o que o espelho já ligou a esse nome; nome que
+// é um telefone (contato não salvo) → o próprio; senão o número interno (0000…), o mesmo que o espelho usaria
+async function _pcFoneDoNome(owner, nome) {
+  const m = await _pcNomesDe(owner); const alvo = _pcNorma(nome);
+  const fs = Object.keys(m).filter(f => m[f] === nome || (alvo && _pcNorma(m[f]) === alvo));
+  if (fs.length === 1) return fs[0];
+  const reais = fs.filter(f => !/^0000/.test(f)); if (reais.length === 1) return reais[0];
+  const dig = String(nome).replace(/\D/g, '');
+  if (dig.length >= 10 && /^[\d\s()+\-.]+$/.test(String(nome))) return await resolveExistingPhone(dig, owner);
+  return _pcFoneInterno(owner, nome);
+}
+async function _pcLimpaAvisos(owner, fones) {
+  for (const f of [...new Set(fones || [])].filter(Boolean)) {
+    try { await supabase.from('messages').delete().eq('owner', owner).eq('phone', f).like('wamid', 'pcav:%'); } catch (_) {}
+  }
+}
+app.post('/pc/avisos', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  try {
+    const owner = req.owner; const b = req.body || {};
+    if (!Array.isArray(b.conversas)) return res.status(400).json({ error: 'sem a lista de conversas' });
+    const lista = []; const vistos = new Set();
+    for (const c of b.conversas.slice(0, 40)) {
+      const nome = String((c && c.nome) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      if (!nome || vistos.has(nome)) continue; vistos.add(nome);
+      lista.push({ nome, n: Math.max(1, Math.min(999, parseInt(c.n, 10) || 1)), previa: String(c.previa || '').replace(/\s+/g, ' ').trim().slice(0, 300) });
+    }
+    const antes = _pcAvisos[owner] || {}; const agora = {}; let novos = 0, lidas = 0;
+    const conta = lista.length ? await _pcConta(owner, true) : null;
+    for (const c of lista) {
+      const chave = c.n + '|' + c.previa; agora[c.nome] = chave;
+      if (antes[c.nome] === chave) continue; // nada mudou nesta conversa
+      const phone = await _pcFoneDoNome(owner, c.nome);
+      await _pcNomeGuarda(owner, phone, c.nome);
+      const texto = c.previa || 'Mensagem nova no WhatsApp do PC';
+      const wamid = 'pcav:' + _pcSha(owner + '|' + phone + '|' + texto);
+      // já está no FILAZ? a mesma prévia (servidor reiniciou) ou a mensagem inteira (a conversa já foi espelhada)
+      let jaTem = false;
+      try {
+        const { data: ult } = await supabase.from('messages').select('content, direction, wamid').eq('owner', owner).eq('phone', phone).order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(4);
+        jaTem = (ult || []).some(m => m.wamid === wamid || (m.direction === 'inbound' && c.previa && _pcIgual(m.content, c.previa)));
+      } catch (_) {}
+      if (jaTem) continue;
+      const ts = new Date().toISOString();
+      await _pcLimpaAvisos(owner, [phone]); // fica só a prévia mais recente
+      const { error: eIns } = await supabase.from('messages').insert({ phone, content: texto, type: 'text', direction: 'inbound', timestamp: ts, account_id: conta, status: null, wamid, owner });
+      if (eIns) { delete agora[c.nome]; continue; } // não gravou: tenta de novo no próximo aviso
+      const previa = texto.length > 80 ? texto.substring(0, 80) + '…' : texto;
+      const { data: ct } = await supabase.from('contacts').select('phone, unread_count, first_unread_at').eq('phone', phone).eq('owner', owner).maybeSingle();
+      const campos = { last_message_at: ts, last_message_preview: previa, last_message_direction: 'inbound', last_message_status: null, unread_count: c.n, first_unread_at: (ct && ct.unread_count > 0 && ct.first_unread_at) ? ct.first_unread_at : ts };
+      if (!ct) await supabase.from('contacts').upsert(Object.assign({ phone, name: c.nome, owner, account_id: conta }, campos), { onConflict: 'owner,phone' });
+      else await supabase.from('contacts').update(campos).eq('phone', phone).eq('owner', owner);
+      novos++;
+    }
+    // saiu da lista de não lidas do WhatsApp (ela leu por lá): a bolinha some no FILAZ
+    for (const nome of Object.keys(antes)) {
+      if (agora[nome] !== undefined) continue;
+      try { const phone = await _pcFoneDoNome(owner, nome); await supabase.from('contacts').update({ unread_count: 0, first_unread_at: null }).eq('phone', phone).eq('owner', owner).gt('unread_count', 0); lidas++; } catch (_) {}
+    }
+    _pcAvisos[owner] = agora;
+    res.json({ ok: true, novos, lidas });
+  } catch (e) { console.error('PC avisos:', e.message); res.status(500).json({ error: e.message }); }
 });
 // GET /pc/saida — o assistente busca o que ela mandou pelo FILAZ para sair pelo WhatsApp do PC (só memória)
 app.get('/pc/saida', (req, res) => {
