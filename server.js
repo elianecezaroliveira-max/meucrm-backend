@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 450;
+const SERVER_VER = 451;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -13426,6 +13426,56 @@ app.get('/relatorios', async (req, res) => {
       automacao: { enviadas: automacao.enviadas, conversas: automacao.conversas.size },
       sem_resposta: { n: esperando.length, lista: topo }
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// 📤 DISPAROS POR NÚMERO (v451) — ela (23/11): "Eu quero um lugar onde eu consiga ver quantos disparos eu fiz de cada
+// número, sem contar os que deram erro… De tal dia a tal dia. Foram tantos disparos de tal número."
+// Disparo = MODELO enviado (bot, gotejamento ou à mão). Conta por número e por dia (horário de Brasília), de `de` até
+// `ate` (AAAA-MM-DD, os dois dias inteiros). Os que deram erro (status failed) NÃO entram na conta: vêm à parte.
+// 🪙 Cota do banco: só as 3 colunas necessárias e só as linhas de modelo do período (no máximo 92 dias).
+app.get('/relatorios/disparos', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'sem banco' });
+  try {
+    const dOk = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) && isFinite(Date.parse(String(s) + 'T00:00:00Z'));
+    let ate = dOk(req.query.ate) ? String(req.query.ate) : _diaBrt(Date.now());
+    let de = dOk(req.query.de) ? String(req.query.de) : new Date(Date.parse(ate + 'T00:00:00Z') - 6 * 86400000).toISOString().slice(0, 10);
+    if (de > ate) { const x = de; de = ate; ate = x; }
+    const iniMs = Date.parse(de + 'T00:00:00Z') + 3 * 3600000;        // 00:00 de Brasília
+    const fimMs = Date.parse(ate + 'T00:00:00Z') + 27 * 3600000;      // 00:00 do dia seguinte (fica de fora)
+    const nDias = Math.round((fimMs - iniMs) / 86400000);
+    if (nDias > 92) return res.status(400).json({ error: 'Escolha um período de até 92 dias.' });
+    const linhas = []; let limitado = false;
+    for (let p = 0; p < 60; p++) {
+      const { data, error } = await supabase.from('messages').select('timestamp, account_id, status')
+        .eq('owner', req.owner).eq('type', 'template').eq('direction', 'outbound')
+        .gte('timestamp', new Date(iniMs).toISOString()).lt('timestamp', new Date(fimMs).toISOString())
+        .order('timestamp', { ascending: true }).order('id', { ascending: true }).range(p * 1000, p * 1000 + 999);
+      if (error) throw new Error(error.message || 'falha ao ler as mensagens');
+      if (!data || !data.length) break;
+      linhas.push(...data);
+      if (data.length < 1000) break;
+      if (p === 59) limitado = true;
+    }
+    const porDia = {};
+    for (let i = 0; i < nDias; i++) { const d = new Date(Date.parse(de + 'T00:00:00Z') + i * 86400000).toISOString().slice(0, 10); porDia[d] = { dia: d, total: 0, por: {} }; }
+    const porNum = {}; let total = 0, erros = 0;
+    for (const m of linhas) {
+      const ms = Date.parse(m.timestamp); if (!isFinite(ms)) continue;
+      const k = String(m.account_id || '_');
+      const o = porNum[k] = porNum[k] || { id: m.account_id || null, disparos: 0, erros: 0 };
+      if (m.status === 'failed') { o.erros++; erros++; continue; } // deu erro: não é disparo feito
+      o.disparos++; total++;
+      const d = porDia[_diaBrt(ms)]; if (d) { d.total++; d.por[k] = (d.por[k] || 0) + 1; }
+    }
+    let contas = []; try { const r = await supabase.from('accounts').select('id, name, phone_display, type, evolution_instance').eq('owner', req.owner); contas = r.data || []; } catch (_) {}
+    const mapa = {}; contas.forEach(a => { mapa[String(a.id)] = a; });
+    // os números de API que não dispararam nada no período aparecem com 0 (ela quer ver TODOS os números)
+    contas.forEach(a => { if (!a.evolution_instance && !porNum[String(a.id)]) porNum[String(a.id)] = { id: a.id, disparos: 0, erros: 0 }; });
+    const numeros = Object.keys(porNum).map(k => { const o = porNum[k], a = mapa[k];
+      return { id: o.id, chave: k, nome: a ? (a.name || a.phone_display || '') : (k === '_' ? '(sem número)' : '(número apagado)'), numero: a ? (a.phone_display || '') : '', disparos: o.disparos, erros: o.erros }; })
+      .sort((a, b) => b.disparos - a.disparos || String(a.nome).localeCompare(String(b.nome), 'pt-BR', { numeric: true }));
+    res.json({ de, ate, dias_no_periodo: nDias, total, erros, limitado, numeros, dias: Object.values(porDia) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
