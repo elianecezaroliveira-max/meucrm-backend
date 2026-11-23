@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 448;
+const SERVER_VER = 449;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -12655,8 +12655,35 @@ app.get('/meu-acesso', async (req, res) => {
     fornecedor: _ehDono(req), plano: _planoInfo(req.owner),
     liberado: _temLiberacao(req), portaria: l.ligado,
     teste_gratis: _testeGratisInfo(req),
-    leads: await _leadsInfo(req.owner)
+    leads: await _leadsInfo(req.owner),
+    emoji: _prefEmojiDe(req) // (v449) tom de pele e emojis recentes de quem está usando
   });
+});
+// 😀 (v449) Ela (23/11): "Várias vezes o emoji no PC volta a ficar com a cor amarela, sendo que eu já defini a cor antes".
+// O tom de pele ficava só no navegador (localStorage e o banco do seletor de emoji): quando o Chrome limpa os dados do
+// site, voltava ao amarelo — no navegador dela não havia mais nem o tom nem os "usados recentemente". Agora fica na
+// CONTA, por pessoa (settings pref_emoji::dona = { email: { tom, recentes } }): vale no PC e no celular, e volta sozinho.
+function _prefEmojiTudo(owner) {
+  try { const v = _cfg('pref_emoji', owner); const o = typeof v === 'string' ? JSON.parse(v) : v; return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {}; } catch (_) { return {}; }
+}
+function _prefEmojiDe(req) {
+  const p = _prefEmojiTudo(req.owner)[String(req.usuario || req.owner || '').toLowerCase()];
+  if (!p) return { tom: null, recentes: [] };
+  return { tom: (Number.isInteger(p.tom) && p.tom >= 0 && p.tom <= 5) ? p.tom : null, recentes: Array.isArray(p.recentes) ? p.recentes.slice(0, 18) : [] };
+}
+app.put('/prefs/emoji', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.status(500).json({ error: 'Supabase não configurado' });
+  const b = req.body || {}; const quem = String(req.usuario || req.owner || '').toLowerCase();
+  const tudo = _prefEmojiTudo(req.owner); const p = Object.assign({}, tudo[quem] || {});
+  if (b.tom !== undefined) { const t = (typeof b.tom === 'number' || (typeof b.tom === 'string' && /^\d$/.test(b.tom))) ? Number(b.tom) : NaN; if (!Number.isInteger(t) || t < 0 || t > 5) return res.status(400).json({ error: 'O tom vai de 0 (amarelo) a 5.' }); p.tom = t; }
+  if (b.recentes !== undefined) { if (!Array.isArray(b.recentes)) return res.status(400).json({ error: 'recentes precisa ser uma lista' }); p.recentes = b.recentes.filter(x => typeof x === 'string' && x && x.length <= 24).slice(0, 18); }
+  p.em = new Date().toISOString(); tudo[quem] = p;
+  const k = 'pref_emoji::' + (req.owner || ' '), value = JSON.stringify(tudo);
+  const { error } = await supabase.from('settings').upsert({ key: k, value, updated_at: new Date().toISOString() });
+  if (error) return res.status(500).json({ error: error.message });
+  _settings[k] = value;
+  res.json({ ok: true, tom: p.tom == null ? null : p.tom, recentes: p.recentes || [] });
 });
 // ═══════════════════════════════════════════════════════════════════
 // 🎁 TESTE GRÁTIS — quem chegou sem liberação começa a usar sozinho, na hora
