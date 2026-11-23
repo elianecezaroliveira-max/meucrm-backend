@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 451;
+const SERVER_VER = 452;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -13251,10 +13251,23 @@ app.put('/custos/config', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════
 app.get('/relatorios', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
-  const dias = Math.min(90, Math.max(1, parseInt(req.query.dias, 10) || 7));
+  let dias = Math.min(90, Math.max(1, parseInt(req.query.dias, 10) || 7));
   try {
     const agoraBrt = new Date(Date.now() - 3 * 3600000);
-    const iniBrt = new Date(Date.UTC(agoraBrt.getUTCFullYear(), agoraBrt.getUTCMonth(), agoraBrt.getUTCDate() - (dias - 1)));
+    let iniBrt = new Date(Date.UTC(agoraBrt.getUTCFullYear(), agoraBrt.getUTCMonth(), agoraBrt.getUTCDate() - (dias - 1)));
+    // (v452) Ela (23/11), sobre o seletor "Últimos 7/15/30 dias": "Eu quero poder escolher entre as janelas dos dias, não
+    // somente assim, queria ver só os de hoje e não consigo". Com ?de=AAAA-MM-DD&ate=AAAA-MM-DD o relatório é só desses
+    // dias (os dois inteiros, horário de Brasília): hoje, ontem, um dia qualquer ou um intervalo de até 92 dias.
+    let ateISO = null, deDia = null, ateDia = null;
+    const _dOk = s => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) && isFinite(Date.parse(String(s) + 'T00:00:00Z'));
+    if (_dOk(req.query.de) && _dOk(req.query.ate)) {
+      deDia = String(req.query.de); ateDia = String(req.query.ate);
+      if (deDia > ateDia) { const x = deDia; deDia = ateDia; ateDia = x; }
+      const n = Math.round((Date.parse(ateDia + 'T00:00:00Z') - Date.parse(deDia + 'T00:00:00Z')) / 86400000) + 1;
+      if (n > 92) return res.status(400).json({ error: 'Escolha um período de até 92 dias.' });
+      dias = n; iniBrt = new Date(Date.parse(deDia + 'T00:00:00Z'));
+      ateISO = new Date(Date.parse(ateDia + 'T00:00:00Z') + 27 * 3600000).toISOString(); // 00:00 (Brasília) do dia seguinte: fica de fora
+    }
     const desdeISO = new Date(iniBrt.getTime() + 3 * 3600000).toISOString();
 
     const temAutor = await _colunaSentBy();
@@ -13262,9 +13275,9 @@ app.get('/relatorios', async (req, res) => {
     const msgs = [];
     let limitado = false;
     for (let p = 0; p < 30; p++) {
-      const { data, error } = await supabase.from('messages').select(cols)
-        .eq('owner', req.owner).gte('timestamp', desdeISO)
-        .order('timestamp', { ascending: true }).range(p * 1000, p * 1000 + 999);
+      let _q = supabase.from('messages').select(cols).eq('owner', req.owner).gte('timestamp', desdeISO);
+      if (ateISO) _q = _q.lt('timestamp', ateISO);
+      const { data, error } = await _q.order('timestamp', { ascending: true }).range(p * 1000, p * 1000 + 999);
       if (error) break;
       if (!data || !data.length) break;
       msgs.push(...data);
@@ -13368,8 +13381,9 @@ app.get('/relatorios', async (req, res) => {
     // ── leads novos no período (só se a coluna created_at existir) ──
     let leadsNovos = null;
     try {
-      const { data, error } = await supabase.from('contacts').select('created_at')
-        .eq('owner', req.owner).gte('created_at', desdeISO).limit(5000);
+      let _ql = supabase.from('contacts').select('created_at').eq('owner', req.owner).gte('created_at', desdeISO);
+      if (ateISO) _ql = _ql.lt('created_at', ateISO);
+      const { data, error } = await _ql.limit(5000);
       if (!error && data) {
         leadsNovos = data.length;
         data.forEach(c => { const d = _diaBrt(Date.parse(c.created_at)); if (porDia[d]) porDia[d].leads++; });
@@ -13413,7 +13427,7 @@ app.get('/relatorios', async (req, res) => {
     })).sort((a, b) => b.enviadas - a.enviadas);
 
     res.json({
-      dias, desde: desdeISO, limitado, tem_autor: temAutor,
+      dias, desde: desdeISO, de: deDia || iniBrt.toISOString().slice(0, 10), ate: ateDia || _diaBrt(Date.now()), limitado, tem_autor: temAutor,
       por_dia: Object.values(porDia),
       totais: {
         enviadas: msgs.filter(m => m.direction === 'outbound').length,
