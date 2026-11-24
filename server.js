@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 454;
+const SERVER_VER = 455;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -1514,13 +1514,17 @@ app.post("/webhook", async (req, res) => {
 
         // (a notificação push já saiu lá em cima, antes das gravações)
         // Processa reply de bot ativo (texto OU clique em botão/lista)
+        let _botCuidou = false;
         if (['text','button','interactive'].includes(type) && content) {
           try {
             const _tratou = await handleBotReply(from, content, ownerEmail);
+            _botCuidou = !!_tratou;
             // 🔘 (v446) clicou no botão do modelo DEPOIS que a espera do bot venceu: o bot segue pelo botão clicado
-            if (!_tratou && type !== 'text' && message.context && message.context.id) await _botCliqueTardio(from, content, ownerEmail, message.context.id);
+            if (!_tratou && type !== 'text' && message.context && message.context.id) _botCuidou = !!(await _botCliqueTardio(from, content, ownerEmail, message.context.id));
           } catch(be) { console.error('Bot reply error:', be.message); }
         }
+        // ⚡ (v455) a sugestão da IA começa a ser pensada JÁ (fica pronta para quando ela abrir a conversa)
+        if (!msgErr && !_botCuidou && type !== 'reaction') _iaPreAquece(ownerEmail, from);
         // IA: regra de "contato errado" primeiro; se não tratou, tenta o FAQ
         if (['text','button','interactive'].includes(type) && content) {
           try {
@@ -10184,6 +10188,51 @@ app.post('/faqs/ai-test', async (req, res) => {
 const IA_SUG_MODELOS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']; // (llama-3.3-70b saiu: o Groq responde 404 "does not exist")
 const _iaMemCache = {};   // dona → { t, estilo, fluxo, exemplos:[…], brutoExemplos }
 const _iaSugCache = {};   // dona|fone|últimaMsgDoLead → { t, mensagens }
+// ⚡ SUGESTÃO PRONTA ANTES DE ELA ABRIR A CONVERSA (v455) — ela (24/11): "Sugestão da IA demora muito para aparecer depois
+// que eu abro a conversa". A sugestão só começava a ser pensada quando a conversa era aberta (e a IA leva vários
+// segundos). Agora, quando o LEAD manda mensagem, o servidor espera a rajada dele acabar (IA_PRE_ESPERA_MS, 8 s) e
+// já pensa a sugestão — ela fica guardada (3 h, enquanto não chegar/sair outra mensagem na conversa) e aparece na hora
+// em que a conversa abre. Uma de cada vez, para não estourar o limite por minuto do provedor.
+// 💰 Para não gastar à toa: não pensa se um bot tratou a mensagem, se a última mensagem já não é do lead (ela respondeu
+// pelo celular), em conversa do WhatsApp do PC nem em número de teste; para 2 min se o provedor reclamar de limite; e
+// tem teto por dia (IA_PRE_TETO_DIA, 400 — 0 desliga).
+const IA_PRE_ESPERA_MS = Math.max(0, parseInt(process.env.IA_PRE_ESPERA_MS || '8000', 10) || 0);
+const IA_PRE_TETO_DIA = Math.max(0, parseInt(process.env.IA_PRE_TETO_DIA || '400', 10) || 0);
+const IA_SUG_GUARDA_MS = 3 * 3600000;
+const _iaPreT = new Map(), _iaPreFila = [];
+const _iaPre = { rodando: false, dia: '', n: 0, pausaAte: 0, feitas: 0, puladas: 0 };
+function _iaPreAquece(owner, phone) {
+  try {
+    if (!owner || !phone || !supabase || IA_PRE_TETO_DIA <= 0) return;
+    if (process.env.VETRA_BANCADA === '1' && process.env.IA_PRE_BANCADA !== '1') return; // nas bancadas antigas nada pensa sozinho (elas contam as chamadas à IA)
+    if (String(owner).toLowerCase() !== _CONTA_IA || !_iaTemChave()) return;
+    const k = owner + '|' + String(phone).replace(/\D/g, '');
+    clearTimeout(_iaPreT.get(k)); // ele ainda está escrevendo: recomeça a contar
+    _iaPreT.set(k, setTimeout(() => { _iaPreT.delete(k); if (!_iaPreFila.includes(k)) _iaPreFila.push(k); _iaPreAnda().catch(() => {}); }, IA_PRE_ESPERA_MS));
+  } catch (_) {}
+}
+async function _iaPreAnda() {
+  if (_iaPre.rodando) return;
+  _iaPre.rodando = true;
+  try {
+    while (_iaPreFila.length) {
+      const k = _iaPreFila.shift(); const i = k.indexOf('|'); const owner = k.slice(0, i), phone = k.slice(i + 1);
+      const hoje = _diaBrt(Date.now()); if (hoje !== _iaPre.dia) { _iaPre.dia = hoje; _iaPre.n = 0; }
+      if (_iaPre.n >= IA_PRE_TETO_DIA || Date.now() < _iaPre.pausaAte) { _iaPre.puladas++; continue; }
+      try {
+        if (!(await _iaSugLigada(owner))) { _iaPre.puladas++; continue; }
+        // a última mensagem ainda é do lead? (ela pode ter respondido pelo celular, ou um bot ter falado)
+        const { data: u } = await supabase.from('messages').select('direction, type').in('phone', phoneVariants(phone)).eq('owner', owner).order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(3);
+        const ult = (u || []).filter(m => m && m.type !== 'note')[0];
+        if (!ult || ult.direction === 'outbound') { _iaPre.puladas++; continue; }
+        _iaPre.n++;
+        const r = await _iaSugere(owner, phone, false);
+        if (r && r.motivo && !r.definitivo && !((r.itens || []).length)) _iaPre.pausaAte = Date.now() + 120000; // limite/erro passageiro: dá um tempo
+        else _iaPre.feitas++;
+      } catch (e) { _iaPre.pausaAte = Date.now() + 120000; }
+    }
+  } finally { _iaPre.rodando = false; }
+}
 const _iaMemK = (owner, parte) => 'ia_mem::' + (owner || ' ') + '::' + parte;
 
 function _iaLinhasJsonl(txt) {
@@ -10229,6 +10278,8 @@ async function _iaMemoria(owner, semCache) {
 }
 async function _iaMemoriaGrava(owner, parte, valor) {
   const quando = new Date().toISOString();
+  // (v455) mudou o manual ou o estilo: as sugestões guardadas foram pensadas com a regra antiga — saem
+  if (parte === 'fluxo' || parte === 'estilo') { try { const p = (owner || ' ') + '|'; Object.keys(_iaSugCache).forEach(k => { if (k.startsWith(p)) delete _iaSugCache[k]; }); } catch (_) {} }
   await supabase.from('settings').upsert({ key: _iaMemK(owner, parte), value: String(valor || ''), updated_at: quando });
   // a cópia na memória recebe o que acabou de ser gravado (e o carimbo novo): a próxima leitura não baixa nada
   const k = owner || ' ', c = _iaMemCache[k];
@@ -11141,7 +11192,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
   if (!treino && ult.account_id && await _ehContaPC(ult.account_id)) return { mensagens: [], definitivo: true, motivo: 'conversa do WhatsApp do PC — a IA fica de fora do número pessoal' }; // 💻 (v444)
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
   const c = _iaSugCache[chave];
-  if (c && !forcar && !treino && Date.now() - c.t < 10 * 60000) return c.r;
+  if (c && !forcar && !treino && Date.now() - c.t < IA_SUG_GUARDA_MS) return c.r; // (v455: 3 h — a chave já muda a cada mensagem nova da conversa)
   // ⏱️ O resumo da parte antiga é OUTRA chamada à IA: antes a sugestão esperava por ela (dobrava o
   // tempo). Agora usa o resumo já guardado; se precisa refazer, refaz em segundo plano e esta
   // sugestão sai sem ele (a próxima já pega o novo).
@@ -15769,9 +15820,11 @@ app.post('/evolution-webhook', async (req, res) => {
         if (!fromMe && !(await _isContactMuted(phone, ownerEmail))) sendPushToOwner(ownerEmail, { title: tituloPush, body: preview, phone, tag: 'chat-' + phone }, { t_msg: Number(data.messageTimestamp) > 0 ? Number(data.messageTimestamp) * 1000 : null }).catch(() => {});
 
         // Bot e n8n só para mensagens RECEBIDAS
+        let _botCuidouQr = false;
         if (!fromMe && type === 'text' && content) {
-          try { await handleBotReply(phone, content, ownerEmail); } catch(be) { console.error('Bot reply error:', be.message); }
+          try { _botCuidouQr = !!(await handleBotReply(phone, content, ownerEmail)); } catch(be) { console.error('Bot reply error:', be.message); }
         }
+        if (!fromMe && !_botCuidouQr) _iaPreAquece(ownerEmail, phone); // ⚡ (v455) sugestão pronta antes de ela abrir a conversa
         if (!fromMe) {
           const n8nUrl = _cfg('n8n_webhook_url', ownerEmail); // n8n da DONA desta conta
           if (n8nUrl) {
@@ -15799,4 +15852,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaSemPontoFinal, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _dripBotsDaEtapa, _dripBotsCache,_sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaSemPontoFinal, _iaPreAquece, _iaPre, _iaPreFila, _iaSugCache, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _dripBotsDaEtapa, _dripBotsCache,_sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
