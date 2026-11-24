@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 453;
+const SERVER_VER = 454;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -4243,12 +4243,32 @@ app.get("/media-proxy/:mediaId", async (req, res) => {
 });
 
 // ── Lista todas as tags existentes (para sugestões e filtro) ──
+const _tagsCache = {}; // dono → { em, tags } — etiquetas em uso nos leads (60 s)
+// mexeu em etiqueta pela tela (lead, em lote ou no gerenciador)? a lista guardada deixa de valer na hora
+app.use((req, res, next) => {
+  try { if (req.method !== 'GET' && req.owner && /\/tags(\/|$)|bulk-tags/.test(req.path)) { const d = req.owner; delete _tagsCache[d]; res.on('finish', () => { delete _tagsCache[d]; }); } } catch (_) {}
+  next();
+});
 app.get("/tags", async (req, res) => {
   if (!supabase) return res.json([]);
-  const { data, error } = await supabase.from("contacts").select("tags").eq("owner", req.owner || ' ');
-  if (error) return res.status(500).json({ error: error.message });
-  const set = new Set();
-  (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) set.add(t); }));
+  // (v454) Ela (24/11), no passo de etiquetas do bot: "Tem etiquetas que já existem mas não mostra aqui, por exemplo a
+  // INSS e a SIAPE". Esta lista lia só os 1.000 primeiros leads (o teto de uma leitura do banco): etiqueta que só
+  // existe em lead depois disso ficava de fora. Agora lê todos, em páginas, e guarda o resultado por 60 s
+  // (🪙 cota do banco: a lista é pedida toda vez que se abre o chat, o funil ou o editor de bots).
+  const dono = req.owner || ' ';
+  const emCache = _tagsCache[dono];
+  let usadas = emCache && Date.now() - emCache.em < 60000 ? emCache.tags : null;
+  if (!usadas) {
+    const s = new Set();
+    for (let p = 0; p < 60; p++) {
+      const { data, error } = await supabase.from("contacts").select("tags").eq("owner", dono).order('phone', { ascending: true }).range(p * 1000, p * 1000 + 999);
+      if (error) { if (p === 0) return res.status(500).json({ error: error.message }); break; }
+      (data || []).forEach(c => (c.tags || []).forEach(t => { if (t) s.add(t); }));
+      if (!data || data.length < 1000) break;
+    }
+    usadas = Array.from(s); _tagsCache[dono] = { em: Date.now(), tags: usadas };
+  }
+  const set = new Set(usadas);
   _tagCatalog(req.owner).forEach(t => set.add(t)); // inclui tags criadas no gerenciador (catálogo DA CONTA)
   res.json(Array.from(set).sort((a, b) => a.localeCompare(b)));
 });
@@ -10431,6 +10451,14 @@ const _IA_ESTADOS = [
 const _iaNormEst = x => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 function _iaEstadoAfirmado(t) { const n = _iaNormEst(t); return _IA_ESTADOS.filter(e => e[1].test(n)).map(e => e[0]); }
 const _IA_ENROLA = /^(se precisar|caso precise|caso tenha|caso queira|qualquer duvida|qualquer coisa|se tiver (alguma |qualquer )?duvida|se houver (alguma |qualquer )?duvida|fico a disposicao|estou a disposicao|estarei a disposicao|estou aqui|estarei por aqui|estamos a disposicao|precisando)\b|\ba disposicao\b/;
+// (v454) Ela (24/11), com as sugestões "Pode ser que o aplicativo esteja com instabilidade no momento." e "Tente
+// novamente mais tarde ou, se preferir, pode enviar por outro meio.": "Nunca envie sugestão com ponto final".
+// Tira o ponto final do fim da mensagem (e do fim de cada linha), também quando vem antes de um emoji
+// ("Fico no aguardo. 🙏🏼" → "Fico no aguardo 🙏🏼"). Reticências, "?" e "!" ficam; ponto no MEIO da frase fica.
+function _iaSemPontoFinal(t) {
+  const _fim = /(?<![.…])\.((?:\s*(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|️|‍))*)$/u;
+  return String(t || '').split('\n').map(l => l.replace(/\s+$/, '').replace(_fim, '$1')).join('\n').trim();
+}
 function _iaSemEnrolacao(t) {
   const partes = String(t || '').split(/(?<=[.!?…])\s+(?=\S)/); // frases (o emoji do fim fica com a frase dele)
   const boas = partes.filter(f => !_IA_ENROLA.test(_iaNormEst(f)));
@@ -11209,6 +11237,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + '- PRIMEIRO identifique o ASSUNTO da última fala do lead (ex.: estorno de parcela, parcela cobrada em dobro, dúvida sobre contrato, reclamação, pedido de documento, andamento da operação, cortesia). Responda a ESSE assunto. Se o lead trouxe um assunto fora da operação (estorno, cobrança, reclamação, dúvida avulsa), NÃO puxe a solicitação de saldo nem a próxima fase — resolva o assunto dele; só volte ao fluxo se ele pedir ou quando o assunto estiver encerrado.\n'
     + '- ANTES de escrever, descubra pela CONVERSA DESTE CLIENTE (não pelos exemplos) em qual das etapas do manual ele está HOJE e o que já foi feito com ele. A resposta tem de servir para ESTE cliente nesta etapa; o que aconteceu com outros clientes não vale aqui. O "porque" tem de citar uma fala DESTA conversa (entre aspas) que mostra a etapa. Prazo que não está escrito nesta conversa vai em dias úteis pelo manual ("em até 5 dias úteis"), nunca como data dd/mm.\n'
     + '- Responda SOMENTE com JSON no formato {"assunto":"...","mensagens":["...","..."],"porque":"..."}: "assunto" em 2–5 palavras; as mensagens VÊM ANTES do porquê; "porque" em 1 ou 2 frases curtas (no máximo 300 caracteres), em português, dizendo EM QUE você se baseou (qual exemplo parecido, qual regra do manual, qual fase/dia da operação, qual novidade) e por que escolheu essa resposta e não outra; e de 1 a 3 mensagens curtas, na ordem de envio, uma ideia por mensagem, como ela manda no WhatsApp.\n'
+    + '- NUNCA termine uma mensagem com ponto final: ela escreve como no WhatsApp ("Vou verificar e já te aviso", sem o ponto no fim). Interrogação, exclamação e emoji no fim continuam valendo.\n'
     + '- VOCÊ NÃO VÊ O SISTEMA DO BANCO: só ela sabe se o saldo chegou, se veio maior ou menor, se enquadrou, se averbou, se o valor foi creditado, se a proposta foi digitada ou cancelada. NUNCA afirme nada disso se ELA não escreveu nesta conversa. Se a resposta depende disso, entregue só o esqueleto com marcador ([VALOR]) do que ela costuma mandar nesse passo, ou {"mensagens":[]}.\n'
     + '- TAMANHO: ela responde curto. Confirmação é "Isso mesmo", "Está bem", "Sim, …" e para aí. Se a resposta cabe em 5 palavras, use 5 palavras. PROIBIDO fechar com "Se precisar, estou à disposição", "Qualquer dúvida, me avisa", "Se precisar de ajuda…" ou parecido.\n'
     + '- Só TEXTO escrito por ela, personalizado para ESTE cliente e para o momento da operação dele. Nada de atalho, bot, modelo pronto ou bloco padrão copiado.\n'
@@ -11338,7 +11367,8 @@ async function _iaSugere(owner, phone, forcar, opts) {
     else if (_fim.devolve || _fim.deus) itensSemRep = [{ tipo: 'texto', texto: (_fim.deus ? 'Amém, obrigada' : 'Obrigada') + (primeiro ? ', ' + primeiro : '') + '!' + (_fim.devolve ? ' ' + _fim.devolve.charAt(0).toUpperCase() + _fim.devolve.slice(1) + ' pra você também' : '') + ' 🙏🏼' }];
     else itensSemRep = [];
   }
-  const itens = itensSemRep.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it);
+  const itens = itensSemRep.map(it => it.tipo === 'texto' && primeiro ? { ...it, texto: it.texto.replace(/\{nome\}/g, primeiro) } : it)
+    .map(it => it.tipo === 'texto' ? { ...it, texto: _iaSemPontoFinal(it.texto) } : it).filter(it => it.tipo !== 'texto' || it.texto); // (v454) nunca com ponto final
   const mensagens = itens.filter(it => it.tipo === 'texto').map(it => it.texto); // app antigo: só os textos
   // 🔍 "Quero entender o porquê da sugestão": o que a IA viu e em que se baseou, para a tela mostrar
   const _cj = _iaCamposJson(texto);
@@ -15769,4 +15799,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _dripBotsDaEtapa, _dripBotsCache,_sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaSemPontoFinal, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _dripBotsDaEtapa, _dripBotsCache,_sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
