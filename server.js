@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 458;
+const SERVER_VER = 459;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -4362,6 +4362,45 @@ app.get("/tags", async (req, res) => {
   const set = new Set(usadas);
   _tagCatalog(req.owner).forEach(t => set.add(t)); // inclui tags criadas no gerenciador (catálogo DA CONTA)
   res.json(Array.from(set).sort((a, b) => a.localeCompare(b)));
+});
+// 🎨 (v459) CORES DAS ETIQUETAS SEM REPETIR — ela (25/11, print): "tag INSS e SIAPE estão com a mesma cor".
+// A cor automática saía de uma conta com o NOME da etiqueta, entre só 6 cores (duas delas verdes): com 23 etiquetas,
+// várias caíam na mesma. Agora são 12 cores e quem escolhe a automática é o servidor, uma vez só, e GUARDA:
+// cada etiqueta sem cor recebe a cor MENOS usada até ali (primeiro as de palavra — INSS, SIAPE, DIGITAR… —, depois
+// as de número), então duas etiquetas só repetem cor quando as 12 já foram usadas. Cor escolhida por ela no
+// gerenciador nunca é trocada. GET /tags/cores devolve { nome: cor } usando a lista de etiquetas já guardada (60 s) —
+// a tela pede isto ao abrir, no lugar do /tags/manage (que lia os leads de novo).
+const TAG_N_CORES = 12;
+function _tagCorPreferida(nome) { let h = 0; const b = String(nome || '').trim().toLowerCase(); for (let i = 0; i < b.length; i++) h = (h * 31 + b.charCodeAt(i)) >>> 0; return h % TAG_N_CORES; }
+async function _tagCoresCompleta(owner, nomes) {
+  const mapa = _tagCores(owner); let mudou = false;
+  const lista = Array.from(new Set((nomes || []).map(n => String(n || '')).filter(Boolean)));
+  const uso = new Array(TAG_N_CORES).fill(0);
+  lista.forEach(n => { const c = mapa[n]; if (c != null && c >= 0 && c < TAG_N_CORES) uso[c]++; });
+  const ehNumero = n => /^\d+$/.test(n.trim());
+  const ordem = lista.filter(n => mapa[n] == null).sort((a, b) => (ehNumero(a) - ehNumero(b)) || a.localeCompare(b));
+  for (const n of ordem) {
+    const pref = _tagCorPreferida(n); let melhor = pref;
+    for (let k = 1; k < TAG_N_CORES; k++) { const c = (pref + k) % TAG_N_CORES; if (uso[c] < uso[melhor]) melhor = c; }
+    mapa[n] = melhor; uso[melhor]++; mudou = true;
+  }
+  if (mudou && supabase) {
+    const k = 'tag_cores::' + (owner || ' ');
+    try { await supabase.from('settings').upsert({ key: k, value: JSON.stringify(mapa), updated_at: new Date().toISOString() }); _settings[k] = JSON.stringify(mapa); } catch (_) {}
+  }
+  return mapa;
+}
+app.get('/tags/cores', async (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  if (!supabase) return res.json({});
+  try {
+    const dono = req.owner || ' ';
+    const emCache = _tagsCache[dono];
+    const set = new Set(emCache ? emCache.tags : []); // (a lista de /tags, pedida logo antes pela tela; vazia = só o catálogo e as já coloridas)
+    _tagCatalog(req.owner).forEach(t => set.add(t));
+    const mapa = await _tagCoresCompleta(req.owner, Array.from(set));
+    res.json(mapa);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Busca por nome, telefone OU conteúdo das mensagens ──
@@ -12118,7 +12157,7 @@ app.get('/tags/manage', async (req, res) => {
   res.json(out);
 });
 
-// Cor escolhida para cada etiqueta (índice 0..5) — guardada por conta
+// Cor de cada etiqueta (índice 0..11) — guardada por conta (escolhida por ela ou dada pelo servidor: ver _tagCoresCompleta)
 function _tagCores(owner) {
   try { const o = JSON.parse(_cfg('tag_cores', owner) || '{}'); return (o && typeof o === 'object') ? o : {}; }
   catch (_) { return {}; }
@@ -12130,7 +12169,7 @@ app.put('/tags/cor', async (req, res) => {
   const cor = req.body?.cor;
   const mapa = _tagCores(req.owner);
   if (cor == null || cor === '') delete mapa[name];
-  else mapa[name] = Math.max(0, Math.min(5, parseInt(cor, 10) || 0));
+  else mapa[name] = Math.max(0, Math.min(TAG_N_CORES - 1, parseInt(cor, 10) || 0)); // (v459) 12 cores
   const k = 'tag_cores::' + (req.owner || ' ');
   await supabase.from('settings').upsert({ key: k, value: JSON.stringify(mapa), updated_at: new Date().toISOString() });
   _settings[k] = JSON.stringify(mapa);
