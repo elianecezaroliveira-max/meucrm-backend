@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 455;
+const SERVER_VER = 457;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -2766,8 +2766,22 @@ app.post('/pc/espelho', async (req, res) => {
         if (!resto || !resto.length) await supabase.from('contacts').delete().eq('owner', owner).eq('phone', interno).eq('account_id', conta);
       }
     } catch (_) {}
-    const { data: ja } = await supabase.from('messages').select('wamid').eq('owner', owner).in('wamid', msgs.map(m => m.wamid));
+    const { data: ja } = await supabase.from('messages').select('wamid, status').eq('owner', owner).in('wamid', msgs.map(m => m.wamid));
     const tem = new Set((ja || []).map(x => x.wamid));
+    // (v456) Ela (25/11, print): "apenas a última mensagem no FILAZ constou como entregue" — a mensagem MINHA entrava com
+    // o tique do instante em que foi lida da tela (✓ enviada) e nunca mais mudava. Agora o tique que o WhatsApp do PC
+    // mostra SOBE aqui também (enviada → entregue → lida); nunca desce.
+    const _pcGrau = { sent: 1, delivered: 2, read: 3 };
+    const subiram = new Set();
+    try {
+      const porSt = {};
+      for (const x of (ja || [])) {
+        const m = msgs.find(y => y.wamid === x.wamid);
+        if (!m || m.direction !== 'outbound') continue;
+        if ((_pcGrau[m.st] || 0) > (_pcGrau[String(x.status || '')] || 0)) { (porSt[m.st] = porSt[m.st] || []).push(x.wamid); subiram.add(x.wamid); }
+      }
+      for (const st of Object.keys(porSt)) await supabase.from('messages').update({ status: st }).eq('owner', owner).in('wamid', porSt[st]);
+    } catch (_) {}
     let novas = msgs.filter(m => !tem.has(m.wamid));
     // o que ELA enviou pelo FILAZ (fila do PC) aparece depois na tela do WhatsApp: é a MESMA mensagem — casa em vez de duplicar
     if (novas.some(m => m.direction === 'outbound')) {
@@ -2791,7 +2805,20 @@ app.post('/pc/espelho', async (req, res) => {
       else if (!c.last_message_at || new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(c.last_message_at)) ? c.last_message_at : String(c.last_message_at) + 'Z').getTime() <= new Date(ult.ts).getTime())
         await supabase.from('contacts').update({ last_message_at: ult.ts, last_message_preview: previa, last_message_direction: ult.direction, last_message_status: ult.direction === 'outbound' ? ult.st : null }).eq('phone', phone).eq('owner', owner);
     }
-    res.json({ ok: true, phone, novos: novas.length });
+    // (v456) o tique da ÚLTIMA mensagem (minha) subiu: a lista de conversas mostra o mesmo tique
+    if (subiram.size) {
+      try {
+        const fim = msgs.reduce((a, m) => (!a || m.ts >= a.ts) ? m : a, null);
+        if (fim && fim.direction === 'outbound' && subiram.has(fim.wamid)) {
+          const { data: c0 } = await supabase.from('contacts').select('last_message_at, last_message_direction').eq('phone', phone).eq('owner', owner).maybeSingle();
+          const t0 = c0 && c0.last_message_at ? new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(c0.last_message_at)) ? c0.last_message_at : String(c0.last_message_at) + 'Z').getTime() : 0;
+          // (a mensagem enviada pelo FILAZ fica com a hora do envio; na tela do WhatsApp ela só tem o minuto — folga de 90 s)
+          if (c0 && c0.last_message_direction === 'outbound' && t0 <= new Date(fim.ts).getTime() + 90000)
+            await supabase.from('contacts').update({ last_message_status: fim.st }).eq('phone', phone).eq('owner', owner);
+        }
+      } catch (_) {}
+    }
+    res.json({ ok: true, phone, novos: novas.length, tiques: subiram.size });
   } catch (e) { console.error('PC espelho:', e.message); res.status(500).json({ error: e.message }); }
 });
 // 🔔 AVISOS DO WHATSAPP DO PC (v453) — ela (23/11): "Tem como fazer com que as notificações do WhatsApp que eu tenho
@@ -2876,7 +2903,61 @@ app.post('/pc/avisos', async (req, res) => {
 app.get('/pc/saida', (req, res) => {
   if (!_exigeLogin(req, res)) return;
   _pcVisto[req.owner] = Date.now();
-  res.json({ fila: (_pcFila.get(req.owner) || []).map(x => ({ id: x.id, nome: x.nome, texto: x.texto, ha_s: Math.round((Date.now() - x.em) / 1000) })) });
+  const resp = { fila: (_pcFila.get(req.owner) || []).map(x => ({ id: x.id, nome: x.nome, texto: x.texto, ha_s: Math.round((Date.now() - x.em) / 1000) })) };
+  // (v457) as reações só vão para o assistente que DIZ que sabe reagir (?reacao=1, Assistente 2.11+). O antigo trata
+  // tudo o que vem na "fila" como texto para colar — por isso elas vêm num campo à parte e nunca na fila.
+  if (String(req.query.reacao || '') === '1') {
+    _pcSabeReagir[req.owner] = Date.now();
+    resp.reacoes = (_pcReac.get(req.owner) || []).map(x => ({ id: x.id, nome: x.nome, emoji: x.emoji, tirar: x.tirar, lado: x.lado, texto: x.texto, ts: x.ts, ha_s: Math.round((Date.now() - x.em) / 1000) }));
+  }
+  res.json(resp);
+});
+// 😀 REAÇÃO PELO WHATSAPP DO PC (v457) — ela (25/11): "Não deixa reagir com emoji também" … "Reação, faça".
+// POST /react numa conversa da conta PC: o pedido fica aqui (só memória) e a resposta ESPERA o assistente — ele acha a
+// mensagem na tela do WhatsApp do PC (lado + hora + texto), passa o mouse nela, aperta "Reagir" e o emoji, e confirma
+// (POST /pc/reacao/feito). Só então a reação é gravada no FILAZ: nada aparece como reagido se não saiu de verdade.
+//   • só os 6 emojis da barra de reações do WhatsApp (👍 ❤️ 😂 😮 😢 🙏); tirar = apertar de novo o mesmo emoji;
+//   • assistente fechado, antigo, conversa errada aberta, mensagem fora da tela → recusa com o motivo, na hora.
+const _pcReac = new Map();      // dono → [{ id, phone, nome, emoji, tirar, lado, texto, ts, em, fim }]
+const _pcSabeReagir = {};       // dono → quando um assistente que sabe reagir consultou pela última vez
+const PC_REACAO_ESPERA_MS = parseInt(process.env.PC_REACAO_ESPERA_MS || '25000', 10);
+const _PC_REAC_BARRA = ['👍', '❤', '😂', '😮', '😢', '🙏'];
+const _pcEmojiBase = s => String(s || '').replace(/[\u{1F3FB}-\u{1F3FF}️]/gu, '').trim(); // sem tom de pele e sem o seletor de variação
+async function _pcReage(req, res, { wamid, emoji }) {
+  const owner = req.owner;
+  const naoDeu = (msg) => res.status(400).json({ error: msg, pc: true });
+  if (!_pcVivo(owner)) return naoDeu('O FILAZ Assistente não está aberto no PC — abra o ASSISTENTE.bat para a reação sair pelo WhatsApp do PC.');
+  if (Date.now() - (_pcSabeReagir[owner] || 0) > 20000) return naoDeu('O FILAZ Assistente aberto no PC é antigo e não sabe reagir — feche e abra o ASSISTENTE.bat.');
+  if (/^pcav:/.test(String(wamid))) return naoDeu('Esta é só a prévia do aviso — abra a conversa no WhatsApp do PC e reaja depois que as mensagens entrarem aqui.');
+  const { data: msg } = await supabase.from('messages').select('phone, direction, content, timestamp, status, reaction, reaction_by').eq('wamid', wamid).eq('owner', owner).maybeSingle();
+  if (!msg) return naoDeu('Não achei essa mensagem para reagir.');
+  if (msg.direction === 'outbound' && (msg.status === 'failed' || msg.status === 'pending')) return naoDeu('Esta mensagem não saiu pelo WhatsApp do PC — não há como reagir a ela.');
+  let alvo = _pcEmojiBase(emoji);
+  const tirar = !alvo;
+  if (tirar) {
+    if (!msg.reaction || msg.reaction_by === 'contact') return naoDeu('Esta mensagem não tem reação sua para tirar.');
+    alvo = _pcEmojiBase(msg.reaction);
+  }
+  if (!_PC_REAC_BARRA.includes(alvo)) return naoDeu('Pelo WhatsApp do PC o FILAZ só reage com os emojis da barra de reações de lá: 👍 ❤️ 😂 😮 😢 🙏.');
+  const nome = (await _pcNomesDe(owner))[msg.phone];
+  if (!nome) return naoDeu('Abra esta conversa no WhatsApp do PC (com o assistente aberto) e reaja de novo.');
+  const tsIso = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(msg.timestamp)) ? msg.timestamp : String(msg.timestamp) + 'Z').toISOString();
+  const item = { id: 'pcreac:' + require('crypto').randomBytes(8).toString('hex'), phone: msg.phone, nome, emoji: alvo, tirar, lado: msg.direction === 'outbound' ? 'dir' : 'esq', texto: String(msg.content || '').slice(0, 300), ts: tsIso, em: Date.now() };
+  const l = _pcReac.get(owner) || []; l.push(item); _pcReac.set(owner, l);
+  const r = await new Promise(resolve => { item.fim = resolve; setTimeout(() => resolve({ ok: false, venceu: true }), PC_REACAO_ESPERA_MS); });
+  item.fim = null; { const i = l.indexOf(item); if (i >= 0) l.splice(i, 1); }
+  if (!r.ok) return naoDeu(r.venceu ? 'O FILAZ Assistente não respondeu a tempo — a reação não saiu. Confira no WhatsApp do PC antes de reagir de novo.' : String(r.erro || 'O assistente não conseguiu reagir pelo WhatsApp do PC.').slice(0, 300));
+  await supabase.from('messages').update({ reaction: emoji || null, reaction_by: 'me' }).eq('wamid', wamid).eq('owner', owner);
+  res.json({ success: true, via: 'pc' });
+  _previaMinhaReacao(wamid, emoji, owner).catch(() => {});
+}
+// POST /pc/reacao/feito { id, ok, erro? } — o assistente reagiu (ou não conseguiu) no WhatsApp do PC
+app.post('/pc/reacao/feito', (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const b = req.body || {}; const item = (_pcReac.get(req.owner) || []).find(x => x.id === String(b.id || ''));
+  if (!item || !item.fim) return res.json({ ok: true, ja: true });
+  item.fim({ ok: !!b.ok, erro: b.erro });
+  res.json({ ok: true });
 });
 // POST /pc/saida/feito { id, ok, erro? } — o assistente enviou (ou não conseguiu)
 app.post('/pc/saida/feito', async (req, res) => {
@@ -3034,6 +3115,12 @@ app.post("/react", async (req, res) => {
   if (!_exigeLogin(req, res)) return;
   const { to, wamid, emoji, account_id } = req.body;
   if (!to || !wamid) return res.status(400).json({ error: "Informe 'to' e 'wamid'" });
+
+  // (v456) conversa do WhatsApp do PC — ela (25/11, print) recebia "WhatsApp QR desconectado — gere o QR novamente em
+  // Contas", que não tem nada a ver. (v457) "Reação, faça": a reação vai para o FILAZ Assistente, que reage lá no
+  // WhatsApp do PC (passa o mouse na mensagem e aperta o emoji da barra de reações) e responde se deu certo.
+  let _ehPC = false; try { _ehPC = !!(supabase && account_id && await _ehContaPC(account_id)); } catch (_) {}
+  if (_ehPC) { try { return await _pcReage(req, res, { wamid, emoji }); } catch (e) { console.error('Reação pelo PC:', e.message); return res.status(500).json({ error: 'Falha ao reagir pelo WhatsApp do PC: ' + e.message, pc: true }); } }
 
   // Conta QR (motor embutido): reage direto pelo WhatsApp pareado
   if (WA_EMBEDDED && supabase && account_id) {
