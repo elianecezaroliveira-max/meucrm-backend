@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 459;
+const SERVER_VER = 460;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -9052,8 +9052,23 @@ async function _executaPassoSilencioso(node, run) {
 // gravação, ninguém ficava sabendo: o bot seguia e a tarefa simplesmente não existia.
 async function _criaTarefaDoBot(cfg, run) {
   const phone = run.contact_phone, OW = run.owner || ' ';
-  let nome = phone;
-  try { const { data: ct } = await supabase.from('contacts').select('name').eq('phone', phone).eq('owner', OW).maybeSingle(); nome = (ct && ct.name) || phone; } catch (_) {}
+  let nome = phone, tagsLead = [];
+  try { const { data: ct } = await supabase.from('contacts').select('name, tags').eq('phone', phone).eq('owner', OW).maybeSingle(); nome = (ct && ct.name) || phone; tagsLead = (ct && Array.isArray(ct.tags)) ? ct.tags : []; } catch (_) {}
+  // 🏷 (v460) TIPO PELA ETIQUETA DO LEAD — ela (25/11): "quando eu mandasse esse bot e a tag tiver INSS colocasse a tarefa
+  // com o tipo INSS, e quando tivesse SIAPE, colocar o tipo como SIAPE. E se não tiver nenhuma colocar como tipo SIMULAR
+  // mesmo". No passo ela marca QUAIS tipos a etiqueta pode escolher (cfg.tipo_pela_etiqueta = [ids dos tipos]): se o lead
+  // tem uma etiqueta com o MESMO NOME de um desses tipos (sem ligar para maiúscula/acento), a tarefa sai com esse tipo;
+  // se não tem, vale o tipo escolhido no passo. Só os tipos MARCADOS contam — na conta dela "DIGITAR" também é etiqueta
+  // e tipo, e não é para virar o tipo da tarefa. Lead com duas etiquetas marcadas → vale o tipo que vem primeiro na
+  // lista de tipos. (true = qualquer tipo com nome de etiqueta.)
+  const _tpe = cfg && cfg.tipo_pela_etiqueta;
+  const _tpeSo = Array.isArray(_tpe) ? new Set(_tpe.map(x => String(x))) : null;
+  if (_tpe && (!_tpeSo || _tpeSo.size) && tagsLead.length) {
+    const _n = x => String(x || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const _tem = new Set(tagsLead.map(_n).filter(Boolean));
+    const _tpTag = _tarefaTipos(run.owner).find(x => x && x.id && (!_tpeSo || _tpeSo.has(String(x.id))) && _tem.has(_n(x.nome)));
+    if (_tpTag) cfg = Object.assign({}, cfg, { tipo: _tpTag.id });
+  }
   // Passo sem tipo escolhido → Acompanhar
   cfg = Object.assign({}, cfg, { tipo: _tarefaTipoLimpo(cfg.tipo) || _tarefaTipoPadrao(run.owner) });
   // Sem nome próprio (o passo agora tem só TIPO + COMENTÁRIO): a tarefa leva o nome do tipo
@@ -16000,4 +16015,4 @@ app.post('/evolution-webhook', async (req, res) => {
 app.listen(PORT, () => console.log(`MeuCRM na porta ${PORT}`));
 // Gancho SÓ para as bancadas de teste (testes/): deixa injetar um WhatsApp QR de
 // mentira. Em produção a variável não existe e nada é exposto.
-if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaSemPontoFinal, _iaPreAquece, _iaPre, _iaPreFila, _iaSugCache, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _dripBotsDaEtapa, _dripBotsCache,_sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
+if (process.env.VETRA_BANCADA === '1') module.exports._bancada = { _criaTarefaDoBot, _dripDentroDaJanela, _waLigacaoEvento, _bloqueados, _retomaUma, _responsaveis, _sheetsBackup, _previaMidia, _iaBancoDaConversa, _iaBancosAtuais, _iaExemplosPorAssunto, _waPresence, _waUltimaMsgIn, _previaMinhaReacao, _trechoReacao, _qrMarcaLidaNoCelular, _qrChaves, _waEfemero, _waEfemeroAnota, _iaMemoria, _iaMemCache, _waSocks, _waState, _embrulhaEnvio, sendBotMsg, _iaExtraiMensagens, _iaAnonima, _iaExemplosParecidos, _previaEnviada, _iaVarreRespostas, _iaGuardaExemplo, handleBotReply, _euSouMaestro, _soMaestro, _jaGravada, _carimbos, _agTick, _acoesTick, _maestroReset: () => { _maestroChecado = 0; }, _maestroSolta, _dimsDaImagem, _midiaDims, _dripHist, _dripRitmoReal, _dripTick, _recordBotFail, _vigiaFalha, startBot, _numFora, _numPausados, _numPausadosSalva, _falhaDoLead, _iaNovidadeGeral, _iaMascaraExemplo, _iaFatos, _iaEncerramento, _pcFila, _pcVisto, _pcFoneInterno, _ehInstPC, _iaEstadoAfirmado, _iaSemEnrolacao, _iaSemPontoFinal, _iaPreAquece, _iaPre, _iaPreFila, _iaSugCache, _iaMascaraDocsNaMemoria, _dripMinMax, _dripForaNaRegra, _dripBotsDaEtapa, _dripBotsCache,_sheetsBackup, _backupDiarioTick, _backupMonta, _paradaGeral, _botAtivoCache, _silencioAgora, _dripSilenciada, processNode, _botCliqueTardio, _iaLimpaLeitura, _esqueceWamids: () => _fonePorWamid.clear(), _supabase: supabase, _convMudancasDesde, _maestroEstado: () => ({ sou: _souMaestro, encerrando: _encerrando }), _EU, _gastoResumo, _gastoSalva, _gastoCarrega, _gastoForca: (n) => { _gasto.forcado = n || null; }, _iaSugere, _iaNovidades, _iaExtraiNovidades, _iaEsgotados, _iaLentos, _primeiroNome, _iaCota429, _iaViradaDoDia, _iaEncurtaParaGroq, _iaCotaResumo, _iaMascara, _iaResumoCache, _gastoZera: () => { _gasto.bytes = 0; _gasto.dias = {}; _gasto.rotas = {}; _gasto.pend = { bytes: 0, dias: {}, rotas: {} }; } };
