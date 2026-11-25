@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 457;
+const SERVER_VER = 458;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -14484,7 +14484,29 @@ app.get('/push/atrasos', (req, res) => {
     avisos: lista });
 });
 // Envia push para todos os aparelhos do dono; remove inscrições mortas (404/410)
+// 🪟 JANELINHA DE AVISOS NO PC (v458) — ela (25/11, print): "Teria como deixar as notificações do FILAZ aqui? Pois lá no
+// cantinho às vezes não consigo ver" (escolheu: uma janelinha num ponto da tela; só mensagem nova de cliente).
+// Todo aviso de MENSAGEM que sairia para o celular/navegador (mesmas regras: conversa silenciada não avisa) fica também
+// numa lista curta SÓ NA MEMÓRIA (as 40 últimas de cada conta); o FILAZ Assistente pergunta de 4 em 4 s o que há de novo
+// (GET /avisos/janela?desde=N — não toca no banco) e mostra numa janelinha que fica por cima das outras.
+const _avisosJan = new Map(); // dono → [{ n, phone, nome, previa, t }]
+let _avisosJanUlt = 0;
+function _avisoJanelaGuarda(owner, p) {
+  const n = (_avisosJanUlt = Math.max(Date.now(), _avisosJanUlt + 1)); // cresce sempre, mesmo depois de o servidor reiniciar
+  const l = _avisosJan.get(owner) || [];
+  l.push({ n, phone: String(p.phone || ''), nome: String(p.title || '').slice(0, 80), previa: String(p.body || '').slice(0, 200), t: Date.now() });
+  if (l.length > 40) l.splice(0, l.length - 40);
+  _avisosJan.set(owner, l);
+}
+app.get('/avisos/janela', (req, res) => {
+  if (!_exigeLogin(req, res)) return;
+  const desde = Number(req.query.desde) || 0;
+  // primeira consulta (desde=0): nada de despejar avisos velhos — só diz a partir de onde perguntar
+  const l = desde > 0 ? (_avisosJan.get(req.owner) || []).filter(a => a.n > desde && Date.now() - a.t < 120000) : [];
+  res.json({ avisos: l, ate: Math.max(desde, _avisosJanUlt, Date.now() - 1) });
+});
 async function sendPushToOwner(owner, payload, opt) {
+  try { if (owner && payload && !payload.tipo && /^chat-/.test(String(payload.tag || ''))) _avisoJanelaGuarda(owner, payload); } catch (_) {}
   if (!webpush || !_vapid || !supabase) return;
   // 🔒 SEM DONO = não envia. Antes, avisos "sem dono" iam para TODOS os aparelhos
   // cadastrados sem dono (de contas diferentes) — era o que fazia o contador de
