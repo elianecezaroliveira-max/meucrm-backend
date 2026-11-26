@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 463;
+const SERVER_VER = 464;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -10564,10 +10564,15 @@ function _iaExemplosParecidos(exemplos, textoLead, n) {
 // guarda o que veio ANTES da fala do lead (contexto); agora a escolha compara também esse
 // contexto com o da conversa atual. "Ok", "sim", "pode ser" têm respostas diferentes conforme o
 // que EU tinha dito antes — com fala curta do lead, o contexto é o que decide.
-function _iaExemplosPorAssunto(exemplos, textoLead, n, ctxAtual) {
+// 📷 (v464) SÓ FOTO/DOCUMENTO do lead (sem texto): a foto é a RESPOSTA ao que eu tinha acabado de dizer — quem decide o
+// exemplo é o CONTEXTO, como no "sim"/"feito". Antes a comparação era com as palavras da leitura da foto ("print de
+// aplicativo… Paraná Banco") e os exemplos escolhidos eram de qualquer conversa que citasse o banco; os 16 exemplos
+// dela de "…assim que averbar retorno para realizar a anuência" (resposta ao "feito" depois do pedido de autorização)
+// nunca entravam.
+function _iaExemplosPorAssunto(exemplos, textoLead, n, ctxAtual, soMidia) {
   const alvo = _iaTok(textoLead);
   const alvoCtx = _iaTok(ctxAtual || '');
-  const curta = alvo.size <= 1; // "ok", "sim", "pode ser": a fala em si não diz o assunto (só sobra 0–1 palavra útil)
+  const curta = alvo.size <= 1 || !!soMidia; // "ok", "sim", "pode ser": a fala em si não diz o assunto (só sobra 0–1 palavra útil)
   const pont = exemplos.map((e, i) => {
     const lt = _iaTok([].concat(e.lead || []).join(' '));
     let comum = 0; alvo.forEach(t => { if (lt.has(t)) comum++; });
@@ -10576,7 +10581,7 @@ function _iaExemplosPorAssunto(exemplos, textoLead, n, ctxAtual) {
     let comumCtx2 = 0; alvoCtx.forEach(t => { if (ctx.has(t)) comumCtx2++; });
     const simLead = comum / Math.max(1, Math.min(alvo.size || 1, lt.size || 1));
     const simCtx = alvoCtx.size ? comumCtx2 / Math.max(1, Math.min(alvoCtx.size, ctx.size || 1)) : 0;
-    return { e, comum, comumCtx2, sc: simLead + (curta ? 1.0 : 0.5) * simCtx + comumCtx * 0.05 + (e.origem === 'treino' ? 0.05 : 0) + i * 1e-6 }; // 🎓 ensinado desempata a favor
+    return { e, comum, comumCtx2, sc: (soMidia ? 0.5 : 1) * simLead + (curta ? 1.0 : 0.5) * simCtx + comumCtx * 0.05 + (e.origem === 'treino' ? 0.05 : 0) + i * 1e-6 }; // 🎓 ensinado desempata a favor
   });
   pont.sort((a, b) => b.sc - a.sc);
   // parecido = mesmo assunto na fala do lead; com fala curta, vale também o mesmo contexto
@@ -11125,7 +11130,8 @@ async function _iaTranscreveSePrecisar(m) {
 // 📷📄 (v423) A IA LÊ a FOTO e o DOCUMENTO que o lead mandou. Ela (06/11): "Quero que a IA leia fotos e documentos".
 // O que a IA viu fica guardado em messages.transcript (como o áudio) — lê uma vez só, por mensagem.
 // Precisa de OPENAI_API_KEY (foto e PDF) ou GEMINI_API_KEY (só foto); sem as duas, segue como antes ("(imagem)").
-const _iaVistos = new Map(); const _iaVendo = new Set();
+const _iaVistos = new Map(); const _iaVendo = new Map(); // (v464) _iaVendo: mensagem → a leitura em andamento (quem chega depois espera a mesma)
+const _iaVisaoFalhas = new Map(); const IA_VISAO_DE_NOVO_MS = parseInt(process.env.IA_VISAO_DE_NOVO_MS || '60000', 10);
 function _iaProvedorVisao() {
   if (process.env.OPENAI_API_KEY) return { nome: 'openai', url: 'https://api.openai.com/v1/chat/completions', chave: process.env.OPENAI_API_KEY, model: process.env.IA_VISAO_MODELO || 'gpt-4o-mini', pdf: true };
   if (process.env.GEMINI_API_KEY) return { nome: 'gemini', url: IA_PROVEDORES.gemini.url, chave: process.env.GEMINI_API_KEY, model: process.env.IA_VISAO_MODELO || 'gemini-3.5-flash', pdf: false };
@@ -11167,17 +11173,36 @@ async function _iaDescreveMidiaSePrecisar(m) {
   const k = String(m.id);
   if (_iaVistos.has(k)) { m.transcript = _iaVistos.get(k); return m.transcript; }
   const prov = _iaProvedorVisao(); if (!prov) return '';
-  if (_iaVendo.has(k)) return ''; // (v445) já está sendo lida por outra sugestão: não paga duas vezes
-  _iaVendo.add(k);
-  try {
-    const bytes = await _bytesDaMidia(m);
-    if (!bytes || bytes.length > 8 * 1024 * 1024) { _iaVistos.set(k, ''); return ''; } // (acima de 8 MB fica de fora)
-    const texto = await _iaVeMidia(prov, bytes, mime || (ehImg ? 'image/jpeg' : 'application/pdf'), String(m.media_name || m.content || ''), ehDoc && !ehImg, m.direction === 'outbound');
-    _iaVistos.set(k, texto || '');
-    if (_iaVistos.size > 500) _iaVistos.delete(_iaVistos.keys().next().value);
-    if (texto) { m.transcript = texto; try { await supabase.from('messages').update({ transcript: texto }).eq('id', m.id).select('id, phone'); } catch (_) {} }
-    return texto || '';
-  } catch (e) { console.warn('IA: leitura de foto/documento falhou:', (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message); _iaVistos.set(k, ''); return ''; }
+  // 🏁 (v464) Ela (26/11, print): o cliente mandou o print "Consignatária Autorizada" logo depois de ela pedir a
+  // autorização, e a sugestão saiu "Recebi a imagem, vou analisar e já retorno aqui" — a resposta de quem NÃO leu a
+  // foto. A foto tinha sido lida: mas a sugestão é pedida DUAS vezes ao mesmo tempo (o servidor adianta quando a
+  // mensagem chega + a tela pede ao abrir), e quem chegava em segundo achava a leitura "em andamento" e seguia SEM
+  // ela. Agora quem chega em segundo ESPERA a mesma leitura (continua pagando uma vez só).
+  if (_iaVendo.has(k)) { try { const t = await _iaVendo.get(k); if (t) m.transcript = t; return t || ''; } catch (_) { return ''; } }
+  // leitura que FALHOU (rede, banco de arquivos ainda sem a foto, limite da IA) não fica "sem leitura" para sempre:
+  // tenta de novo depois de 1 minuto, no máximo 3 vezes por mensagem
+  const f = _iaVisaoFalhas.get(k);
+  if (f && (f.n >= 3 || Date.now() - f.t < IA_VISAO_DE_NOVO_MS)) return '';
+  const p = (async () => {
+    try {
+      const bytes = await _bytesDaMidia(m);
+      if (bytes && bytes.length > 8 * 1024 * 1024) { _iaVistos.set(k, ''); return ''; } // (acima de 8 MB fica de fora)
+      if (!bytes) throw new Error('arquivo ainda não disponível');
+      const texto = await _iaVeMidia(prov, bytes, mime || (ehImg ? 'image/jpeg' : 'application/pdf'), String(m.media_name || m.content || ''), ehDoc && !ehImg, m.direction === 'outbound');
+      if (!texto) { if (ehDoc && !ehImg && (!prov.pdf || (mime && mime !== 'application/pdf'))) { _iaVistos.set(k, ''); return ''; } throw new Error('leitura vazia'); } // (documento que este leitor não lê: não adianta tentar de novo)
+      _iaVistos.set(k, texto); _iaVisaoFalhas.delete(k);
+      if (_iaVistos.size > 500) _iaVistos.delete(_iaVistos.keys().next().value);
+      m.transcript = texto; try { await supabase.from('messages').update({ transcript: texto }).eq('id', m.id).select('id, phone'); } catch (_) {}
+      return texto;
+    } catch (e) {
+      console.warn('IA: leitura de foto/documento falhou:', (e.response && e.response.data && e.response.data.error && e.response.data.error.message) || e.message);
+      _iaVisaoFalhas.set(k, { n: ((f && f.n) || 0) + 1, t: Date.now() });
+      if (_iaVisaoFalhas.size > 500) _iaVisaoFalhas.delete(_iaVisaoFalhas.keys().next().value);
+      return '';
+    }
+  })();
+  _iaVendo.set(k, p);
+  try { const t = await p; if (t) m.transcript = t; return t; }
   finally { _iaVendo.delete(k); }
 }
 // ⚡🤖 O que ela já tem pronto: respostas rápidas (settings quick_replies::dona) e bots ativos
@@ -11397,6 +11422,7 @@ function _iaFormalizacaoTxt(owner, lead, msgs, bancoDaConversa) {
 }
 // Monta e pede a sugestão. Devolve { mensagens, itens, model } — nunca envia nada.
 // 🎓 opts.conversa: TREINO — conversa de mentira (IA ▸ Treinar); não lê o banco, não usa cache, não é "número de teste"
+const _iaSugVoo = new Map(); // (v464) ponto da conversa → a sugestão que está sendo pensada agora
 async function _iaSugere(owner, phone, forcar, opts) {
   const treino = !!(opts && Array.isArray(opts.conversa));
   if (!treino && _iaEhTeste(phone, owner)) return { mensagens: [], itens: [], motivo: 'número de teste — a IA não sugere nem aprende aqui', definitivo: true };
@@ -11417,7 +11443,8 @@ async function _iaSugere(owner, phone, forcar, opts) {
       if (/^\[(vídeo|video)[^\]]*\]$/i.test(x)) return { type: 'video', content: '[Vídeo recebido]' };
       return { type: 'text', content: x.slice(0, 1500) }; };
     brutas = opts.conversa.map((m, i) => ({ id: 'treino' + i, direction: m.quem === 'eu' ? 'outbound' : 'inbound', ...(m.quem === 'eu' ? { type: 'text', content: String(m.texto || '').slice(0, 1500) } : _tipoTreino(m.texto)), timestamp: new Date(Date.now() - (n - i) * 60000).toISOString() })).reverse();
-  } else {
+  } else if (opts && opts._brutas) brutas = opts._brutas; // (v464) segunda volta do "um pedido só por vez": a conversa já foi lida
+  else {
     ({ data: brutas, error: erroMsgs } = await supabase.from('messages').select('*')
       .in('phone', phoneVariants(phone)).eq('owner', owner || ' ')
       .order('timestamp', { ascending: false }).order('id', { ascending: false }).limit(400));
@@ -11435,6 +11462,16 @@ async function _iaSugere(owner, phone, forcar, opts) {
   const chave = (owner || ' ') + '|' + phone + '|' + ult.id + '|' + ult.direction;
   const c = _iaSugCache[chave];
   if (c && !forcar && !treino && Date.now() - c.t < IA_SUG_GUARDA_MS) return c.r; // (v455: 3 h — a chave já muda a cada mensagem nova da conversa)
+  // 🏁 (v464) UM PEDIDO SÓ POR VEZ para o mesmo ponto da conversa: o servidor adianta a sugestão quando a mensagem
+  // chega e a tela pede a mesma ao abrir — os dois ao mesmo tempo faziam DUAS chamadas à IA e podiam dar respostas
+  // diferentes (uma com a leitura da foto, a outra sem). Quem chega em segundo recebe a resposta do primeiro.
+  if (!treino && !(opts && opts._voo)) {
+    const emVoo = _iaSugVoo.get(chave);
+    if (emVoo && !forcar) return emVoo;
+    const p = _iaSugere(owner, phone, forcar, Object.assign({}, opts || {}, { _voo: true, _brutas: brutas })).finally(() => { if (_iaSugVoo.get(chave) === p) _iaSugVoo.delete(chave); });
+    _iaSugVoo.set(chave, p);
+    return p;
+  }
   // ⏱️ O resumo da parte antiga é OUTRA chamada à IA: antes a sugestão esperava por ela (dobrava o
   // tempo). Agora usa o resumo já guardado; se precisa refazer, refaz em segundo plano e esta
   // sugestão sai sem ele (a próxima já pega o novo).
@@ -11471,7 +11508,8 @@ async function _iaSugere(owner, phone, forcar, opts) {
   // 6 exemplos (eram 8) e conversa mais curta: o plano grátis da Groq limita tokens por minuto
   // contexto ATUAL: o que veio antes da fala do lead (sobretudo o que EU disse por último)
   const ctxAtual = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha).join(' ');
-  const { parecidos: exemplos, estilo: exEstilo } = _iaExemplosPorAssunto(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6, ctxAtual);
+  const _soMidia = doLead.length > 0 && doLead.every(m => /^(image|document)$/.test(String(m.type || ''))); // (v464) o lead respondeu SÓ com foto/documento
+  const { parecidos: exemplos, estilo: exEstilo } = _iaExemplosPorAssunto(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6, ctxAtual, _soMidia);
   const correcoes = _iaCorrecoesParecidas(mem.exemplos, textoLead || '', 3, ctxAtual);
   // 🏦 banco desta operação (o que a conversa cita) + para onde ela porta hoje
   let bancosTxt = '';
@@ -11539,6 +11577,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     + '- Se a frase só fizer sentido COM um número que não está na conversa, escreva o marcador entre colchetes para ELA preencher antes de enviar ([VALOR LIBERADO], [VALOR DA PARCELA], [SALDO DEVEDOR], [BANCO], [Nº DO CONTRATO], [DATA]) — nunca um número chutado. Se nem com marcador a frase fizer sentido, use a frase de espera.\n'
     + '- "(áudio: …)" é a transcrição do que o lead falou: responda a isso como se fosse texto. Se a última coisa do lead foi áudio SEM transcrição, ou foto/documento SEM leitura, sugira só "Recebi, vou analisar e já retorno 🙏🏼".\n'
     + '- A leitura que vem entre parênteses numa imagem ou documento do lead diz o que ele mandou: responda ao que a LEITURA diz e chame o arquivo pelo nome que ela dá (não diga "recebi o extrato" se a leitura não fala em extrato). Se a leitura traz um AVISO do banco (SMS, mensagem, notificação — ex.: portabilidade finalizada, proposta aprovada, pendência), esse aviso é um FATO NOVO da operação: situe a fase por ele e nunca fale em aguardar uma etapa que o aviso mostra que já aconteceu.\n'
+    + '- FOTO QUE É A RESPOSTA AO QUE EU PEDI: se a minha última mensagem pedia uma ação ao lead (fazer uma autorização, assinar o aceite, enviar um documento) e a leitura da foto mostra que ele FEZ (ex.: "Consignatária Autorizada", "autorização concluída", "passos completados", comprovante), isso vale como ele dizer "feito": responda como ELA responde a essa confirmação nos exemplos do mesmo contexto — UMA mensagem curta com o próximo passo (ex.: "Perfeito, assim que averbar retorno para realizar a anuência 🙏🏼"). NÃO diga "recebi a imagem, vou analisar", não descreva o print e não acrescente prazo nem explicação que ela não deu.\n'
     + '- Se não há o que responder (o lead só agradeceu ou encerrou), responda {"mensagens":[]} ou uma única frase curta de fechamento.\n'
     + '- Nos exemplos, "[image] [Imagem]", "[document] …" e "[link]"/"{link}" marcam uma imagem/arquivo/link que ela envia à mão: NUNCA escreva esses marcadores; pule essa mensagem.\n'
     + '- Quando uma linha MINHA ("Eu: …") traz uma imagem ou documento com a leitura da IA entre parênteses, isso é o que EU JÁ ENVIEI ao lead. Se for uma SIMULAÇÃO, aqueles são os números da proposta já apresentada (banco de destino, parcela que será portada, prazo e valor liberado): use-os para responder as dúvidas do lead sobre a proposta, sem mudar nenhum número e sem pedir de novo o que já está nela.\n'
@@ -11563,9 +11602,14 @@ async function _iaSugere(owner, phone, forcar, opts) {
   // 📨 O que o lead mandou AGORA (todas as mensagens dele desde a minha última): a IA respondia só à
   // primeira ("já mando o contrato" → "aguardo") e ignorava o arquivo que veio um minuto depois
   const _temArquivo = doLead.some(m => /^(document|image|video)$/.test(String(m.type || '')) || (m.type === 'audio' && !m.transcript));
+  const _arquivos = doLead.filter(m => /^(document|image)$/.test(String(m.type || '')));
+  const _arquivoLido = _arquivos.length > 0 && _arquivos.every(m => !!m.transcript) && !doLead.some(m => m.type === 'video' || (m.type === 'audio' && !m.transcript)); // (v464) tudo o que ele mandou foi lido
   const agoraTxt = doLead.length ? '\n\n### O QUE O LEAD MANDOU AGORA (' + doLead.length + ' mensage' + (doLead.length === 1 ? 'm' : 'ns') + ' desde a minha última — responda a TUDO isto, não só à primeira)\n'
     + doLead.map(m => '[' + _iaDataHora(m.timestamp) + '] ' + _iaLinha(m)).join('\n')
-    + (_temArquivo ? '\n⚠️ Ele mandou ARQUIVO/FOTO' + (doLead.length > 1 ? ' junto com o texto' : '') + ': a resposta precisa reconhecer o que chegou ("Recebi…") — nunca responder como se o arquivo não tivesse vindo (ex.: "aguardo seu retorno" depois que ele já enviou).' : '') : '';
+    + (_temArquivo ? '\n⚠️ Ele mandou ARQUIVO/FOTO' + (doLead.length > 1 ? ' junto com o texto' : '')
+        + (_arquivoLido ? ' e a LEITURA acima diz o que é: se é a confirmação/comprovante do que EU tinha pedido, responda como a um "feito" (o próximo passo dela, curto); se é outra coisa, reconheça o que chegou pelo que a leitura diz ("Recebi…")'
+                        : ': a resposta precisa reconhecer o que chegou ("Recebi…")')
+        + ' — nunca responder como se o arquivo não tivesse vindo (ex.: "aguardo seu retorno" depois que ele já enviou).' : '') : '';
   const corrTxt = correcoes.map(e => 'Lead: ' + [].concat(e.lead || []).join(' | ').slice(0, 200) + '\nA IA sugeriu (ERRADO): ' + [].concat(e.sugerido || []).join(' | ').slice(0, 300) + '\nEla mandou (CERTO): ' + [].concat(e.resposta || []).join(' | ').slice(0, 300) + (e.motivo ? '\nPor quê (ela explicou): ' + String(e.motivo).slice(0, 300) : '')).join('\n---\n');
   const exEstiloTxt = exEstilo.map((e, i) => '--- Estilo ' + (i + 1) + ' ---\n' + [].concat(e.lead || []).map(x => 'Lead: ' + _iaMascaraExemplo(x)).join('\n') + '\n' + [].concat(e.resposta || []).map(x => 'Eu: ' + _iaMascaraExemplo(x)).join('\n')).join('\n');
   const usr = catTxt + (exTxt ? '### COMO ELA RESPONDEU A OUTROS CLIENTES EM SITUAÇÃO PARECIDA (são OUTRAS pessoas, em outros dias: copie o JEITO de escrever e o PASSO da operação — nunca a situação, prazo, previsão, banco ou problema de lá; [DATA]/[VALOR]/[DIA] eram dados daquele cliente. Se o exemplo está em OUTRA etapa da operação que este cliente, ignore-o.)\n(linhas "Eu: ⏳ depois: …" são passos que ela manda HORAS depois, não na resposta de agora)\n(cada exemplo traz o que veio ANTES: use-o só se esse contexto bate com a conversa atual — "ok"/"sim" do lead pede resposta diferente conforme o que eu tinha dito antes)\n' + exTxt + '\n\n' : '### EXEMPLOS PARECIDOS COM A FALA DO LEAD\n(nenhum: a memória não tem caso parecido — responda ao assunto do lead com o estilo dela e o manual; não copie assunto de outros exemplos)\n\n')
