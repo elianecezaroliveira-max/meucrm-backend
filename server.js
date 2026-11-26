@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 461;
+const SERVER_VER = 462;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -2759,7 +2759,9 @@ app.post('/pc/espelho', async (req, res) => {
       if (!texto.trim() || isNaN(ts) || !m.k || (m.quem !== 'eu' && m.quem !== 'lead')) return null;
       if (ts.getTime() > Date.now() + 10 * 60000) return null; // nada no futuro
       if (_PC_RX_BARRA.test(texto)) return null; // (v461) leitura com a barra de reações aberta (assistente antigo): não entra — a leitura limpa vem em seguida
-      return { wamid: 'pc:' + sha(owner + '|' + phone + '|' + String(m.k)), direction: m.quem === 'eu' ? 'outbound' : 'inbound', content: texto, ts: ts.toISOString(), st: m.st === 'lida' ? 'read' : m.st === 'entregue' ? 'delivered' : 'sent' };
+      // (v462) resposta a uma mensagem: o assistente 2.14 manda a citação (cit = o texto citado; citou = de quem era)
+      const cit = String((m && m.cit) || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+      return { wamid: 'pc:' + sha(owner + '|' + phone + '|' + String(m.k)), direction: m.quem === 'eu' ? 'outbound' : 'inbound', content: texto, ts: ts.toISOString(), st: m.st === 'lida' ? 'read' : m.st === 'entregue' ? 'delivered' : 'sent', cit, citDir: cit ? (m.citou === 'eu' ? 'outbound' : 'inbound') : null };
     }).filter(Boolean);
     await _pcNomeGuarda(owner, phone, nome);
     if (!msgs.length) return res.json({ ok: true, phone, novos: 0 });
@@ -2773,8 +2775,16 @@ app.post('/pc/espelho', async (req, res) => {
         if (!resto || !resto.length) await supabase.from('contacts').delete().eq('owner', owner).eq('phone', interno).eq('account_id', conta);
       }
     } catch (_) {}
-    const { data: ja } = await supabase.from('messages').select('wamid, status').eq('owner', owner).in('wamid', msgs.map(m => m.wamid));
+    const { data: ja } = await supabase.from('messages').select('wamid, status, quoted_content').eq('owner', owner).in('wamid', msgs.map(m => m.wamid));
     const tem = new Set((ja || []).map(x => x.wamid));
+    // (v462) a resposta que já estava no FILAZ sem a citação ganha a citação agora
+    try {
+      for (const x of (ja || [])) {
+        if (x.quoted_content) continue;
+        const m = msgs.find(y => y.wamid === x.wamid);
+        if (m && m.cit) await supabase.from('messages').update({ quoted_content: m.cit, quoted_direction: m.citDir }).eq('owner', owner).eq('wamid', x.wamid);
+      }
+    } catch (_) {}
     // (v456) Ela (25/11, print): "apenas a última mensagem no FILAZ constou como entregue" — a mensagem MINHA entrava com
     // o tique do instante em que foi lida da tela (✓ enviada) e nunca mais mudava. Agora o tique que o WhatsApp do PC
     // mostra SOBE aqui também (enviada → entregue → lida); nunca desce.
@@ -2802,8 +2812,47 @@ app.post('/pc/espelho', async (req, res) => {
       }
       novas = novas.filter(m => !m.casada);
     }
+    // 🩹 (v462) A MESMA MENSAGEM, LIDA MELHOR — o assistente 2.14 passou a ler certo o que antes saía errado (o link partido
+    // por um espaço; a mensagem com horário no texto, que era cortada ali). Texto diferente = chave diferente, e ela
+    // entraria DE NOVO ao lado da antiga. Então, antes de gravar uma "nova" que tem link ou horário no texto, procura a
+    // antiga nesta conversa (mesmo lado, vinda do PC, que não está mais na leitura atual) e CONSERTA a antiga no lugar:
+    //   • mesmo minuto e texto igual tirando espaços/quebras de linha → é a mesma (o link partido);
+    //   • a antiga é o começo da nova, o que falta começa por um horário e a antiga estava gravada nesse horário → é a
+    //     que foi cortada no horário.
+    let consertadas = 0;
+    try {
+      const cand = novas.filter(m => /\d{1,2}:\d{2}|:\/\/|[a-z0-9]\.[a-z]{2,}\//i.test(m.content));
+      if (cand.length) {
+        const { data: velhas } = await supabase.from('messages').select('id, wamid, content, direction, timestamp').eq('owner', owner).eq('phone', phone).eq('account_id', conta).like('wamid', 'pc:%').order('timestamp', { ascending: false }).limit(150);
+        const naTela = new Set(msgs.map(m => m.wamid));
+        const livres = (velhas || []).filter(x => !naTela.has(x.wamid));
+        const semEsp = t => String(t || '').replace(/\s+/g, '');
+        const tsDe = v => new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(v)) ? v : String(v) + 'Z').getTime();
+        for (const m of cand) {
+          const i = livres.findIndex(x => {
+            if (x.direction !== m.direction) return false;
+            const a = String(x.content || ''), b = m.content;
+            if (a !== b && semEsp(a) === semEsp(b) && Math.abs(tsDe(x.timestamp) - new Date(m.ts).getTime()) < 60000) return true;
+            // a cortada: é o começo da nova, o resto começa por um horário, e a antiga estava gravada JUSTAMENTE nesse
+            // horário (era o defeito: a hora escrita no texto virava a hora da mensagem) — horário de Brasília
+            const at = a.trim(); if (at.length < 2 || b.length <= at.length || !b.startsWith(at)) return false;
+            const hm = /^\s*(\d{1,2}):(\d{2})/.exec(b.slice(at.length)); if (!hm) return false;
+            const tx = tsDe(x.timestamp), d = new Date(tx - 3 * 3600000);
+            return d.getUTCHours() === Number(hm[1]) && d.getUTCMinutes() === Number(hm[2]) && Math.abs(tx - new Date(m.ts).getTime()) < 36 * 3600000;
+          });
+          if (i < 0) continue;
+          const alvo = livres.splice(i, 1)[0];
+          const muda = { content: m.content, wamid: m.wamid, timestamp: m.ts };
+          if (m.direction === 'outbound') muda.status = m.st;
+          if (m.cit) { muda.quoted_content = m.cit; muda.quoted_direction = m.citDir; }
+          await supabase.from('messages').update(muda).eq('id', alvo.id).eq('owner', owner);
+          m.casada = true; consertadas++;
+        }
+        novas = novas.filter(m => !m.casada);
+      }
+    } catch (_) {}
     if (novas.length) {
-      const { error: eIns } = await supabase.from('messages').insert(novas.map(m => ({ phone, content: m.content, type: 'text', direction: m.direction, timestamp: m.ts, account_id: conta, status: m.direction === 'outbound' ? m.st : null, wamid: m.wamid, owner })));
+      const { error: eIns } = await supabase.from('messages').insert(novas.map(m => Object.assign({ phone, content: m.content, type: 'text', direction: m.direction, timestamp: m.ts, account_id: conta, status: m.direction === 'outbound' ? m.st : null, wamid: m.wamid, owner }, m.cit ? { quoted_content: m.cit, quoted_direction: m.citDir } : {})));
       if (eIns) return res.status(500).json({ error: eIns.message });
       const ult = novas.reduce((a, m) => (!a || m.ts >= a.ts) ? m : a, null);
       const { data: c } = await supabase.from('contacts').select('phone, last_message_at').eq('phone', phone).eq('owner', owner).maybeSingle();
@@ -2846,7 +2895,7 @@ app.post('/pc/espelho', async (req, res) => {
         if (pv && _PC_RX_BARRA.test(pv) && pv.replace(_PC_RX_BARRA, '').trim()) await supabase.from('contacts').update({ last_message_preview: pv.replace(_PC_RX_BARRA, '').trim() }).eq('phone', phone).eq('owner', owner);
       }
     } catch (_) {}
-    res.json({ ok: true, phone, novos: novas.length, tiques: subiram.size, limpas });
+    res.json({ ok: true, phone, novos: novas.length, tiques: subiram.size, limpas, consertadas });
   } catch (e) { console.error('PC espelho:', e.message); res.status(500).json({ error: e.message }); }
 });
 // 🔔 AVISOS DO WHATSAPP DO PC (v453) — ela (23/11): "Tem como fazer com que as notificações do WhatsApp que eu tenho
