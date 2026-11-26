@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 460;
+const SERVER_VER = 461;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -2736,6 +2736,12 @@ async function _pcFalha(owner, item, motivo) {
   try { await supabase.from('contacts').update({ last_message_status: 'failed' }).eq('phone', item.phone).eq('owner', owner).eq('last_message_direction', 'outbound'); } catch (_) {}
   return true;
 }
+// 🧹 (v461) BARRA DE REAÇÕES NO TEXTO — ela (26/11, print): no FILAZ a mensagem do WhatsApp do PC apareceu DUAS vezes, uma
+// com "👍❤️😂😮😢🙏" no fim. Com a barra de reações do WhatsApp aberta (mouse em cima / botão direito na mensagem) o
+// assistente lia os 6 emojis como texto: texto diferente = mensagem "nova". O assistente 2.13 não lê mais a barra; aqui,
+// leitura que ainda chegue com a barra no fim é recusada, e o que já entrou sujo é limpo quando a conversa é espelhada.
+const _PC_RX_BARRA = /\s*👍[\u{1F3FB}-\u{1F3FF}]?\s*❤️?\s*😂\s*😮\s*😢\s*🙏[\u{1F3FB}-\u{1F3FF}]?\s*\+?\s*$/u;
+const _pcBarraLimpa = new Map(); // dono|fone → quando a conversa foi limpa pela última vez
 // POST /pc/espelho { nome, fone?, mensagens:[{ k, quem:'eu'|'lead', texto, ts, st? }] } — só o que o assistente leu na tela
 app.post('/pc/espelho', async (req, res) => {
   if (!_exigeLogin(req, res)) return;
@@ -2752,6 +2758,7 @@ app.post('/pc/espelho', async (req, res) => {
       const texto = String((m && m.texto) || '').slice(0, 4096); const ts = new Date((m && m.ts) || '');
       if (!texto.trim() || isNaN(ts) || !m.k || (m.quem !== 'eu' && m.quem !== 'lead')) return null;
       if (ts.getTime() > Date.now() + 10 * 60000) return null; // nada no futuro
+      if (_PC_RX_BARRA.test(texto)) return null; // (v461) leitura com a barra de reações aberta (assistente antigo): não entra — a leitura limpa vem em seguida
       return { wamid: 'pc:' + sha(owner + '|' + phone + '|' + String(m.k)), direction: m.quem === 'eu' ? 'outbound' : 'inbound', content: texto, ts: ts.toISOString(), st: m.st === 'lida' ? 'read' : m.st === 'entregue' ? 'delivered' : 'sent' };
     }).filter(Boolean);
     await _pcNomeGuarda(owner, phone, nome);
@@ -2818,7 +2825,28 @@ app.post('/pc/espelho', async (req, res) => {
         }
       } catch (_) {}
     }
-    res.json({ ok: true, phone, novos: novas.length, tiques: subiram.size });
+    // 🧹 (v461) o que já tinha entrado sujo nesta conversa sai agora (no máximo uma vez a cada 10 min por conversa):
+    // mensagem que termina com a barra de reações e tem a gêmea limpa → a suja é apagada; sem gêmea → só o texto é limpo.
+    let limpas = 0;
+    try {
+      const kL = owner + '|' + phone;
+      if (Date.now() - (_pcBarraLimpa.get(kL) || 0) > parseInt(process.env.PC_LIMPA_BARRA_MS || '600000', 10)) {
+        _pcBarraLimpa.set(kL, Date.now());
+        const { data: sujas } = await supabase.from('messages').select('id, content, direction').eq('owner', owner).eq('phone', phone).eq('account_id', conta).like('wamid', 'pc:%').like('content', '%😮%😢%').limit(60);
+        for (const s of (sujas || [])) {
+          const txt = String(s.content || ''); if (!_PC_RX_BARRA.test(txt)) continue;
+          const limpo = txt.replace(_PC_RX_BARRA, '').trim(); if (!limpo) continue;
+          const { data: gemea } = await supabase.from('messages').select('id').eq('owner', owner).eq('phone', phone).eq('direction', s.direction).eq('content', limpo).limit(1);
+          if (gemea && gemea.length) await supabase.from('messages').delete().eq('id', s.id).eq('owner', owner);
+          else await supabase.from('messages').update({ content: limpo }).eq('id', s.id).eq('owner', owner);
+          limpas++;
+        }
+        const { data: cp } = await supabase.from('contacts').select('last_message_preview').eq('phone', phone).eq('owner', owner).maybeSingle();
+        const pv = cp && String(cp.last_message_preview || '');
+        if (pv && _PC_RX_BARRA.test(pv) && pv.replace(_PC_RX_BARRA, '').trim()) await supabase.from('contacts').update({ last_message_preview: pv.replace(_PC_RX_BARRA, '').trim() }).eq('phone', phone).eq('owner', owner);
+      }
+    } catch (_) {}
+    res.json({ ok: true, phone, novos: novas.length, tiques: subiram.size, limpas });
   } catch (e) { console.error('PC espelho:', e.message); res.status(500).json({ error: e.message }); }
 });
 // 🔔 AVISOS DO WHATSAPP DO PC (v453) — ela (23/11): "Tem como fazer com que as notificações do WhatsApp que eu tenho
