@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 462;
+const SERVER_VER = 463;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -2800,14 +2800,18 @@ app.post('/pc/espelho', async (req, res) => {
       for (const st of Object.keys(porSt)) await supabase.from('messages').update({ status: st }).eq('owner', owner).in('wamid', porSt[st]);
     } catch (_) {}
     let novas = msgs.filter(m => !tem.has(m.wamid));
+    const _semEsp = t => String(t || '').replace(/\s+/g, '');
+    const casadasEnv = [];
     // o que ELA enviou pelo FILAZ (fila do PC) aparece depois na tela do WhatsApp: é a MESMA mensagem — casa em vez de duplicar
+    // (v463) a comparação não liga para espaço/quebra de linha: a mensagem de várias linhas enviada pelo FILAZ voltava
+    // da tela do WhatsApp numa linha só, não casava e ficava DUAS vezes na conversa.
     if (novas.some(m => m.direction === 'outbound')) {
       const { data: enviadas } = await supabase.from('messages').select('id, wamid, content, timestamp').eq('owner', owner).eq('phone', phone).eq('direction', 'outbound').eq('account_id', conta).order('timestamp', { ascending: false }).limit(40);
       const livres = (enviadas || []).filter(x => /^pcenv:/.test(String(x.wamid || '')));
       for (const m of novas.filter(x => x.direction === 'outbound')) {
-        const i = livres.findIndex(x => String(x.content || '').trim() === m.content.trim() && Math.abs(new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(x.timestamp)) ? x.timestamp : String(x.timestamp) + 'Z').getTime() - new Date(m.ts).getTime()) < 30 * 60000);
+        const i = livres.findIndex(x => (String(x.content || '').trim() === m.content.trim() || (_semEsp(m.content).length >= 2 && _semEsp(x.content) === _semEsp(m.content))) && Math.abs(new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(x.timestamp)) ? x.timestamp : String(x.timestamp) + 'Z').getTime() - new Date(m.ts).getTime()) < 30 * 60000);
         if (i < 0) continue;
-        const alvo = livres.splice(i, 1)[0]; m.casada = true;
+        const alvo = livres.splice(i, 1)[0]; m.casada = true; casadasEnv.push(m);
         try { await supabase.from('messages').update({ wamid: m.wamid, status: m.st }).eq('id', alvo.id); } catch (_) {}
       }
       novas = novas.filter(m => !m.casada);
@@ -2819,20 +2823,31 @@ app.post('/pc/espelho', async (req, res) => {
     //   • mesmo minuto e texto igual tirando espaços/quebras de linha → é a mesma (o link partido);
     //   • a antiga é o começo da nova, o que falta começa por um horário e a antiga estava gravada nesse horário → é a
     //     que foi cortada no horário.
+    // (v463) Assistente 2.15 — mais dois casos da mesma coisa:
+    //   • a mensagem de VÁRIAS LINHAS, que chegava numa linha só (cai na regra do "igual tirando espaços/quebras");
+    //   • a mensagem com LINK, que chegava com o texto do CARTÃO do link (título, endereço, site) na frente: a antiga
+    //     TERMINA com a nova (tirando espaços), é do mesmo minuto e o que sobra na frente tem um site.
+    // E quando a certa JÁ existe (é a que ela enviou pelo FILAZ, casada logo acima), a antiga errada é uma duplicata: sai.
     let consertadas = 0;
     try {
-      const cand = novas.filter(m => /\d{1,2}:\d{2}|:\/\/|[a-z0-9]\.[a-z]{2,}\//i.test(m.content));
+      const _temLink = t => /:\/\/|[a-z0-9]\.[a-z]{2,}\//i.test(String(t || ''));
+      const cand = novas.concat(casadasEnv).filter(m => /\d{1,2}:\d{2}|\n/.test(m.content) || _temLink(m.content));
       if (cand.length) {
         const { data: velhas } = await supabase.from('messages').select('id, wamid, content, direction, timestamp').eq('owner', owner).eq('phone', phone).eq('account_id', conta).like('wamid', 'pc:%').order('timestamp', { ascending: false }).limit(150);
         const naTela = new Set(msgs.map(m => m.wamid));
         const livres = (velhas || []).filter(x => !naTela.has(x.wamid));
         const semEsp = t => String(t || '').replace(/\s+/g, '');
         const tsDe = v => new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(String(v)) ? v : String(v) + 'Z').getTime();
+        let ultCons = null;
         for (const m of cand) {
           const i = livres.findIndex(x => {
             if (x.direction !== m.direction) return false;
             const a = String(x.content || ''), b = m.content;
-            if (a !== b && semEsp(a) === semEsp(b) && Math.abs(tsDe(x.timestamp) - new Date(m.ts).getTime()) < 60000) return true;
+            if (a !== b && Math.abs(tsDe(x.timestamp) - new Date(m.ts).getTime()) < 60000) {
+              const sa = semEsp(a), sb = semEsp(b);
+              if (sa === sb) return true;
+              if (sb.length >= 8 && sa.length > sb.length && sa.endsWith(sb) && _temLink(b) && /[a-z0-9-]+\.[a-z]{2,}/i.test(sa.slice(0, sa.length - sb.length))) return true; // (o cartão do link na frente)
+            }
             // a cortada: é o começo da nova, o resto começa por um horário, e a antiga estava gravada JUSTAMENTE nesse
             // horário (era o defeito: a hora escrita no texto virava a hora da mensagem) — horário de Brasília
             const at = a.trim(); if (at.length < 2 || b.length <= at.length || !b.startsWith(at)) return false;
@@ -2842,13 +2857,22 @@ app.post('/pc/espelho', async (req, res) => {
           });
           if (i < 0) continue;
           const alvo = livres.splice(i, 1)[0];
+          if (m.casada) { await supabase.from('messages').delete().eq('id', alvo.id).eq('owner', owner); consertadas++; if (!ultCons || m.ts >= ultCons.ts) ultCons = m; continue; } // a certa já existe: a errada é duplicata
           const muda = { content: m.content, wamid: m.wamid, timestamp: m.ts };
           if (m.direction === 'outbound') muda.status = m.st;
           if (m.cit) { muda.quoted_content = m.cit; muda.quoted_direction = m.citDir; }
           await supabase.from('messages').update(muda).eq('id', alvo.id).eq('owner', owner);
-          m.casada = true; consertadas++;
+          m.casada = true; consertadas++; if (!ultCons || m.ts >= ultCons.ts) ultCons = m;
         }
         novas = novas.filter(m => !m.casada);
+        // a prévia da lista de conversas: se a consertada é a ÚLTIMA mensagem da conversa, a prévia mostra o texto certo
+        if (ultCons) {
+          try {
+            const { data: c1 } = await supabase.from('contacts').select('last_message_at').eq('phone', phone).eq('owner', owner).maybeSingle();
+            if (c1 && c1.last_message_at && Math.abs(tsDe(c1.last_message_at) - new Date(ultCons.ts).getTime()) < 60000 && !msgs.some(x => x.ts > ultCons.ts))
+              await supabase.from('contacts').update({ last_message_preview: ultCons.content.length > 80 ? ultCons.content.substring(0, 80) + '…' : ultCons.content }).eq('phone', phone).eq('owner', owner);
+          } catch (_) {}
+        }
       }
     } catch (_) {}
     if (novas.length) {
