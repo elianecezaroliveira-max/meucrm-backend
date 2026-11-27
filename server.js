@@ -646,7 +646,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 464;
+const SERVER_VER = 465;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -11357,6 +11357,26 @@ function _iaConvenio(lead, msgs) {
   const r = testa(tags, 'etiqueta') || testa(nome, 'nome do lead') || testa(notas, 'notas') || testa(conv, 'conversa');
   return { convenio: r || '', fonte: fontes[0] || '' };
 }
+// 🏷️ (v465) Ela (27/11): "Agora os LEADS têm etiquetas, indicando se é INSS ou SIAPE, para as sugestões de IA será útil".
+// A etiqueta já dizia à IA o convênio e a ficha de formalização (v421). Faltava nos EXEMPLOS: a memória misturava
+// respostas dadas a clientes SIAPE e INSS. De que convênio é um exemplo: o que foi gravado com ele (a partir de agora)
+// ou, nos antigos, o que o próprio texto mostra ("Sou Gov"/"SIAPE" × "INSS"/"benefício"); se cita os dois ou nenhum,
+// serve para qualquer um.
+const _iaConvExCache = new WeakMap();
+function _iaConvDoExemplo(e) {
+  if (!e || typeof e !== 'object') return '';
+  if (e.convenio === 'SIAPE' || e.convenio === 'INSS') return e.convenio;
+  if (_iaConvExCache.has(e)) return _iaConvExCache.get(e);
+  const t = [].concat(e.contexto || [], e.lead || [], e.resposta || []).join('\n');
+  const s = _IA_SIAPE_RE.test(t), i = _IA_INSS_RE.test(t);
+  const r = s && !i ? 'SIAPE' : i && !s ? 'INSS' : '';
+  _iaConvExCache.set(e, r);
+  return r;
+}
+// o convênio SÓ quando vem de fonte firme (etiqueta, nome do lead, notas) — o que a conversa cita de passagem não filtra nada
+function _iaConvFirme(lead) { try { return _iaConvenio(lead, []).convenio || ''; } catch (_) { return ''; } }
+function _iaExemplosDoConvenio(exemplos, conv) { return conv ? (exemplos || []).filter(e => { const c = _iaConvDoExemplo(e); return !c || c === conv; }) : (exemplos || []); }
+const _iaDeOutroConvenio = (conv, t) => !!conv && ((conv === 'INSS' && /\bsiape\b|sou\s*gov/i.test(String(t || ''))) || (conv === 'SIAPE' && /\binss\b/i.test(String(t || ''))));
 function _iaFichas(owner) {
   try { const v = JSON.parse(_cfg('ia_fichas', owner) || '[]'); return Array.isArray(v) ? v.filter(f => f && String(f.como || '').trim()).map(f => ({ banco: String(f.banco || '').trim(), convenio: String(f.convenio || 'TODOS').trim().toUpperCase(), como: String(f.como || '').trim().slice(0, 1200), ...(f.origem ? { origem: String(f.origem), em: f.em || null } : {}) })) : []; }
   catch (_) { return []; }
@@ -11509,8 +11529,11 @@ async function _iaSugere(owner, phone, forcar, opts) {
   // contexto ATUAL: o que veio antes da fala do lead (sobretudo o que EU disse por último)
   const ctxAtual = msgs.slice(Math.max(0, msgs.length - doLead.length - 4), msgs.length - doLead.length).map(_iaLinha).join(' ');
   const _soMidia = doLead.length > 0 && doLead.every(m => /^(image|document)$/.test(String(m.type || ''))); // (v464) o lead respondeu SÓ com foto/documento
-  const { parecidos: exemplos, estilo: exEstilo } = _iaExemplosPorAssunto(mem.exemplos, textoLead || '(áudio) (imagem) (documento)', 6, ctxAtual, _soMidia);
-  const correcoes = _iaCorrecoesParecidas(mem.exemplos, textoLead || '', 3, ctxAtual);
+  // 🏷️ (v465) lead com convênio firme (etiqueta INSS/SIAPE, nome, notas): os exemplos do OUTRO convênio ficam de fora
+  const _convLead = _iaConvFirme(lead);
+  const _exConv = _iaExemplosDoConvenio(mem.exemplos, _convLead);
+  const { parecidos: exemplos, estilo: exEstilo } = _iaExemplosPorAssunto(_exConv, textoLead || '(áudio) (imagem) (documento)', 6, ctxAtual, _soMidia);
+  const correcoes = _iaCorrecoesParecidas(_exConv, textoLead || '', 3, ctxAtual);
   // 🏦 banco desta operação (o que a conversa cita) + para onde ela porta hoje
   let bancosTxt = '';
   try {
@@ -11548,10 +11571,12 @@ async function _iaSugere(owner, phone, forcar, opts) {
   }
   const _falas = arr => [...new Set(arr || [])].slice(-4).map(f => '"' + f + '"').join(' / ');
   const _momento = (manual, aprendidas) => [manual ? 'SÓ QUANDO: ' + manual : '', (aprendidas && aprendidas.length) ? 'aprendido dos seus usos — ela dispara quando o lead diz: ' + _falas(aprendidas) : ''].filter(Boolean).join(' · ');
-  const rapidasCom = rapidas.filter(r => String(quando.rapidas[r.atalho] || '').trim() || (usos.rapidas[r.atalho] || []).length);
-  const botsCom = bots.filter(b => String(quando.bots[b.id] || '').trim() || (usos.bots[b.id] || []).length);
-  const podeBot = id => !!(String(quando.bots[id] || '').trim() || (usos.bots[id] || []).length);
-  const podeRapida = at => !!(String(quando.rapidas[at] || '').trim() || (usos.rapidas[at] || []).length);
+  // 🏷️ (v465) resposta rápida ou bot que é do OUTRO convênio pelo nome ("/segurança siape" para um lead INSS) não é sugerido
+  const _botOutro = id => { const b = bots.find(x => x.id === id); return !!b && _iaDeOutroConvenio(_convLead, b.nome); };
+  const rapidasCom = rapidas.filter(r => !_iaDeOutroConvenio(_convLead, r.atalho) && (String(quando.rapidas[r.atalho] || '').trim() || (usos.rapidas[r.atalho] || []).length));
+  const botsCom = bots.filter(b => !_iaDeOutroConvenio(_convLead, b.nome) && (String(quando.bots[b.id] || '').trim() || (usos.bots[b.id] || []).length));
+  const podeBot = id => !_botOutro(id) && !!(String(quando.bots[id] || '').trim() || (usos.bots[id] || []).length);
+  const podeRapida = at => !_iaDeOutroConvenio(_convLead, at) && !!(String(quando.rapidas[at] || '').trim() || (usos.rapidas[at] || []).length);
   const _SO_TEXTO = !(rapidasCom.length || botsCom.length); // sem momento cadastrado nem aprendido: só mensagem personalizada
   const catTxt = (!_SO_TEXTO ? '### RESPOSTAS PRONTAS E BOTS DELA — cada um SÓ no momento certo (cadastrado por ela ou aprendido dos usos dela)\n'
       + rapidasCom.map(r => 'Rápida {"rapida":"/' + r.atalho + '"} — "' + r.previa + '"' + (r.anexo ? ' (vai com anexo)' : '') + ' → ' + _momento(String(quando.rapidas[r.atalho] || '').trim(), usos.rapidas[r.atalho])).join('\n')
@@ -11624,7 +11649,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
   // 🎓 REGRA ENSINADA: se a fala do lead é a mesma (ou quase) de um exemplo que ELA ensinou no treino,
   // no mesmo contexto, a resposta é a dela — sem perguntar ao modelo (ela: "acabei de mostrar como se
   // faz e ele vem com resposta rápida em vez do bot que eu corrigi"). Rápido e previsível.
-  const regra = _iaRegraEnsinada(mem.exemplos, textoLead || '', ctxAtual);
+  const regra = _iaRegraEnsinada(_exConv, textoLead || '', ctxAtual);
   // 👋 (v441) despedida/agradecimento do lead: só UMA frase curta retribuindo
   const _minhaUlt = (() => { for (let i = msgs.length - doLead.length - 1; i >= 0; i--) if (msgs[i].direction === 'outbound') return String(msgs[i].content || ''); return ''; })();
   const _fim = doLead.every(m => !m.type || m.type === 'text') ? _iaEncerramento(textoLead, _minhaUlt) : null;
@@ -11721,6 +11746,7 @@ async function _iaSugere(owner, phone, forcar, opts) {
     quase_repetidas: _quaseRep, despedida: !!_fim, // (v441) tiradas por repetir o que ela acabou de dizer · o lead só se despediu
     momentos: itensSemRep.filter(it => it.tipo !== 'texto').map(it => ({ tipo: it.tipo, nome: it.tipo === 'rapida' ? '/' + it.atalho : it.nome, momento: it.tipo === 'rapida' ? _momento(String(quando.rapidas[it.atalho] || '').trim(), usos.rapidas[it.atalho]) : _momento(String(quando.bots[it.id] || '').trim(), usos.bots[it.id]) })),
     convenio: formInfo.convenio || '', convenio_fonte: formInfo.fonte || '', fichas_usadas: formInfo.fichas || 0,
+    exemplos_de_outro_convenio: mem.exemplos.length - _exConv.length, // (v465) deixados de fora por serem do outro convênio (INSS × SIAPE)
     fase: { etapa: etapa || '', dias_uteis_desde_minha: _ultMinha ? _iaDiasUteis(_ultMinha.timestamp) : null, dias_uteis_desde_inicio: _pri ? _iaDiasUteis(_pri.timestamp) : null, resumo_antigo: !!resumoAntigo, mensagens_lidas: msgs.length + antigas.length },
     modelo: model, tempo_ms: Date.now() - _t0,
   };
@@ -12019,8 +12045,10 @@ async function _iaGuardaExemplo(owner, b) {
   if (!enviadas.length) return { ok: true, guardado: false, motivo: 'só texto pronto (rápida/bot) — não ensina' };
   if (!treino && _iaEhTeste(phone, owner)) return { ok: true, guardado: false, motivo: 'conversa de teste' }; // nada de teste entra na memória
   const sugerido = [].concat(b.sugerido || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 4);
-  let nome = '';
-  if (!treino) try { const { data } = await supabase.from('contacts').select('name').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); nome = String(((data || [])[0] || {}).name || ''); } catch (_) {}
+  let nome = '', convEx = '';
+  // 🏷️ (v465) o exemplo guarda o CONVÊNIO do lead (etiqueta INSS/SIAPE, nome ou notas): resposta dada a um cliente
+  // SIAPE (autorização no Sou Gov…) não serve de exemplo para um cliente INSS, e vice-versa
+  if (!treino) try { const { data } = await supabase.from('contacts').select('name, tags, notes').in('phone', phoneVariants(phone)).eq('owner', owner || ' ').limit(1); const l0 = (data || [])[0] || {}; nome = String(l0.name || ''); convEx = _iaConvenio(l0, []).convenio; } catch (_) {}
   let leadLinhas = [].concat(b.lead || []).map(x => String(x || '').replace(/^Lead: /, '').trim()).filter(Boolean).slice(0, 8);
   let ctxLinhas = [].concat(b.contexto || []).map(x => String(x || '').trim()).filter(Boolean).slice(0, 6);
   if (treino && !leadLinhas.length) return { erro: 'lead' };
@@ -12049,6 +12077,7 @@ async function _iaGuardaExemplo(owner, b) {
     conversa: treino ? 'treino' : b.auto ? 'aprendido-sozinho' : 'aprendido', chave, contexto: ctxLinhas.map(an), lead: leadLinhas.map(an), resposta: enviadas.map(an),
     origem: treino ? 'treino' : enviadas.every(t => sugerido.includes(t)) && sugerido.length ? 'aceita' : (b.usou ? 'editada' : 'propria'),
     ...(treino && String(b.motivo || '').trim() ? { motivo: String(b.motivo).trim().slice(0, 300) } : {}),
+    ...(convEx ? { convenio: convEx } : {}),
     sugerido: sugerido.map(an), em: new Date().toISOString().slice(0, 10)
   };
   return await _iaMemNaFila(async () => {
