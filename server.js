@@ -465,15 +465,34 @@ async function resolveOwner(req) {
   const tok = a.startsWith('Bearer ') ? a.slice(7) : null;
   if (!tok || !SUPABASE_URL) return null;
   const c = _tokenOwner[tok];
-  if (c && Date.now() - c.ts < 300000) { req._usuario = c.bruto || c.email; return c.email; }
+  if (c && Date.now() - c.ts < 300000) { req._usuario = c.bruto || c.email; return _contaDoLogin(c.bruto, c.email); }
   if (!_tokenPedindo[tok]) _tokenPedindo[tok] = _resolveOwnerNoSupabase(tok).finally(() => { delete _tokenPedindo[tok]; });
   try {
     const r = await _tokenPedindo[tok];
-    req._usuario = r.bruto; return r.email;
+    req._usuario = r.bruto; return _contaDoLogin(r.bruto, r.email);
   } catch (e) {
-    if (c) { req._usuario = c.bruto || c.email; return c.email; } // cache velho vale mais que "sem login" numa falha passageira
+    if (c) { req._usuario = c.bruto || c.email; return _contaDoLogin(c.bruto, c.email); } // cache velho vale mais que "sem login" numa falha passageira
     throw e;
   }
+}
+// 👥 (v466) Ela (27/11, print do login de um vendedor com "Nenhuma conversa por aqui"): "Acontece algumas vezes no dia,
+// eu volto e não tem conversa, e depois de um tempo atualizando elas aparecem, isso não acontece no meu login".
+// Quem é da EQUIPE entra na conta da dona pela lista owner_aliases — que mora nas configurações carregadas na MEMÓRIA
+// do servidor. Depois de cada reinício (todo deploy), o servidor já atendia pedidos ANTES de as configurações
+// chegarem: o login do vendedor era conferido sem a lista, virava "conta própria" (vazia) e isso ficava GUARDADO por
+// 5 minutos — lista de conversas vazia até o guardado vencer. O login da dona não depende da lista, por isso nunca
+// acontecia com ela. Agora: (1) ninguém é identificado antes de as configurações chegarem (o pedido espera; se demorar,
+// responde "tente de novo", que o app já sabe repetir — nunca lista vazia); (2) o guardado do login traz só QUEM é a
+// pessoa; em qual conta ela entra é visto na lista a cada pedido (mudou a equipe, vale na hora).
+let _aliasTxt = null, _aliasMapa = {};
+function _contaDoLogin(bruto, guardada) {
+  if (!bruto) return guardada || null;
+  try {
+    const txt = _settings['owner_aliases'] || '{}';
+    if (txt !== _aliasTxt) { _aliasTxt = txt; try { _aliasMapa = JSON.parse(txt) || {}; } catch (_) { _aliasMapa = {}; } }
+    const dona = _aliasMapa[bruto];
+    return dona ? String(dona).toLowerCase() : bruto;
+  } catch (_) { return guardada || bruto; }
 }
 async function _resolveOwnerNoSupabase(tok) {
   let r;
@@ -492,13 +511,14 @@ async function _resolveOwnerNoSupabase(tok) {
     // da conta. O antigo "todos caem na conta principal" (owner_default) NÃO existe
     // mais — era o que fazia um cliente enxergar (e disparar) a conta de outro.
     if (email) {
-      try {
-        const aliases = JSON.parse(_settings['owner_aliases'] || '{}');
-        if (aliases[email]) {
-          _marcaAcessoEquipe(String(aliases[email]).toLowerCase(), email);
-          email = String(aliases[email]).toLowerCase();
-        }
-      } catch (_) {}
+      // (v466) sem as configurações na memória não dá para saber se a pessoa é da equipe de alguém: espera por elas
+      // (o servidor acabou de ligar) — e, se não chegarem, é "tente de novo", nunca "conta própria vazia"
+      if (!_settingsOk) {
+        try { await Promise.race([_settingsProntas, new Promise(r => setTimeout(r, SETTINGS_ESPERA_MS))]); } catch (_) {}
+        if (!_settingsOk) throw new _AuthIndisponivel('configurações ainda carregando');
+      }
+      const dona = _contaDoLogin(email, email);
+      if (dona !== email) { _marcaAcessoEquipe(dona, email); email = dona; }
       _tokenOwner[tok] = { email, bruto, ts: Date.now() };
     }
     return { email, bruto };
@@ -646,7 +666,7 @@ app.get('/auth-handoff/:nonce', (req, res) => {
   res.json({ pronto: true, access_token: v.access_token, refresh_token: v.refresh_token });
 });
 // Diagnóstico: qual versão do servidor está NO AR (confere se o Railway publicou)
-const SERVER_VER = 465;
+const SERVER_VER = 466;
 // 👤 (v418) Lead NOVO entra só com o PRIMEIRO NOME: o nome do WhatsApp costuma vir "Giovanni Monteiro Pena 🔥"
 // ou "🙏 Maria" (foi como a pessoa se cadastrou). Ela: "quero que fique apenas o primeiro nome". Tira figurinhas
 // e símbolos, pula títulos (Dr., Sra.) e fica com a primeira palavra que tem letra; sem nada, cai no telefone.
@@ -13027,9 +13047,21 @@ async function loadSettings() {
     }
     _midiaDimsCarrega(); // 📐
     console.log('Settings carregados: ' + n + ' chave(s)');
-  } catch(e) { console.error('Settings load error:', e.message); }
+    _settingsOk = true;
+    return true;
+  } catch(e) { console.error('Settings load error:', e.message); return false; }
 }
-loadSettings();
+// (v466) as configurações chegaram ao menos uma vez? Quem identifica o login espera por isto (ver _contaDoLogin).
+// Se a primeira leitura falhar, tenta de novo a cada 3 s — antes só voltava a tentar 10 minutos depois.
+let _settingsOk = !supabase;
+const SETTINGS_ESPERA_MS = parseInt(process.env.SETTINGS_ESPERA_MS || '6000', 10);
+const _settingsProntas = (async () => {
+  if (!supabase) return true;
+  for (let i = 0; ; i++) {
+    if (await loadSettings()) return true;
+    await new Promise(r => setTimeout(r, Math.min(3000 + i * 1000, 15000)));
+  }
+})();
 // recarrega settings (ex.: novos membros da equipe) sem precisar de redeploy — a cada 10 min,
 // com rótulo próprio no medidor de saída do banco
 setInterval(() => _gastoCtx.run({ rota: 'fundo:loadSettings' }, () => loadSettings()), 10 * 60 * 1000);
